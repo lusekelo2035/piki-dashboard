@@ -1,0 +1,28 @@
+# Secrets — NEVER commit these
+.env
+secrets.toml
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Generated files
+*.xlsx
+*.pdf
+Driver_Attendance_Sheet.xlsx
+
+# IDE
+.vscode/
+.idea/
