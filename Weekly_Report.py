@@ -3251,4 +3251,4 @@ with tab5:
 # FOOTER
 # ─────────────────────────────────────────────────
 st.divider()
-st.caption("Piki Business Intelligence Dashboard · Built with Streamlit & Claude AI · Tanzania 🇹🇿")
+st.caption("Piki Business Intelligence Dashboard · for any question or recommendation please call me 0767871795 ")
