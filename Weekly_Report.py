@@ -485,38 +485,23 @@ with st.sidebar:
     SUPABASE_KEY = _get_secret("SUPABASE_KEY", "")
     DB_TABLE     = _get_secret("DB_TABLE", "orders")
 
-    # ── Date range filter for DB query ──
-    st.markdown("#### 📅 Data Range to Load")
-    _today       = pd.Timestamp.today()
-    _default_from = (_today - pd.Timedelta(days=365)).date()
-    _default_to   = _today.date()
-    _load_from = st.date_input("From date", value=_default_from, key="db_from")
-    _load_to   = st.date_input("To date",   value=_default_to,   key="db_to")
-
-    _load_btn  = st.button("🔄 Load / Refresh Data", type="primary", use_container_width=True)
-    _cache_key = f"raw_df_{_load_from}_{_load_to}"
-
     def _parse_dates(df):
         df['DELIVERY DATE'] = pd.to_datetime(df['DELIVERY DATE'], errors='coerce')
         df['DELIVERY TIME'] = pd.to_datetime(df['DELIVERY TIME'], errors='coerce')
         return df
 
-    # ── Try Supabase first ──
-    def _load_from_supabase(url, key, table, date_from, date_to):
-        """Load orders from Supabase between two dates."""
+    # ── Try Supabase (load ALL data, no date restriction) ──
+    def _load_from_supabase(url, key, table):
+        """Load ALL orders from Supabase in paginated batches."""
         try:
             from supabase import create_client
             client = create_client(url, key)
-            _from_str = str(date_from)
-            _to_str   = str(date_to)
-            # Supabase REST API: fetch in pages of 1000 rows
             all_rows, page = [], 0
             PAGE = 1000
             while True:
                 resp = (client.table(table)
                         .select("*")
-                        .gte("DELIVERY DATE", _from_str)
-                        .lte("DELIVERY DATE", _to_str)
+                        .order("DELIVERY DATE", desc=True)
                         .range(page * PAGE, (page + 1) * PAGE - 1)
                         .execute())
                 rows = resp.data
@@ -525,50 +510,63 @@ with st.sidebar:
                     break
                 page += 1
             if not all_rows:
-                return None, "No data in selected date range."
+                return None, "No data found in database table."
             return pd.DataFrame(all_rows), None
         except ImportError:
             return None, "supabase package not installed."
         except Exception as e:
             return None, str(e)
 
-    # ── Load data ──
-    if _load_btn or "raw_df" not in st.session_state or st.session_state.get("_cache_key") != _cache_key:
+    # ── Data loading UI ──
+    _load_btn  = st.button("🔄 Refresh Data", type="primary", use_container_width=True)
 
+    if _load_btn or "raw_df" not in st.session_state:
         if SUPABASE_URL and SUPABASE_KEY:
-            # PRIMARY: Supabase database
             with st.spinner("Loading from database…"):
-                _df_raw, _err = _load_from_supabase(SUPABASE_URL, SUPABASE_KEY, DB_TABLE, _load_from, _load_to)
+                _df_raw, _err = _load_from_supabase(SUPABASE_URL, SUPABASE_KEY, DB_TABLE)
             if _df_raw is not None:
                 raw = _parse_dates(_df_raw)
-                st.session_state.raw_df     = raw
-                st.session_state["_cache_key"] = _cache_key
-                st.success(f"✅ Database: {len(raw):,} rows ({_load_from} → {_load_to})")
+                st.session_state.raw_df = raw
+                st.success(f"✅ {len(raw):,} rows loaded from database")
             else:
                 st.error(f"❌ Database error: {_err}")
                 st.stop()
         else:
-            # FALLBACK: CSV upload
-            st.info("💡 No database configured — using file upload.")
-            _uploaded = st.file_uploader("Upload CSV or Excel", type=["csv","xlsx"], key="fallback_upload")
+            # FALLBACK: CSV / Excel upload
+            st.markdown("#### 📂 Upload Data File")
+            _uploaded = st.file_uploader(
+                "Upload your orders CSV or Excel file",
+                type=["csv","xlsx"],
+                key="fallback_upload",
+                help="Upload the orders export from your system"
+            )
             if _uploaded:
-                raw = (pd.read_csv(_uploaded) if _uploaded.name.endswith(".csv")
-                       else pd.read_excel(_uploaded))
-                raw = _parse_dates(raw)
-                st.session_state.raw_df     = raw
-                st.session_state["_cache_key"] = "manual"
-                st.success(f"✅ Uploaded: {len(raw):,} rows")
+                with st.spinner("Reading file…"):
+                    try:
+                        if _uploaded.name.endswith(".csv"):
+                            raw = pd.read_csv(_uploaded, encoding='utf-8', on_bad_lines='skip')
+                        else:
+                            raw = pd.read_excel(_uploaded)
+                        raw = _parse_dates(raw)
+                        st.session_state.raw_df = raw
+                        st.success(f"✅ {len(raw):,} rows loaded from **{_uploaded.name}**")
+                    except Exception as _ue:
+                        st.error(f"❌ Could not read file: {_ue}")
+                        st.stop()
             elif "raw_df" not in st.session_state:
-                st.warning("⚠️ Add database credentials in secrets, or upload a file to continue.")
-                st.code('''# Add to .streamlit/secrets.toml:
-SUPABASE_URL = "https://xxxx.supabase.co"
-SUPABASE_KEY = "your-anon-public-key"
-CLAUDE_API_KEY = "sk-ant-api03-..."
-DB_TABLE = "orders"''')
+                st.markdown("""
+                <div style="background:#f8f9fa;border:2px dashed #dee2e6;border-radius:12px;
+                            padding:20px 24px;text-align:center;margin:10px 0;">
+                  <div style="font-size:32px;margin-bottom:8px;">📂</div>
+                  <div style="font-weight:600;font-size:15px;color:#495057;">No data loaded yet</div>
+                  <div style="font-size:13px;color:#6c757d;margin-top:4px;">
+                    Upload a CSV or Excel export above to get started.<br>
+                    Or add Supabase credentials to <code>.streamlit/secrets.toml</code>
+                  </div>
+                </div>""", unsafe_allow_html=True)
                 st.stop()
 
     raw = st.session_state.raw_df
-
     st.markdown(f"📊 **{len(raw):,} rows** loaded")
 
     st.divider()
@@ -2113,196 +2111,349 @@ with tab4:
 
     st.divider()
 
-    # ── Geographic Tool ──
-    st.subheader("🗺️ Customer & Business Density + Area Analysis")
-    req_geo = ['CUSTOMER LATITUDE','CUSTOMER LONGITUDE','BUSINESS LATITUDE','BUSINESS LONGITUDE']
-    if not all(c in df4.columns for c in req_geo):
+    # ══════════════════════════════════════════════════════════════
+    # GEO INTELLIGENCE — Two-panel layout
+    # ══════════════════════════════════════════════════════════════
+    st.divider()
+    st.markdown('''<div class="section-header">🗺️ Geographic Intelligence — Area & Service Analysis</div>''',
+                unsafe_allow_html=True)
+
+    _req_geo = ['CUSTOMER LATITUDE','CUSTOMER LONGITUDE','BUSINESS LATITUDE','BUSINESS LONGITUDE']
+    if not all(c in df4.columns for c in _req_geo):
         st.info("Geo columns not found in dataset.")
     else:
-        geo4 = df4.dropna(subset=req_geo)
-        if geo4.empty:
+        _geo4 = df4.dropna(subset=_req_geo).copy()
+        if _geo4.empty:
             st.info("No valid geo data for current filter.")
         else:
-            map4_col1, map4_col2 = st.columns([2, 2])
-            with map4_col1:
-                map4_type = st.radio("Map Layer",
-                    ["Both","Customer Only","Business Only"], horizontal=True, key="geo4_type")
-            with map4_col2:
-                top_n4 = st.slider("Top restaurants on map", 5, 50, 20, key="geo4_top")
+            # ── Compute per-customer delivery metrics ──
+            _geo4['DT'] = _geo4['Average Delivery Time'].fillna(0)
+            _geo4['DistKm'] = _geo4.apply(
+                lambda r: haversine(r['BUSINESS LATITUDE'], r['BUSINESS LONGITUDE'],
+                                    r['CUSTOMER LATITUDE'], r['CUSTOMER LONGITUDE']), axis=1)
 
-            st.info("✏️ **Draw a polygon** on the map to analyze orders in a specific area. Use the toolbar on the left side of the map.")
-
-            center4 = ([geo4['CUSTOMER LATITUDE'].mean(), geo4['CUSTOMER LONGITUDE'].mean()]
+            _center = ([_geo4['CUSTOMER LATITUDE'].mean(), _geo4['CUSTOMER LONGITUDE'].mean()]
                        if city_sel else [-6.8018, 39.2801])
 
-            rp4 = (geo4.groupby(['BUSINESS NAME','BUSINESS LATITUDE','BUSINESS LONGITUDE'])
-                   .agg(Orders=('ID','count'), Sales=('SUBTOTAL','sum'),
-                        AvgDT=('Average Delivery Time','mean'))
-                   .reset_index().sort_values('Orders', ascending=False))
+            _rp4 = (_geo4.groupby(['BUSINESS NAME','BUSINESS LATITUDE','BUSINESS LONGITUDE'])
+                    .agg(Orders=('ID','count'), Sales=('SUBTOTAL','sum'),
+                         AvgDT=('Average Delivery Time','mean'),
+                         AvgDist=('DistKm','mean'))
+                    .reset_index().sort_values('Orders', ascending=False))
 
-            # Always use st_folium with polygon draw enabled
-            m4 = folium.Map(location=center4, zoom_start=13, tiles="CartoDB positron")
-            if map4_type != "Business Only":
-                HeatMap(geo4[['CUSTOMER LATITUDE','CUSTOMER LONGITUDE']].values.tolist(),
-                        radius=12, blur=10, name="Customer Density").add_to(m4)
-            if map4_type != "Customer Only":
-                HeatMap(geo4[['BUSINESS LATITUDE','BUSINESS LONGITUDE']].values.tolist(),
-                        radius=15, blur=12, name="Business Density").add_to(m4)
-            for _, r in rp4.head(top_n4).iterrows():
-                folium.CircleMarker(
-                    [r['BUSINESS LATITUDE'], r['BUSINESS LONGITUDE']],
-                    radius=7, color='#e74c3c', fill=True, fill_opacity=0.9,
-                    popup=folium.Popup(
-                        f"<b>🍽️ {r['BUSINESS NAME']}</b><br>"
-                        f"📦 Orders: {int(r['Orders'])}<br>"
-                        f"💰 Sales: {int(r['Sales']):,} TZS<br>"
-                        f"⏱️ Avg DT: {r['AvgDT']:.1f} min", max_width=220),
-                    tooltip=f"🍽️ {r['BUSINESS NAME']}"
-                ).add_to(m4)
-            Draw(draw_options={"polyline":False,"polygon":True,"circle":False,
-                               "rectangle":True,"marker":False,"circlemarker":False},
-                 edit_options={"edit":True,"remove":True}).add_to(m4)
-            folium.LayerControl().add_to(m4)
-            map4_data = st_folium(m4, height=560, key="geo4_map_draw", use_container_width=True)
+            # ── PANEL 1: Density + Polygon Area Analysis ──
+            st.markdown("### 📍 Panel 1 — Density Map & Area Analysis")
+            st.markdown(
+                '''<div style="background:#e8f4fd;border-left:3px solid #1f77b4;padding:8px 14px;
+                border-radius:6px;font-size:13px;margin-bottom:10px;">
+                🔵 <b>Blue heatmap</b> = Customer density &nbsp;|&nbsp;
+                🔴 <b>Red circles</b> = Restaurants &nbsp;|&nbsp;
+                ✏️ <b>Draw a polygon</b> (left toolbar) to analyze any area in detail
+                </div>''', unsafe_allow_html=True)
 
-            # Polygon area analysis
-            if map4_data and map4_data.get("all_drawings"):
-                coords = map4_data["all_drawings"][-1]["geometry"]["coordinates"][0]
-                poly   = Polygon([(c[1], c[0]) for c in coords])
-                geo4 = geo4.copy()
-                geo4["in_poly"] = geo4.apply(
-                    lambda r: poly.contains(Point(r["CUSTOMER LATITUDE"], r["CUSTOMER LONGITUDE"])), axis=1)
-                area_df = geo4[geo4["in_poly"]]
+            _p1c1, _p1c2 = st.columns([3,1])
+            with _p1c2:
+                _map4_type = st.radio("Show layer",
+                    ["Both","Customers","Businesses"], key="geo4_type2", label_visibility="collapsed")
+                _top_n4    = st.slider("Top restaurants", 5, 50, 20, key="geo4_top2")
+                st.caption("🖱️ Click any restaurant pin for details")
 
-                if not area_df.empty:
-                    st.subheader("📍 Selected Area Summary")
-                    a1_, a2_, a3_ = st.columns(3)
-                    a1_.metric("Orders in Area", f"{len(area_df):,}")
-                    a2_.metric("Sales in Area", f"{area_df['SUBTOTAL'].sum()/1e6:.2f}M TZS")
-                    a3_.metric("Avg Delivery", f"{area_df['Average Delivery Time'].mean():.1f} min")
+            with _p1c1:
+                _m4 = folium.Map(location=_center, zoom_start=13, tiles="CartoDB positron")
 
-                    area_biz = (area_df.groupby("BUSINESS NAME")
-                                .agg(Orders=("ID","count"), Sales=("SUBTOTAL","sum"),
-                                     AvgDT=("Average Delivery Time","mean"))
-                                .reset_index().sort_values("Orders", ascending=False))
-                    st.dataframe(area_biz, use_container_width=True)
-                    st.download_button("⬇️ Download Area Data",
-                                       data=area_df.to_csv(index=False).encode(),
-                                       file_name="selected_area.csv", mime="text/csv")
+                # Customer heatmap
+                if _map4_type != "Businesses":
+                    _cust_coords = _geo4[['CUSTOMER LATITUDE','CUSTOMER LONGITUDE']].values.tolist()
+                    HeatMap(_cust_coords, radius=14, blur=12, name="Customer Density",
+                            gradient={0.3:'#74b9ff',0.6:'#0984e3',1.0:'#2d3436'}).add_to(_m4)
 
-                    # Area AI insight
-                    area_ctx = (f"AREA ANALYSIS: {len(area_df):,} orders | "
-                                f"{area_df['SUBTOTAL'].sum()/1e6:.2f}M TZS sales | "
-                                f"{area_df['Average Delivery Time'].mean():.1f} min avg DT\n\n"
-                                f"Top businesses in area:\n{area_biz.head(10).to_string(index=False)}")
-                    area_prompt = f"""Senior BI analyst for Tanzanian food delivery.
-{area_ctx}
-Provide:
-1. Zone Health – Is this area well-served?
-2. Top Business Performance – Who drives orders/revenue here?
-3. Delivery Efficiency – Is avg delivery time acceptable?
-4. Growth Opportunity – Should more businesses/riders be deployed here?
-5. Action – One specific recommendation.
-Use real numbers."""
-                    with st.spinner("Analyzing selected area…"):
-                        area_ins = claude_insight(area_prompt, 600)
-                    ai_block("geo_area", area_ctx, area_ins)
+                # Restaurant circle markers
+                if _map4_type != "Customers":
+                    for _, _r in _rp4.head(_top_n4).iterrows():
+                        _sz = max(6, min(18, int(_r['Orders'] / max(_rp4['Orders'].max(),1) * 18)))
+                        folium.CircleMarker(
+                            [_r['BUSINESS LATITUDE'], _r['BUSINESS LONGITUDE']],
+                            radius=_sz, color='#e74c3c', fill=True, fill_opacity=0.85,
+                            popup=folium.Popup(
+                                f"<b>🍽️ {_r['BUSINESS NAME']}</b><br>"
+                                f"📦 <b>{int(_r['Orders']):,}</b> orders<br>"
+                                f"💰 {int(_r['Sales']):,} TZS<br>"
+                                f"⏱️ Avg: {_r['AvgDT']:.1f} min &nbsp;|&nbsp; 📏 {_r['AvgDist']:.1f} km",
+                                max_width=240),
+                            tooltip=f"🍽️ {_r['BUSINESS NAME']} ({int(_r['Orders']):,} orders)"
+                        ).add_to(_m4)
+
+                # Polygon draw tool
+                Draw(draw_options={"polyline":False,"polygon":True,"circle":False,
+                                   "rectangle":True,"marker":False,"circlemarker":False},
+                     edit_options={"edit":True,"remove":True}).add_to(_m4)
+                folium.LayerControl().add_to(_m4)
+                _map4_data = st_folium(_m4, height=500, key="geo4_map_v2", use_container_width=True)
+
+            # ── Polygon analysis ──
+            if _map4_data and _map4_data.get("all_drawings"):
+                _coords = _map4_data["all_drawings"][-1]["geometry"]["coordinates"][0]
+                _poly   = Polygon([(c[1], c[0]) for c in _coords])
+                _geo4["_in_poly"] = _geo4.apply(
+                    lambda r: _poly.contains(Point(r["CUSTOMER LATITUDE"], r["CUSTOMER LONGITUDE"])), axis=1)
+                _area_df = _geo4[_geo4["_in_poly"]].copy()
+
+                if not _area_df.empty:
+                    st.markdown("---")
+                    st.markdown(f"### 📊 Selected Area Analysis — **{len(_area_df):,} orders**")
+
+                    _ac1, _ac2, _ac3, _ac4, _ac5 = st.columns(5)
+                    _ac1.metric("📦 Orders", f"{len(_area_df):,}")
+                    _ac2.metric("💰 Sales", f"{_area_df['SUBTOTAL'].sum()/1e6:.2f}M TZS")
+                    _ac3.metric("⏱️ Avg Delivery", f"{_area_df['DT'].mean():.1f} min")
+                    _ac4.metric("📏 Avg Distance", f"{_area_df['DistKm'].mean():.1f} km")
+                    _ac5.metric("👤 Unique Customers", f"{_area_df['CUSTOMER NAME'].nunique():,}")
+
+                    _ab_c1, _ab_c2 = st.columns(2)
+                    with _ab_c1:
+                        st.markdown("##### 🍽️ Top Businesses in Area")
+                        _area_biz = (_area_df.groupby("BUSINESS NAME")
+                                     .agg(Orders=("ID","count"), Sales=("SUBTOTAL","sum"),
+                                          AvgDT=("DT","mean"), AvgDist=("DistKm","mean"))
+                                     .reset_index().sort_values("Orders", ascending=False))
+                        _area_biz["Sales"] = _area_biz["Sales"].apply(lambda x: f"{int(x):,}")
+                        _area_biz["AvgDT"] = _area_biz["AvgDT"].round(1)
+                        _area_biz["AvgDist"] = _area_biz["AvgDist"].round(2)
+                        st.dataframe(_area_biz.head(10), use_container_width=True)
+
+                    with _ab_c2:
+                        st.markdown("##### 👥 Top Customers in Area")
+                        _area_cust = (_area_df.groupby("CUSTOMER NAME")
+                                      .agg(Orders=("ID","count"), Spend=("SUBTOTAL","sum"),
+                                           AvgDT=("DT","mean"))
+                                      .reset_index().sort_values("Spend", ascending=False))
+                        _area_cust["Spend"] = _area_cust["Spend"].apply(lambda x: f"{int(x):,} TZS")
+                        st.dataframe(_area_cust.head(10), use_container_width=True)
+
+                    st.download_button("⬇️ Download Area Orders (CSV)",
+                                       data=_area_df.drop(columns=["_in_poly","_in_cluster"], errors="ignore").to_csv(index=False).encode(),
+                                       file_name="selected_area_orders.csv", mime="text/csv",
+                                       key="dl_area_orders")
+
+                    # Auto AI insight for polygon selection
+                    _area_ctx = (
+                        f"AREA SELECTED: {len(_area_df):,} orders | "
+                        f"{_area_df['SUBTOTAL'].sum()/1e6:.2f}M TZS sales | "
+                        f"Avg delivery {_area_df['DT'].mean():.1f} min | "
+                        f"Avg distance {_area_df['DistKm'].mean():.1f} km | "
+                        f"{_area_df['CUSTOMER NAME'].nunique()} unique customers\n\n"
+                        f"Top businesses:\n{_area_biz.head(8).to_string(index=False)}"
+                    )
+                    _area_prompt = (
+                        "You are a senior operations analyst for a Tanzanian food delivery company.\n"
+                        + _area_ctx + "\n\n"
+                        "Analyze this specific geographic area:\n"
+                        "1. **Zone Health** — Is this area well-served or underserved given the delivery times?\n"
+                        "2. **Service Quality** — Is avg delivery time and distance acceptable? Any bottlenecks?\n"
+                        "3. **Business Mix** — Which businesses drive the area? Any gaps or opportunities?\n"
+                        "4. **Customer Value** — What is the revenue concentration in this zone?\n"
+                        "5. **Action** — One specific operational recommendation for this zone.\n"
+                        "Use real numbers. Be direct and specific."
+                    )
+                    with st.spinner("🤖 Analyzing selected area…"):
+                        _area_ins = claude_insight(_area_prompt, 600)
+                    ai_block("geo_area_v2", _area_ctx, _area_ins)
                 else:
-                    st.warning("No orders inside selected area.")
+                    st.warning("⚠️ No orders found inside the drawn area. Try a larger polygon.")
 
-            # ── VIP Customers & Valuable Customer Intelligence ──
+            # ══════════════════════════════════════════════════════════════
+            # PANEL 2 — Service Quality Cluster Map
+            # ══════════════════════════════════════════════════════════════
             st.divider()
-            st.subheader("👑 Valuable Customer Intelligence")
-            st.caption("Top customers by spend, order frequency, and geographic location. "
-                       "Use this to design loyalty programs, targeted promotions, or rider allocation.")
+            st.markdown("### 🔴 Panel 2 — Service Quality Intelligence: Hard-to-Serve Areas")
+            st.markdown('''
+            <div style="background:#fff3cd;border-left:3px solid #f39c12;padding:10px 16px;
+                        border-radius:6px;font-size:13px;margin-bottom:12px;">
+            <b>How to read this map:</b> Circles = customer zones clustered by proximity (1 km radius).
+            Color shows <b>average delivery time</b> — 🔴 Red = struggling zones (slow delivery),
+            🟢 Green = well-served. Circle size = order volume.
+            <b>Click any circle</b> for detailed zone analysis.
+            </div>''', unsafe_allow_html=True)
 
-            val_cust = (geo4.groupby(['CUSTOMER NAME','CUSTOMER LATITUDE','CUSTOMER LONGITUDE'])
-                        .agg(Orders=('ID','count'), Total_Spend=('SUBTOTAL','sum'),
-                             Avg_Order=('SUBTOTAL','mean'))
-                        .reset_index().sort_values('Total_Spend', ascending=False))
+            # Control row
+            _sq_c1, _sq_c2, _sq_c3 = st.columns([2,2,2])
+            with _sq_c1:
+                _dt_thresh = st.slider("🔴 Flag zones slower than (min)", 20, 90, 45, key="geo_dt_thresh",
+                                       help="Delivery time threshold — zones above this are flagged red")
+            with _sq_c2:
+                _min_orders = st.slider("Min orders to show zone", 1, 20, 3, key="geo_min_orders",
+                                        help="Filter out low-activity zones")
+            with _sq_c3:
+                _cluster_km = st.select_slider("Cluster radius", options=[0.5,1.0,1.5,2.0,3.0],
+                                               value=1.0, key="geo_cluster_km",
+                                               help="Group customers within this radius into one zone")
 
-            cust_orders = (geo4.groupby(['CUSTOMER LATITUDE','CUSTOMER LONGITUDE'])
-                           .agg(Orders=('ID','count'), Sales=('SUBTOTAL','sum'),
-                                Unique_Customers=('CUSTOMER NAME','nunique'))
-                           .reset_index().sort_values('Orders', ascending=False))
+            # ── Cluster customers by grid approximation (fast, no sklearn needed) ──
+            # Round lat/lon to cluster_km degree equivalent
+            _deg_per_km = 1.0 / 111.0
+            _grid_size  = _cluster_km * _deg_per_km
+            _geo4["_lat_g"] = (_geo4["CUSTOMER LATITUDE"]  / _grid_size).round(0) * _grid_size
+            _geo4["_lon_g"] = (_geo4["CUSTOMER LONGITUDE"] / _grid_size).round(0) * _grid_size
 
-            # VIP customer map
-            m_vip = folium.Map(location=center4, zoom_start=13, tiles="CartoDB positron")
+            _clusters = (_geo4.groupby(["_lat_g","_lon_g"])
+                         .agg(Orders=('ID','count'),
+                              Sales=('SUBTOTAL','sum'),
+                              AvgDT=('DT','mean'),
+                              AvgDist=('DistKm','mean'),
+                              Unique_Cust=('CUSTOMER NAME','nunique'),
+                              AvgOrder=('SUBTOTAL','mean'),
+                              Lat=('CUSTOMER LATITUDE','mean'),
+                              Lon=('CUSTOMER LONGITUDE','mean'))
+                         .reset_index()
+                         .rename(columns={"_lat_g":"GridLat","_lon_g":"GridLon"}))
 
-            # Customer demand heatmap
-            heat_data = [[r['CUSTOMER LATITUDE'], r['CUSTOMER LONGITUDE'], r['Orders']]
-                         for _, r in cust_orders.head(300).iterrows()]
-            HeatMap(heat_data, radius=16, blur=14, max_zoom=14,
-                    gradient={0.2:'#d4e6f1', 0.5:'#2980b9', 1.0:'#154360'},
-                    name="Order Demand Heatmap").add_to(m_vip)
+            _clusters = _clusters[_clusters["Orders"] >= _min_orders].copy()
+            _clusters["ServiceScore"] = _clusters["AvgDT"]  # higher = worse
 
-            # Business markers (red) 
-            for _, r in rp4.head(top_n4).iterrows():
+            # Color by delivery time vs threshold
+            def _zone_color(avg_dt):
+                if avg_dt >= _dt_thresh:           return "#e74c3c"   # 🔴 struggling
+                elif avg_dt >= _dt_thresh * 0.75:  return "#f39c12"   # 🟠 moderate
+                elif avg_dt >= _dt_thresh * 0.55:  return "#f1c40f"   # 🟡 ok
+                else:                               return "#27ae60"   # 🟢 good
+
+            # ── Build service quality map ──
+            _m5 = folium.Map(location=_center, zoom_start=13, tiles="CartoDB positron")
+
+            # Add restaurant markers (smaller, grey)
+            for _, _r in _rp4.head(30).iterrows():
                 folium.CircleMarker(
-                    [r['BUSINESS LATITUDE'], r['BUSINESS LONGITUDE']],
-                    radius=9, color='#e74c3c', fill=True, fill_opacity=0.9,
+                    [_r['BUSINESS LATITUDE'], _r['BUSINESS LONGITUDE']],
+                    radius=6, color='#636e72', fill=True, fill_opacity=0.7,
+                    tooltip=f"🍽️ {_r['BUSINESS NAME']}",
                     popup=folium.Popup(
-                        f"<b>🍽️ {r['BUSINESS NAME']}</b><br>"
-                        f"📦 Orders: {int(r['Orders'])}<br>"
-                        f"💰 Sales: {int(r['Sales']):,} TZS<br>"
-                        f"⏱️ Avg DT: {r['AvgDT']:.1f} min", max_width=220),
-                    tooltip=f"🍽️ {r['BUSINESS NAME']}"
-                ).add_to(m_vip)
+                        f"<b>{_r['BUSINESS NAME']}</b><br>"
+                        f"Avg delivery: {_r['AvgDT']:.1f} min | {_r['AvgDist']:.1f} km avg",
+                        max_width=200)
+                ).add_to(_m5)
 
-            # VIP customer markers (gold stars)
-            for _, r in val_cust.head(10).iterrows():
-                try:
-                    folium.Marker(
-                        [r['CUSTOMER LATITUDE'], r['CUSTOMER LONGITUDE']],
-                        icon=folium.Icon(color='orange', icon='star', prefix='fa'),
-                        popup=folium.Popup(
-                            f"<b>⭐ {r['CUSTOMER NAME']}</b><br>"
-                            f"🛒 Orders: {int(r['Orders'])} | 💰 {int(r['Total_Spend']):,} TZS<br>"
-                            f"📊 Avg order: {int(r['Avg_Order']):,} TZS",
-                            max_width=240),
-                        tooltip=f"⭐ VIP: {r['CUSTOMER NAME']}"
-                    ).add_to(m_vip)
-                except Exception:
-                    pass
+            # Add customer zone circles
+            _max_orders = max(_clusters["Orders"].max(), 1)
+            for _, _cl in _clusters.iterrows():
+                _col   = _zone_color(_cl["AvgDT"])
+                _rad   = max(8, min(30, int(_cl["Orders"] / _max_orders * 30)))
+                _border = "#c0392b" if _cl["AvgDT"] >= _dt_thresh else "#2c3e50"
 
-            folium.LayerControl().add_to(m_vip)
-            st.markdown("""
-            <div style="background:#fff8e7;border-left:3px solid #f39c12;padding:8px 14px;border-radius:6px;font-size:13px;margin-bottom:8px;">
-            🔴 <b>Red circles</b> = Restaurants &nbsp;|&nbsp; 
-            🔵 <b>Blue heatmap</b> = Customer order density &nbsp;|&nbsp; 
-            ⭐ <b>Stars</b> = Top 10 VIP customers by spend
-            </div>""", unsafe_allow_html=True)
-            st.components.v1.html(m_vip._repr_html_(), height=480)
+                # Build rich popup HTML
+                _dt_flag = "🔴 SLOW" if _cl["AvgDT"] >= _dt_thresh else ("🟠" if _cl["AvgDT"] >= _dt_thresh*0.75 else "🟢 Good")
+                _popup_html = (
+                    f"<div style='min-width:220px;font-size:13px;'>"
+                    f"<b style='font-size:14px;'>📍 Customer Zone</b><br>"
+                    f"<hr style='margin:4px 0;'>"
+                    f"📦 <b>{int(_cl['Orders']):,}</b> orders &nbsp;|&nbsp; "
+                    f"👤 {int(_cl['Unique_Cust']):,} customers<br>"
+                    f"💰 Avg order: <b>{int(_cl['AvgOrder']):,} TZS</b><br>"
+                    f"⏱️ Avg delivery: <b>{_cl['AvgDT']:.1f} min</b> {_dt_flag}<br>"
+                    f"📏 Avg distance: <b>{_cl['AvgDist']:.1f} km</b><br>"
+                    f"💵 Zone revenue: <b>{int(_cl['Sales']):,} TZS</b>"
+                    f"</div>"
+                )
 
-            dem_c1, dem_c2 = st.columns(2)
-            with dem_c1:
-                st.markdown("#### 👑 Top Valuable Customers")
-                disp_cust = val_cust.head(20)[['CUSTOMER NAME','Orders','Total_Spend','Avg_Order']].copy()
-                disp_cust['Total_Spend'] = disp_cust['Total_Spend'].apply(lambda x: f"{int(x):,} TZS")
-                disp_cust['Avg_Order']   = disp_cust['Avg_Order'].apply(lambda x: f"{int(x):,} TZS")
-                disp_cust.index = range(1, len(disp_cust)+1)
-                st.dataframe(disp_cust, use_container_width=True)
+                folium.CircleMarker(
+                    [_cl["Lat"], _cl["Lon"]],
+                    radius=_rad,
+                    color=_border, fill=True,
+                    fill_color=_col, fill_opacity=0.65,
+                    popup=folium.Popup(_popup_html, max_width=280),
+                    tooltip=(f"⏱️ {_cl['AvgDT']:.0f} min | 📦 {int(_cl['Orders']):,} orders")
+                ).add_to(_m5)
 
-            with dem_c2:
-                st.markdown("#### 📍 Highest-Demand Customer Zones")
-                st.caption("Coordinates with most orders placed — gaps between demand zones and restaurants = expansion opportunity")
-                top_zones = cust_orders.head(15).copy()
-                top_zones['Lat/Lng'] = (top_zones['CUSTOMER LATITUDE'].round(4).astype(str)
-                                         + ", " + top_zones['CUSTOMER LONGITUDE'].round(4).astype(str))
-                top_zones['Sales (TZS)'] = top_zones['Sales'].apply(lambda x: f"{int(x):,}")
-                top_zones = top_zones[['Lat/Lng','Orders','Sales (TZS)','Unique_Customers']]
-                top_zones.index = range(1, len(top_zones)+1)
-                st.dataframe(top_zones, use_container_width=True)
+            # Legend
+            folium.Marker(
+                location=[_center[0] - 0.02, _center[1] + 0.04],
+                icon=folium.DivIcon(html=f"""
+                <div style='background:white;border:1px solid #ccc;border-radius:6px;
+                             padding:8px 12px;font-size:12px;box-shadow:2px 2px 6px rgba(0,0,0,0.15);
+                             white-space:nowrap;'>
+                  <b>Service Level</b><br>
+                  <span style='color:#27ae60;'>●</span> Good (&lt;{int(_dt_thresh*0.55)}min)<br>
+                  <span style='color:#f1c40f;'>●</span> OK ({int(_dt_thresh*0.55)}–{int(_dt_thresh*0.75)}min)<br>
+                  <span style='color:#f39c12;'>●</span> Moderate ({int(_dt_thresh*0.75)}–{_dt_thresh}min)<br>
+                  <span style='color:#e74c3c;'>●</span> Slow (&gt;{_dt_thresh}min)<br>
+                  <span style='color:#636e72;'>●</span> Restaurant
+                </div>""", icon_size=(0,0), icon_anchor=(0,0))
+            ).add_to(_m5)
 
-            dl_c1, dl_c2 = st.columns(2)
-            dl_c1.download_button("⬇️ VIP Customers Excel",
-                                   data=excel_bytes(val_cust.head(100), "VIP Customers"),
-                                   file_name="VIP_Customers.xlsx",
-                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            dl_c2.download_button("⬇️ Demand Zones Excel",
-                                   data=excel_bytes(cust_orders.head(100), "Demand Zones"),
-                                   file_name="Demand_Zones.xlsx",
-                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            st.components.v1.html(_m5._repr_html_(), height=520)
+
+            # ── Struggling zones table + comparison ──
+            _struggling = _clusters[_clusters["AvgDT"] >= _dt_thresh].sort_values("AvgDT", ascending=False)
+            _good_zones = _clusters[_clusters["AvgDT"] < _dt_thresh * 0.55].sort_values("Orders", ascending=False)
+
+            _sq_t1, _sq_t2 = st.columns(2)
+            with _sq_t1:
+                st.markdown(f"#### 🔴 Struggling Zones (>{_dt_thresh} min avg delivery)")
+                if not _struggling.empty:
+                    _str_disp = _struggling[['Lat','Lon','Orders','AvgDT','AvgDist','AvgOrder','Sales']].copy()
+                    _str_disp['Lat'] = _str_disp['Lat'].round(4)
+                    _str_disp['Lon'] = _str_disp['Lon'].round(4)
+                    _str_disp['AvgDT'] = _str_disp['AvgDT'].round(1)
+                    _str_disp['AvgDist'] = _str_disp['AvgDist'].round(2)
+                    _str_disp['AvgOrder'] = _str_disp['AvgOrder'].apply(lambda x: f"{int(x):,}")
+                    _str_disp['Sales'] = _str_disp['Sales'].apply(lambda x: f"{int(x):,}")
+                    _str_disp.index = range(1, len(_str_disp)+1)
+                    st.dataframe(_str_disp, use_container_width=True)
+                else:
+                    st.success(f"✅ No zones with avg delivery > {_dt_thresh} min!")
+
+            with _sq_t2:
+                st.markdown("#### 🟢 Best-Served Zones (fastest delivery)")
+                if not _good_zones.empty:
+                    _good_disp = _good_zones[['Lat','Lon','Orders','AvgDT','AvgDist','AvgOrder','Sales']].copy()
+                    _good_disp['Lat'] = _good_disp['Lat'].round(4)
+                    _good_disp['Lon'] = _good_disp['Lon'].round(4)
+                    _good_disp['AvgDT'] = _good_disp['AvgDT'].round(1)
+                    _good_disp['AvgDist'] = _good_disp['AvgDist'].round(2)
+                    _good_disp['AvgOrder'] = _good_disp['AvgOrder'].apply(lambda x: f"{int(x):,}")
+                    _good_disp['Sales'] = _good_disp['Sales'].apply(lambda x: f"{int(x):,}")
+                    _good_disp.index = range(1, len(_good_disp)+1)
+                    st.dataframe(_good_disp, use_container_width=True)
+                else:
+                    st.info("Adjust threshold to see well-served zones.")
+
+            # ── Download cluster data ──
+            _sq_d1, _sq_d2 = st.columns(2)
+            _sq_d1.download_button("⬇️ All Zones (Excel)",
+                data=excel_bytes(_clusters.drop(columns=["GridLat","GridLon","_lat_g","_lon_g"], errors="ignore")
+                                 .rename(columns={"Lat":"Center Lat","Lon":"Center Lon"})
+                                 .sort_values("AvgDT", ascending=False), "All Zones"),
+                file_name="Service_Quality_Zones.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_zones")
+            _sq_d2.download_button("⬇️ Struggling Zones (Excel)",
+                data=excel_bytes(_struggling.rename(columns={"Lat":"Center Lat","Lon":"Center Lon"}), "Struggling"),
+                file_name="Struggling_Zones.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_struggling")
+
+            # ── AI Insight for service quality ──
+            if not _struggling.empty:
+                _sq_ctx = (
+                    f"GEOGRAPHIC SERVICE QUALITY ANALYSIS\n"
+                    f"Total zones: {len(_clusters)} | Struggling zones (>{_dt_thresh}min): {len(_struggling)}\n"
+                    f"Overall avg delivery: {_clusters['AvgDT'].mean():.1f} min | "
+                    f"Worst zone: {_struggling['AvgDT'].max():.1f} min avg\n"
+                    f"Avg distance struggling zones: {_struggling['AvgDist'].mean():.1f} km\n\n"
+                    f"TOP STRUGGLING ZONES:\n{_struggling.head(8)[['Lat','Lon','Orders','AvgDT','AvgDist','Sales']].round(2).to_string(index=False)}\n\n"
+                    f"BEST ZONES:\n{_good_zones.head(5)[['Lat','Lon','Orders','AvgDT','AvgDist']].round(2).to_string(index=False)}"
+                )
+                _sq_prompt = (
+                    "You are a senior logistics analyst for Piki, a Tanzanian food delivery company.\n\n"
+                    + _sq_ctx + "\n\n"
+                    "Provide a geographic service quality analysis:\n"
+                    "1. **Coverage Gaps** — Which areas are consistently underserved? What patterns do you see?\n"
+                    "2. **Distance vs Time** — Is poor service caused by distance or operational issues?\n"
+                    "3. **Revenue at Risk** — How much revenue is at risk in struggling zones due to poor service?\n"
+                    "4. **Quick Wins** — Which 2-3 struggling zones should be prioritized first and why?\n"
+                    "5. **Recommendations** — Specific actions: add restaurant, deploy riders, set delivery boundaries?\n"
+                    "Use real numbers. Be operational and specific."
+                )
+                ai_insight_button("geo_service_quality", "Service Quality Analysis", lambda: (claude_insight(_sq_prompt, 700), _sq_ctx))
 
 # ═══════════════════════════════════════════════════════════════
 # TAB 5 — PIKI PARTY STORE
