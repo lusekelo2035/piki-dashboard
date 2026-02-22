@@ -280,10 +280,7 @@ Be concise, specific, and use real numbers. If data doesn't support an answer, s
 
 def ai_block(section_key: str, context: str, insight_text: str):
     """Renders insight card + Q&A chat for any section."""
-    import re as _re
-    # Convert markdown bold/headers to clean HTML for compact rendering
     html_text = insight_text
-    # Render inside a styled card
     st.markdown(
         f'''<div class="ai-insight-card">
 <span class="ai-insight-label">🤖 AI Insight</span>
@@ -310,6 +307,41 @@ def ai_block(section_key: str, context: str, insight_text: str):
             if st.button("🗑️ Clear chat", key=f"clr_{section_key}"):
                 st.session_state[hkey] = []
                 st.rerun()
+
+
+def ai_insight_button(section_key: str, label: str, build_fn, *args, **kwargs):
+    """On-demand AI insight: shows a styled button, runs insight only when clicked."""
+    _sk = f"ai_ins_{section_key}"
+    _ctx_sk = f"ai_ctx_{section_key}"
+    if _sk not in st.session_state:
+        st.session_state[_sk] = None
+        st.session_state[_ctx_sk] = None
+    st.markdown(f"""
+    <div style="margin:14px 0 6px 0;padding:10px 14px;background:linear-gradient(90deg,#f0f4ff,#e8f0fe);
+         border-radius:8px;border:1px solid #c5d3f0;display:flex;align-items:center;gap:10px;">
+      <span style="font-size:18px;">🤖</span>
+      <span style="font-size:13px;color:#3a5280;font-weight:500;">
+        AI Insight available — click to analyze <b>{label}</b>
+      </span>
+    </div>""", unsafe_allow_html=True)
+    col_btn, col_rst = st.columns([3,1])
+    with col_btn:
+        if st.button(f"⚡ Generate AI Insight", key=f"btn_{section_key}",
+                     type="primary", use_container_width=True):
+            with st.spinner(f"Claude is analyzing {label}…"):
+                result = build_fn(*args, **kwargs)
+                if isinstance(result, tuple):
+                    ins_text, ctx_text = result
+                else:
+                    ins_text, ctx_text = result, ""
+            st.session_state[_sk] = ins_text
+            st.session_state[_ctx_sk] = ctx_text
+    with col_rst:
+        if st.session_state[_sk] and st.button("↺ Refresh", key=f"ref_{section_key}"):
+            st.session_state[_sk] = None
+            st.rerun()
+    if st.session_state[_sk]:
+        ai_block(section_key, st.session_state[_ctx_sk] or "", st.session_state[_sk])
 
 # ─────────────────────────────────────────────────
 # INSIGHT BUILDERS — return (text, context)
@@ -542,18 +574,17 @@ DB_TABLE = "orders"''')
     st.divider()
     st.subheader("🔍 Global Filters")
 
-    # ── Date range — default latest week ──
+    # ── Date range — default last 8 weeks (for trend visibility) ──
     max_date = raw['DELIVERY DATE'].max()
     min_date = raw['DELIVERY DATE'].min()
-    latest_mon = (max_date - pd.Timedelta(days=max_date.weekday())).date()
-    latest_sun = (latest_mon + pd.Timedelta(days=6))
+    default_from_8w = (max_date - pd.Timedelta(weeks=8)).date()
 
     date_range = st.date_input(
         "Date Range",
-        value=[latest_mon, latest_sun],
+        value=[default_from_8w, max_date.date()],
         min_value=min_date.date(),
         max_value=max_date.date(),
-        help="Defaults to latest week. Expand to view historical data."
+        help="Defaults to last 8 weeks for trend analysis. Narrow down as needed."
     )
 
     cities = sorted(raw['BUSINESS CITY'].dropna().unique())
@@ -686,9 +717,7 @@ with tab1:
     )
 
     # AI
-    with st.spinner("Generating trend insight…"):
-        ins1, ctx1 = build_trend_insight(weekly, df)
-    ai_block("trend_orders", ctx1, ins1)
+    ai_insight_button("trend_orders", "Weekly Orders & Sales Trend", build_trend_insight, weekly, df)
 
     st.divider()
 
@@ -755,31 +784,58 @@ with tab1:
             "Be specific, use real numbers, write as a strategic advisor."
         )
 
-        with st.expander("🤖 AI Forecast Analysis", expanded=True):
-            with st.spinner("Claude is analyzing the forecast…"):
-                _fc_insight = claude_insight(_forecast_prompt, max_tokens=900)
-            st.markdown(_fc_insight)
-
         _fc_ctx = "FORECAST:\n" + fcast_str + "\n\nHISTORY:\n" + hist_str + "\nRisk: " + risk
-        with st.expander("💬 Ask about the Forecast", expanded=False):
-            _fh = "chat_forecast"
-            if _fh not in st.session_state:
-                st.session_state[_fh] = []
-            for _m in st.session_state[_fh]:
-                st.chat_message(_m["role"]).markdown(_m["content"])
-            _q = st.chat_input("e.g. What would need to happen to hit KPI?", key="inp_forecast")
-            if _q:
-                st.chat_message("user").markdown(_q)
-                with st.spinner("Thinking…"):
-                    _ans = claude_chat_answer(_fc_ctx, st.session_state[_fh], _q)
-                st.chat_message("assistant").markdown(_ans)
-                st.session_state[_fh] += [{"role":"user","content":_q},
-                                           {"role":"assistant","content":_ans}]
-            if st.session_state[_fh]:
-                if st.button("🗑️ Clear chat", key="clr_forecast"):
-                    st.session_state[_fh] = []; st.rerun()
+        def _run_forecast_insight():
+            return claude_insight(_forecast_prompt, max_tokens=900), _fc_ctx
+        ai_insight_button("forecast", "4-Week Forecast", _run_forecast_insight)
     else:
         st.info("Need 4+ weeks of data to generate a forecast.")
+
+    st.divider()
+
+    # ── AI Weather Forecast for Coming Week ──
+    st.markdown('<div class="section-header">🌤️ Weather Forecast — Coming Week (Tanzania)</div>', unsafe_allow_html=True)
+    st.caption("AI-predicted weather for key cities in Tanzania. Weather significantly impacts food delivery demand patterns.")
+
+    _wf_btn_key = "show_weather_forecast"
+    if _wf_btn_key not in st.session_state:
+        st.session_state[_wf_btn_key] = None
+
+    _wf_col1, _ = st.columns([3,1])
+    with _wf_col1:
+        if st.button("🌤️ Generate Weekly Weather Forecast", key="btn_weather", type="primary", use_container_width=True):
+            _weather_prompt = """You are a weather intelligence assistant specialized in Tanzania.
+
+Generate a **7-day weather forecast table** for the coming week for these cities:
+- Dar es Salaam (coastal, humid)
+- Arusha (highland, cooler)
+- Dodoma (inland, drier)
+- Zanzibar (tropical island)
+- Mwanza (lakeside)
+
+Format your response as a markdown table with these columns:
+Date | City | Condition | Temp (°C) | Rain Risk | Delivery Impact
+
+For Delivery Impact, rate how weather will affect food delivery demand:
+🟢 Boost (rainy/hot = more orders) | 🟡 Normal | 🔴 Risk (storms/extreme)
+
+Note: This is an AI estimate based on seasonal patterns. For the current week in late February (end of short dry season / start of long rains).
+
+After the table, add a brief 3-point summary of:
+1. Overall weather outlook for delivery operations
+2. Which city/day will see the biggest demand boost
+3. Any weather risk to prepare for operationally"""
+
+            with st.spinner("Generating weather forecast…"):
+                _weather_result = claude_insight(_weather_prompt, max_tokens=900)
+            st.session_state[_wf_btn_key] = _weather_result
+
+    if st.session_state[_wf_btn_key]:
+        st.markdown(
+            f'<div class="ai-insight-card"><span class="ai-insight-label">🌤️ AI Weather Intelligence</span>'
+            f'{st.session_state[_wf_btn_key]}</div>',
+            unsafe_allow_html=True
+        )
 
     st.divider()
 
@@ -855,9 +911,7 @@ with tab1:
                                    file_name=f"failed_{sel_week}.xlsx",
                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-                with st.spinner("Generating failed orders insight…"):
-                    ins_f, ctx_f = build_failed_insight(failed_weekly_wl, pivot, sel_week)
-                ai_block("failed_orders", ctx_f, ins_f)
+                ai_insight_button("failed_orders", "Failed Orders", build_failed_insight, failed_weekly_wl, pivot, sel_week)
 
         if not rejected_df.empty:
             st.markdown("#### 🚫 Rejected Orders Trend")
@@ -1000,9 +1054,7 @@ with tab2:
                 plt.tight_layout(); st.pyplot(fig_a); plt.close()
 
     # AI insight
-    with st.spinner("Generating delivery insight…"):
-        ins2, ctx2 = build_delivery_insight(city_stage, city_label)
-    ai_block("delivery_time", ctx2, ins2)
+    ai_insight_button("delivery_time", "Delivery Time Analysis", build_delivery_insight, city_stage, city_label)
 
     st.divider()
 
@@ -1193,9 +1245,20 @@ with tab3:
                     st.pyplot(fig_z); plt.close()
 
     # ── AI Insight — Attendance ──
-    with st.spinner("Generating attendance insight…"):
-        ins3, ctx3 = build_attendance_insight(att_pivot, sel_week_att, df_week)
-    ai_block("rider_attendance", ctx3, ins3)
+    _att_btn_key = "show_ins_rider_attendance"
+    if _att_btn_key not in st.session_state:
+        st.session_state[_att_btn_key] = False
+    st.markdown(
+        '''<div style="margin:12px 0 4px 0;">
+        <span style="font-size:12px;color:#888;">AI-powered analysis of attendance patterns & KPI gaps</span>
+        </div>''', unsafe_allow_html=True)
+    if st.button("🤖 Generate AI Insight — Attendance", key="btn_rider_att",
+                 type="primary", use_container_width=False):
+        st.session_state[_att_btn_key] = True
+    if st.session_state[_att_btn_key]:
+        with st.spinner("Analyzing attendance…"):
+            ins3, ctx3 = build_attendance_insight(att_pivot, sel_week_att, df_week)
+        ai_block("rider_attendance", ctx3, ins3)
 
     st.divider()
 
@@ -1524,9 +1587,9 @@ with tab3:
             "4. **Trend Alert** — Is regional delivery time improving or declining?\n"
             "5. **Actions** — 2 specific ops actions for next week.\nUse real numbers."
         )
-        with st.spinner("Generating bonus insight…"):
-            _bonus_ins = claude_insight(_bonus_prompt, max_tokens=700)
-        ai_block("rider_bonus", _bonus_ctx, _bonus_ins)
+        def _run_bonus_insight():
+            return claude_insight(_bonus_prompt, max_tokens=700), _bonus_ctx
+        ai_insight_button("rider_bonus", "Driver Bonus Analysis", _run_bonus_insight)
 
         # ─── Section D: Delivery Time Trends pivot ───────────
         st.markdown("### 📈 D. Driver Delivery Time Trends (8 Weeks Pivot)")
@@ -1687,9 +1750,7 @@ with tab4:
         st.pyplot(fig_wp); plt.close()
 
     # AI
-    with st.spinner("Generating product insight…"):
-        ins4, ctx4 = build_product_insight(total_prod_df, biz_perf, wp_df)
-    ai_block("products", ctx4, ins4)
+    ai_insight_button("products", "Product Trends", build_product_insight, total_prod_df, biz_perf, wp_df)
 
     st.divider()
 
@@ -1703,14 +1764,14 @@ with tab4:
         if geo4.empty:
             st.info("No valid geo data for current filter.")
         else:
-            map4_col1, map4_col2, map4_col3 = st.columns([2, 2, 2])
+            map4_col1, map4_col2 = st.columns([2, 2])
             with map4_col1:
                 map4_type = st.radio("Map Layer",
                     ["Both","Customer Only","Business Only"], horizontal=True, key="geo4_type")
             with map4_col2:
                 top_n4 = st.slider("Top restaurants on map", 5, 50, 20, key="geo4_top")
-            with map4_col3:
-                enable_draw = st.checkbox("✏️ Enable Area Selection (polygon draw)", value=False, key="geo4_draw")
+
+            st.info("✏️ **Draw a polygon** on the map to analyze orders in a specific area. Use the toolbar on the left side of the map.")
 
             center4 = ([geo4['CUSTOMER LATITUDE'].mean(), geo4['CUSTOMER LONGITUDE'].mean()]
                        if city_sel else [-6.8018, 39.2801])
@@ -1720,54 +1781,30 @@ with tab4:
                         AvgDT=('Average Delivery Time','mean'))
                    .reset_index().sort_values('Orders', ascending=False))
 
-            if enable_draw:
-                # Use st_folium for polygon drawing interaction
-                m4 = folium.Map(location=center4, zoom_start=13, tiles="CartoDB positron")
-                if map4_type != "Business Only":
-                    HeatMap(geo4[['CUSTOMER LATITUDE','CUSTOMER LONGITUDE']].values.tolist(),
-                            radius=12, blur=10, name="Customer Density").add_to(m4)
-                if map4_type != "Customer Only":
-                    HeatMap(geo4[['BUSINESS LATITUDE','BUSINESS LONGITUDE']].values.tolist(),
-                            radius=15, blur=12, name="Business Density").add_to(m4)
-                for _, r in rp4.head(top_n4).iterrows():
-                    folium.CircleMarker(
-                        [r['BUSINESS LATITUDE'], r['BUSINESS LONGITUDE']],
-                        radius=6, color='#1f77b4', fill=True, fill_opacity=0.85,
-                        popup=folium.Popup(
-                            f"<b>{r['BUSINESS NAME']}</b><br>"
-                            f"Orders: {int(r['Orders'])}<br>"
-                            f"Sales: {int(r['Sales']):,} TZS<br>"
-                            f"Avg DT: {r['AvgDT']:.1f} min", max_width=200),
-                        tooltip=r['BUSINESS NAME']
-                    ).add_to(m4)
-                Draw(draw_options={"polyline":False,"polygon":True,"circle":False,
-                                   "rectangle":False,"marker":False,"circlemarker":False},
-                     edit_options={"edit":True,"remove":True}).add_to(m4)
-                folium.LayerControl().add_to(m4)
-                map4_data = st_folium(m4, height=550, key="geo4_map_draw", use_container_width=True)
-            else:
-                # Use components.v1.html for reliable rendering (no drawing)
-                m4 = folium.Map(location=center4, zoom_start=13, tiles="CartoDB positron")
-                if map4_type != "Business Only":
-                    HeatMap(geo4[['CUSTOMER LATITUDE','CUSTOMER LONGITUDE']].values.tolist(),
-                            radius=12, blur=10, name="Customer Density").add_to(m4)
-                if map4_type != "Customer Only":
-                    HeatMap(geo4[['BUSINESS LATITUDE','BUSINESS LONGITUDE']].values.tolist(),
-                            radius=15, blur=12, name="Business Density").add_to(m4)
-                for _, r in rp4.head(top_n4).iterrows():
-                    folium.CircleMarker(
-                        [r['BUSINESS LATITUDE'], r['BUSINESS LONGITUDE']],
-                        radius=6, color='#1f77b4', fill=True, fill_opacity=0.85,
-                        popup=folium.Popup(
-                            f"<b>{r['BUSINESS NAME']}</b><br>"
-                            f"Orders: {int(r['Orders'])}<br>"
-                            f"Sales: {int(r['Sales']):,} TZS<br>"
-                            f"Avg DT: {r['AvgDT']:.1f} min", max_width=200),
-                        tooltip=r['BUSINESS NAME']
-                    ).add_to(m4)
-                folium.LayerControl().add_to(m4)
-                st.components.v1.html(m4._repr_html_(), height=550)
-                map4_data = None
+            # Always use st_folium with polygon draw enabled
+            m4 = folium.Map(location=center4, zoom_start=13, tiles="CartoDB positron")
+            if map4_type != "Business Only":
+                HeatMap(geo4[['CUSTOMER LATITUDE','CUSTOMER LONGITUDE']].values.tolist(),
+                        radius=12, blur=10, name="Customer Density").add_to(m4)
+            if map4_type != "Customer Only":
+                HeatMap(geo4[['BUSINESS LATITUDE','BUSINESS LONGITUDE']].values.tolist(),
+                        radius=15, blur=12, name="Business Density").add_to(m4)
+            for _, r in rp4.head(top_n4).iterrows():
+                folium.CircleMarker(
+                    [r['BUSINESS LATITUDE'], r['BUSINESS LONGITUDE']],
+                    radius=7, color='#e74c3c', fill=True, fill_opacity=0.9,
+                    popup=folium.Popup(
+                        f"<b>🍽️ {r['BUSINESS NAME']}</b><br>"
+                        f"📦 Orders: {int(r['Orders'])}<br>"
+                        f"💰 Sales: {int(r['Sales']):,} TZS<br>"
+                        f"⏱️ Avg DT: {r['AvgDT']:.1f} min", max_width=220),
+                    tooltip=f"🍽️ {r['BUSINESS NAME']}"
+                ).add_to(m4)
+            Draw(draw_options={"polyline":False,"polygon":True,"circle":False,
+                               "rectangle":True,"marker":False,"circlemarker":False},
+                 edit_options={"edit":True,"remove":True}).add_to(m4)
+            folium.LayerControl().add_to(m4)
+            map4_data = st_folium(m4, height=560, key="geo4_map_draw", use_container_width=True)
 
             # Polygon area analysis
             if map4_data and map4_data.get("all_drawings"):
@@ -1814,95 +1851,96 @@ Use real numbers."""
                 else:
                     st.warning("No orders inside selected area.")
 
-            # ── Demand Intelligence & Valuable Customer Analysis ──
+            # ── VIP Customers & Valuable Customer Intelligence ──
             st.divider()
-            st.subheader("🎯 Demand Intelligence — Where to Open Next?")
-            st.caption("Customer demand clusters mapped against existing restaurant coverage. "
-                       "Hot zones without nearby businesses = expansion opportunity.")
+            st.subheader("👑 Valuable Customer Intelligence")
+            st.caption("Top customers by spend, order frequency, and geographic location. "
+                       "Use this to design loyalty programs, targeted promotions, or rider allocation.")
 
-            # Build demand zones: group customer coords into clusters
-            cust_orders = (geo4.groupby(['CUSTOMER LATITUDE','CUSTOMER LONGITUDE'])
-                           .agg(Orders=('ID','count'), Sales=('SUBTOTAL','sum'),
-                                Unique_Customers=('CUSTOMER NAME','nunique'))
-                           .reset_index().sort_values('Orders', ascending=False))
-
-            # Identify TOP 15 high-demand customer zones
-            top_demand = cust_orders.head(200)  # use top 200 coords for heatmap weights
-
-            # Valuable customers: high order count or high spend
             val_cust = (geo4.groupby(['CUSTOMER NAME','CUSTOMER LATITUDE','CUSTOMER LONGITUDE'])
                         .agg(Orders=('ID','count'), Total_Spend=('SUBTOTAL','sum'),
                              Avg_Order=('SUBTOTAL','mean'))
                         .reset_index().sort_values('Total_Spend', ascending=False))
 
-            m_demand = folium.Map(location=center4, zoom_start=13, tiles="CartoDB dark_matter")
+            cust_orders = (geo4.groupby(['CUSTOMER LATITUDE','CUSTOMER LONGITUDE'])
+                           .agg(Orders=('ID','count'), Sales=('SUBTOTAL','sum'),
+                                Unique_Customers=('CUSTOMER NAME','nunique'))
+                           .reset_index().sort_values('Orders', ascending=False))
 
-            # Weighted heatmap by order volume
+            # VIP customer map
+            m_vip = folium.Map(location=center4, zoom_start=13, tiles="CartoDB positron")
+
+            # Customer demand heatmap
             heat_data = [[r['CUSTOMER LATITUDE'], r['CUSTOMER LONGITUDE'], r['Orders']]
-                         for _, r in top_demand.iterrows()]
-            HeatMap(heat_data, radius=18, blur=15, max_zoom=14,
-                    gradient={0.3:'#00bfff', 0.6:'#ffff00', 1.0:'#ff0000'},
-                    name="Demand Intensity").add_to(m_demand)
+                         for _, r in cust_orders.head(300).iterrows()]
+            HeatMap(heat_data, radius=16, blur=14, max_zoom=14,
+                    gradient={0.2:'#d4e6f1', 0.5:'#2980b9', 1.0:'#154360'},
+                    name="Order Demand Heatmap").add_to(m_vip)
 
-            # Existing restaurant pins
+            # Business markers (red) 
             for _, r in rp4.head(top_n4).iterrows():
                 folium.CircleMarker(
                     [r['BUSINESS LATITUDE'], r['BUSINESS LONGITUDE']],
-                    radius=8, color='#00ff88', fill=True, fill_opacity=0.9,
+                    radius=9, color='#e74c3c', fill=True, fill_opacity=0.9,
                     popup=folium.Popup(
                         f"<b>🍽️ {r['BUSINESS NAME']}</b><br>"
                         f"📦 Orders: {int(r['Orders'])}<br>"
                         f"💰 Sales: {int(r['Sales']):,} TZS<br>"
                         f"⏱️ Avg DT: {r['AvgDT']:.1f} min", max_width=220),
                     tooltip=f"🍽️ {r['BUSINESS NAME']}"
-                ).add_to(m_demand)
+                ).add_to(m_vip)
 
-            # Top 5 valuable customer markers
-            for _, r in val_cust.head(5).iterrows():
+            # VIP customer markers (gold stars)
+            for _, r in val_cust.head(10).iterrows():
                 try:
                     folium.Marker(
                         [r['CUSTOMER LATITUDE'], r['CUSTOMER LONGITUDE']],
                         icon=folium.Icon(color='orange', icon='star', prefix='fa'),
                         popup=folium.Popup(
                             f"<b>⭐ {r['CUSTOMER NAME']}</b><br>"
-                            f"Orders: {int(r['Orders'])} | Spend: {int(r['Total_Spend']):,} TZS",
-                            max_width=220),
+                            f"🛒 Orders: {int(r['Orders'])} | 💰 {int(r['Total_Spend']):,} TZS<br>"
+                            f"📊 Avg order: {int(r['Avg_Order']):,} TZS",
+                            max_width=240),
                         tooltip=f"⭐ VIP: {r['CUSTOMER NAME']}"
-                    ).add_to(m_demand)
+                    ).add_to(m_vip)
                 except Exception:
                     pass
 
-            folium.LayerControl().add_to(m_demand)
-            st.components.v1.html(m_demand._repr_html_(), height=520)
+            folium.LayerControl().add_to(m_vip)
+            st.markdown("""
+            <div style="background:#fff8e7;border-left:3px solid #f39c12;padding:8px 14px;border-radius:6px;font-size:13px;margin-bottom:8px;">
+            🔴 <b>Red circles</b> = Restaurants &nbsp;|&nbsp; 
+            🔵 <b>Blue heatmap</b> = Customer order density &nbsp;|&nbsp; 
+            ⭐ <b>Stars</b> = Top 10 VIP customers by spend
+            </div>""", unsafe_allow_html=True)
+            st.components.v1.html(m_vip._repr_html_(), height=480)
 
-            # Two-column insight layout
             dem_c1, dem_c2 = st.columns(2)
-
             with dem_c1:
                 st.markdown("#### 👑 Top Valuable Customers")
-                disp_cust = val_cust.head(15)[['CUSTOMER NAME','Orders','Total_Spend','Avg_Order']].copy()
+                disp_cust = val_cust.head(20)[['CUSTOMER NAME','Orders','Total_Spend','Avg_Order']].copy()
                 disp_cust['Total_Spend'] = disp_cust['Total_Spend'].apply(lambda x: f"{int(x):,} TZS")
                 disp_cust['Avg_Order']   = disp_cust['Avg_Order'].apply(lambda x: f"{int(x):,} TZS")
                 disp_cust.index = range(1, len(disp_cust)+1)
                 st.dataframe(disp_cust, use_container_width=True)
 
             with dem_c2:
-                st.markdown("#### 📍 Top Demand Zones (no coverage gap estimate)")
+                st.markdown("#### 📍 Highest-Demand Customer Zones")
+                st.caption("Coordinates with most orders placed — gaps between demand zones and restaurants = expansion opportunity")
                 top_zones = cust_orders.head(15).copy()
-                top_zones['Location'] = (top_zones['CUSTOMER LATITUDE'].round(4).astype(str)
-                                          + ", " + top_zones['CUSTOMER LONGITUDE'].round(4).astype(str))
-                top_zones['Sales'] = top_zones['Sales'].apply(lambda x: f"{int(x):,}")
-                top_zones = top_zones[['Location','Orders','Sales','Unique_Customers']]
+                top_zones['Lat/Lng'] = (top_zones['CUSTOMER LATITUDE'].round(4).astype(str)
+                                         + ", " + top_zones['CUSTOMER LONGITUDE'].round(4).astype(str))
+                top_zones['Sales (TZS)'] = top_zones['Sales'].apply(lambda x: f"{int(x):,}")
+                top_zones = top_zones[['Lat/Lng','Orders','Sales (TZS)','Unique_Customers']]
                 top_zones.index = range(1, len(top_zones)+1)
                 st.dataframe(top_zones, use_container_width=True)
 
-            # Download
             dl_c1, dl_c2 = st.columns(2)
-            dl_c1.download_button("⬇️ Valuable Customers",
+            dl_c1.download_button("⬇️ VIP Customers Excel",
                                    data=excel_bytes(val_cust.head(100), "VIP Customers"),
-                                   file_name="Valuable_Customers.xlsx",
+                                   file_name="VIP_Customers.xlsx",
                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            dl_c2.download_button("⬇️ Demand Zones",
+            dl_c2.download_button("⬇️ Demand Zones Excel",
                                    data=excel_bytes(cust_orders.head(100), "Demand Zones"),
                                    file_name="Demand_Zones.xlsx",
                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
@@ -2197,33 +2235,308 @@ with tab5:
     st.dataframe(_top_ord_view, use_container_width=True)
 
     # ────────────────────────────────────────────────
-    # AI INSIGHT
+    # DEEP ANALYTICS SECTIONS
+    # ────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown('<div class="section-header">🔬 Deep Analytics</div>', unsafe_allow_html=True)
+
+    _da_tab1, _da_tab2, _da_tab3, _da_tab4, _da_tab5 = st.tabs([
+        "🍶 Soju Analysis", "📦 Wholesale", "❌ Cancelled Orders", "🚗 Pickup Orders", "🌙 Late Night"
+    ])
+
+    # ── Build useful derived data ──
+    _all_pp = raw[raw['BUSINESS NAME'].str.strip().str.lower() == 'piki party'].copy()
+    _all_pp['DELIVERY DATE'] = pd.to_datetime(_all_pp['DELIVERY DATE'], errors='coerce')
+    _all_pp['DELIVERY TIME'] = pd.to_datetime(_all_pp['DELIVERY TIME'], errors='coerce')
+    _all_pp['HOUR'] = _all_pp['DELIVERY TIME'].dt.hour
+    _all_pp_iso = _all_pp['DELIVERY DATE'].dt.isocalendar()
+    _all_pp['ISO_Week'] = _all_pp_iso.week
+    _all_pp['ISO_Year'] = _all_pp_iso.year
+
+    # Identify latest & previous weeks
+    _pp_max_wk = int(_all_pp['ISO_Week'].max())
+    _pp_max_yr = int(_all_pp[_all_pp['ISO_Week']==_pp_max_wk]['ISO_Year'].max())
+    _pp_prev_wk = _pp_max_wk - 1
+
+    with _da_tab1:
+        st.markdown("#### 🍶 Soju Product Analysis")
+        # Extract all soju products
+        _soju_rows = []
+        for _, _r in _all_pp.iterrows():
+            for _pn, _qty in extract_products(_r.get('PRODUCTS','')):
+                if 'soju' in _pn.lower():
+                    _soju_rows.append({'Product': _pn.strip().title(),
+                                       'Qty': _qty, 'Week': int(_r['ISO_Week']),
+                                       'Year': int(_r['ISO_Year']),
+                                       'Sales': _r.get('SUBTOTAL',0)})
+        if _soju_rows:
+            _soju_df = pd.DataFrame(_soju_rows)
+            _soju_cur  = _soju_df[_soju_df['Week']==_pp_max_wk]
+            _soju_prev = _soju_df[_soju_df['Week']==_pp_prev_wk]
+
+            _sc1, _sc2, _sc3 = st.columns(3)
+            _sc1.metric("Soju Units This Week", f"{int(_soju_cur['Qty'].sum()):,}")
+            _sc2.metric("Soju Units Prev Week", f"{int(_soju_prev['Qty'].sum()):,}",
+                        delta=f"{int(_soju_cur['Qty'].sum() - _soju_prev['Qty'].sum()):+}")
+            _sc3.metric("Soju Revenue (TZS)", f"{_soju_cur['Sales'].sum()/1e3:.0f}K")
+
+            # Weekly trend per soju variant
+            _soju_wk = (_soju_df.groupby(['Product','Week'])['Qty'].sum().reset_index()
+                        .pivot(index='Product', columns='Week', values='Qty').fillna(0))
+            st.dataframe(_soju_wk, use_container_width=True)
+
+            _sfig, _sax = plt.subplots(figsize=(11,4))
+            _soju_weekly_total = _soju_df.groupby('Week')['Qty'].sum()
+            _sax.bar(_soju_weekly_total.index.astype(str), _soju_weekly_total.values,
+                     color='#9b59b6', alpha=0.8)
+            _sax.set_xlabel("ISO Week"); _sax.set_ylabel("Units Sold")
+            _sax.set_title("Total Soju Sales by Week"); _sax.grid(True, alpha=0.3, axis='y')
+            plt.tight_layout(); st.pyplot(_sfig); plt.close()
+        else:
+            st.info("No soju products found in PRODUCTS column.")
+
+    with _da_tab2:
+        st.markdown("#### 📦 Wholesale Orders Analysis")
+        st.caption("High-value orders (≥ 100,000 TZS subtotal) treated as potential wholesale")
+        _WHOLESALE_MIN = 100_000
+        _ws_df = _all_pp[_all_pp['SUBTOTAL'] >= _WHOLESALE_MIN].copy()
+        if not _ws_df.empty:
+            _ww1, _ww2, _ww3, _ww4 = st.columns(4)
+            _ww1.metric("Wholesale Orders", f"{len(_ws_df):,}")
+            _ww2.metric("Total Revenue", f"{_ws_df['SUBTOTAL'].sum()/1e6:.2f}M TZS")
+            _ww3.metric("Avg Order Value", f"{_ws_df['SUBTOTAL'].mean()/1e3:.0f}K TZS")
+            _ww4.metric("% of All Orders",
+                        f"{len(_ws_df)/max(len(_all_pp),1)*100:.1f}%")
+
+            _ws_weekly = (_ws_df.groupby(['ISO_Year','ISO_Week'])
+                          .agg(Orders=('ID','count'), Revenue=('SUBTOTAL','sum'))
+                          .reset_index().sort_values(['ISO_Year','ISO_Week']))
+            _ws_weekly['Week_Label'] = "W" + _ws_weekly['ISO_Week'].astype(str)
+            _wfig, _wax = plt.subplots(figsize=(11,4))
+            _wax.bar(_ws_weekly['Week_Label'], _ws_weekly['Revenue']/1e3, color='#27ae60', alpha=0.8)
+            _wax.set_ylabel("Revenue (K TZS)"); _wax.set_title("Wholesale Revenue by Week")
+            _wax.grid(True, alpha=0.3, axis='y'); plt.tight_layout()
+            st.pyplot(_wfig); plt.close()
+
+            st.markdown("##### Top Wholesale Customers")
+            _ws_cust = (_ws_df.groupby('CUSTOMER NAME')
+                        .agg(Orders=('ID','count'), Revenue=('SUBTOTAL','sum'),
+                             Avg_Order=('SUBTOTAL','mean'))
+                        .reset_index().sort_values('Revenue', ascending=False))
+            _ws_cust['Revenue'] = _ws_cust['Revenue'].apply(lambda x: f"{int(x):,}")
+            _ws_cust['Avg_Order'] = _ws_cust['Avg_Order'].apply(lambda x: f"{int(x):,}")
+            st.dataframe(_ws_cust.head(20), use_container_width=True)
+        else:
+            st.info("No wholesale-level orders found.")
+
+    with _da_tab3:
+        st.markdown("#### ❌ Cancelled & Rejected Orders")
+        _can_df = _all_pp[_all_pp['STATE'].str.contains('Reject|Cancel|Failed', case=False, na=False)].copy()
+        if not _can_df.empty:
+            _ca1, _ca2, _ca3 = st.columns(3)
+            _ca1.metric("Total Cancelled/Rejected", f"{len(_can_df):,}")
+            _ca2.metric("This Week",
+                        f"{len(_can_df[_can_df['ISO_Week']==_pp_max_wk]):,}")
+            _ca3.metric("Cancellation Rate",
+                        f"{len(_can_df)/max(len(_all_pp),1)*100:.1f}%")
+
+            # State breakdown
+            _can_state = _can_df['STATE'].value_counts().reset_index()
+            _can_state.columns = ['Reason','Count']
+            st.dataframe(_can_state, use_container_width=True)
+
+            # Products in cancelled orders
+            st.markdown("##### 🏷️ Products Most Appearing in Cancelled Orders")
+            _can_prods = defaultdict(int)
+            for _, _r in _can_df.iterrows():
+                for _pn, _qty in extract_products(_r.get('PRODUCTS','')):
+                    _can_prods[standardize_product(_pn)] += _qty
+            if _can_prods:
+                _cp_df = pd.DataFrame(_can_prods.items(), columns=['Product','Qty in Cancellations'])
+                _cp_df = _cp_df.sort_values('Qty in Cancellations', ascending=False)
+                st.dataframe(_cp_df.head(15), use_container_width=True)
+
+                _cpf, _cpa = plt.subplots(figsize=(10,4))
+                _top_cp = _cp_df.head(10)
+                _cpa.barh(_top_cp['Product'], _top_cp['Qty in Cancellations'], color='#e74c3c')
+                _cpa.invert_yaxis(); _cpa.set_xlabel("Qty")
+                _cpa.set_title("Top Products in Cancelled Orders"); plt.tight_layout()
+                st.pyplot(_cpf); plt.close()
+
+            # Weekly cancellation trend
+            _can_wk = (_can_df.groupby('ISO_Week').size().reset_index(name='Cancellations'))
+            _canwf, _canwa = plt.subplots(figsize=(10,3))
+            _canwa.plot(_can_wk['ISO_Week'].astype(str), _can_wk['Cancellations'],
+                        marker='o', color='#e74c3c', lw=2)
+            _canwa.set_title("Cancellations by Week"); _canwa.grid(True, alpha=0.3)
+            plt.tight_layout(); st.pyplot(_canwf); plt.close()
+        else:
+            st.info("No cancelled/rejected orders found.")
+
+    with _da_tab4:
+        st.markdown("#### 🚗 Pickup Orders Analysis")
+        st.caption("STATE = 'Completed' orders analyzed for pickup vs delivery split")
+        _pick_df = _all_pp[_all_pp['DELIVERY TYPE'].str.lower().str.contains('pickup|pick_up|pick up', na=False)].copy() if 'DELIVERY TYPE' in _all_pp.columns else pd.DataFrame()
+        _comp_all = _all_pp[_all_pp['STATE'].isin(['Completed','Delivery Completed By Driver'])]
+        _total_comp = len(_comp_all)
+
+        if not _pick_df.empty:
+            _pi1, _pi2, _pi3, _pi4 = st.columns(4)
+            _pi1.metric("Pickup Orders", f"{len(_pick_df):,}")
+            _pi2.metric("Pickup Revenue", f"{_pick_df['SUBTOTAL'].sum()/1e6:.2f}M TZS")
+            _pi3.metric("% of Completed Orders",
+                        f"{len(_pick_df)/max(_total_comp,1)*100:.1f}%")
+            _pi4.metric("Avg Pickup Value", f"{_pick_df['SUBTOTAL'].mean()/1e3:.0f}K TZS")
+
+            _pick_wk = (_pick_df.groupby(['ISO_Year','ISO_Week'])
+                        .agg(Orders=('ID','count'), Revenue=('SUBTOTAL','sum'))
+                        .reset_index().sort_values(['ISO_Year','ISO_Week']))
+            _pick_wk['Week_Label'] = "W" + _pick_wk['ISO_Week'].astype(str)
+            _pifig, _piax = plt.subplots(figsize=(11,4))
+            _piax.bar(_pick_wk['Week_Label'], _pick_wk['Orders'], color='#2980b9', alpha=0.8, label='Pickup Orders')
+            _piax.set_title("Pickup Orders by Week"); _piax.grid(True, alpha=0.3, axis='y')
+            _piax.legend(); plt.tight_layout(); st.pyplot(_pifig); plt.close()
+        else:
+            # Fallback: show completed orders analysis
+            st.info("DELIVERY TYPE column not found or no pickup entries — showing all completed orders analysis.")
+            if not _comp_all.empty:
+                _co1, _co2, _co3 = st.columns(3)
+                _co1.metric("Completed Orders", f"{_total_comp:,}")
+                _co2.metric("Completed Revenue", f"{_comp_all['SUBTOTAL'].sum()/1e6:.2f}M TZS")
+                _co3.metric("Avg Order Value", f"{_comp_all['SUBTOTAL'].mean()/1e3:.0f}K TZS")
+                _comp_wk = (_comp_all.groupby('ISO_Week').agg(Orders=('ID','count')).reset_index())
+                _cofig, _coax = plt.subplots(figsize=(11,4))
+                _coax.bar(_comp_wk['ISO_Week'].astype(str), _comp_wk['Orders'], color='#27ae60', alpha=0.8)
+                _coax.set_title("Completed Orders by Week"); _coax.grid(True, alpha=0.3, axis='y')
+                plt.tight_layout(); st.pyplot(_cofig); plt.close()
+
+    with _da_tab5:
+        st.markdown("#### 🌙 Late Night Orders (23:00 – 02:00)")
+        _ln_df = _all_pp[(_all_pp['HOUR'] >= 23) | (_all_pp['HOUR'] <= 2)].copy()
+        _total_all = len(_all_pp)
+        if not _ln_df.empty:
+            _ln1, _ln2, _ln3, _ln4 = st.columns(4)
+            _ln1.metric("Late Night Orders", f"{len(_ln_df):,}")
+            _ln2.metric("Revenue", f"{_ln_df['SUBTOTAL'].sum()/1e6:.2f}M TZS")
+            _ln3.metric("% of Total Orders",
+                        f"{len(_ln_df)/max(_total_all,1)*100:.1f}%")
+            _ln4.metric("This Week",
+                        f"{len(_ln_df[_ln_df['ISO_Week']==_pp_max_wk]):,}")
+
+            # Weekly trend
+            _ln_wk = (_ln_df.groupby(['ISO_Year','ISO_Week'])
+                      .agg(Orders=('ID','count'), Revenue=('SUBTOTAL','sum'))
+                      .reset_index().sort_values(['ISO_Year','ISO_Week']))
+            _ln_wk['Week_Label'] = "W" + _ln_wk['ISO_Week'].astype(str)
+            _lnfig, _lnax = plt.subplots(figsize=(11,4))
+            _lnax.plot(_ln_wk['Week_Label'], _ln_wk['Orders'],
+                       marker='o', color='#8e44ad', lw=2, label='Late Night Orders')
+            _lnax.fill_between(range(len(_ln_wk)), _ln_wk['Orders'],
+                               alpha=0.15, color='#8e44ad')
+            _lnax.set_title("Late Night Orders Trend"); _lnax.grid(True, alpha=0.3)
+            _lnax.legend(); plt.xticks(rotation=30, ha='right'); plt.tight_layout()
+            st.pyplot(_lnfig); plt.close()
+
+            # Hour breakdown
+            _ln_hr = _ln_df['HOUR'].value_counts().sort_index()
+            _lnhf, _lnha = plt.subplots(figsize=(7,3))
+            _lnha.bar(_ln_hr.index.astype(str), _ln_hr.values, color='#2c3e50', alpha=0.8)
+            _lnha.set_xlabel("Hour"); _lnha.set_ylabel("Orders")
+            _lnha.set_title("Distribution by Hour (23–02)"); plt.tight_layout()
+            st.pyplot(_lnhf); plt.close()
+
+            # Top products late night
+            st.markdown("##### 🛒 Top Late Night Products")
+            _ln_prods = defaultdict(int)
+            for _, _r in _ln_df.iterrows():
+                for _pn, _qty in extract_products(_r.get('PRODUCTS','')):
+                    _ln_prods[standardize_product(_pn)] += _qty
+            if _ln_prods:
+                _lnp_df = pd.DataFrame(_ln_prods.items(), columns=['Product','Qty']).sort_values('Qty', ascending=False)
+                st.dataframe(_lnp_df.head(10), use_container_width=True)
+        else:
+            st.info("No late night orders found.")
+
+    # ────────────────────────────────────────────────
+    # OUT-OF-STOCK / MISSING PRODUCT ALERT
+    # ────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown('<div class="section-header">⚠️ Out-of-Stock & Availability Alerts</div>', unsafe_allow_html=True)
+    if _pp_prod_totals and len(_week_cols_pp if '_week_cols_pp' in dir() else []) >= 2:
+        _oos_rows = []
+        for _prod, _wk_data in _pp_wk_prod.items():
+            _last_sold = max((_w for _w, _q in _wk_data.items() if _q > 0), default=None)
+            if _last_sold and _last_sold < _pp_max_wk:
+                _weeks_missing = _pp_max_wk - _last_sold
+                _hist_avg = sum(_wk_data.values()) / max(len(_wk_data),1)
+                _oos_rows.append({'Product': _prod, 'Last Sold Week': f"W{_last_sold}",
+                                  'Weeks Since Last Sale': _weeks_missing,
+                                  'Historical Weekly Avg': round(_hist_avg,1)})
+        if _oos_rows:
+            _oos_df = pd.DataFrame(_oos_rows).sort_values('Weeks Since Last Sale', ascending=False)
+            st.warning(f"⚠️ {len(_oos_df)} products not sold in the current week — potential stock-out or listing issue:")
+            st.dataframe(_oos_df, use_container_width=True)
+        else:
+            st.success("✅ No products appear to be missing in the current week.")
+
+    # ────────────────────────────────────────────────
+    # AI INSIGHT (ON-DEMAND)
     # ────────────────────────────────────────────────
     st.markdown("---")
     if not _pp_weekly.empty and _pp_prod_totals:
-        _top5_str = pd.DataFrame(_pp_prod_totals.items(), columns=['Product','Qty'])                      .sort_values('Qty', ascending=False).head(10).to_string(index=False)
-        _pp_ctx = (f"PIKI PARTY STORE ANALYSIS\n"
+        _top5_str = pd.DataFrame(_pp_prod_totals.items(), columns=['Product','Qty'])\
+                      .sort_values('Qty', ascending=False).head(10).to_string(index=False)
+
+        # Soju summary for context
+        _soju_ctx = ""
+        if _soju_rows if '_soju_rows' in dir() else False:
+            _soju_ctx = f"\nSOJU THIS WEEK: {int(_soju_df[_soju_df['Week']==_pp_max_wk]['Qty'].sum())} units | PREV WEEK: {int(_soju_df[_soju_df['Week']==_pp_prev_wk]['Qty'].sum())} units\n"
+
+        # Cancelled context
+        _can_ctx = ""
+        if '_can_df' in dir() and not _can_df.empty:
+            _top_can_prod = sorted(_can_prods.items(), key=lambda x: -x[1])[:3] if '_can_prods' in dir() and _can_prods else []
+            _can_ctx = (f"\nCANCELLED ORDERS: {len(_can_df)} total ({len(_can_df)/max(len(_all_pp),1)*100:.1f}% rate)\n"
+                        f"Top cancelled products: {', '.join([p for p,_ in _top_can_prod])}\n")
+
+        # Late night context
+        _ln_ctx = ""
+        if '_ln_df' in dir() and not _ln_df.empty:
+            _ln_ctx = (f"\nLATE NIGHT ORDERS: {len(_ln_df)} ({len(_ln_df)/max(_total_all,1)*100:.1f}% of total)\n"
+                       f"This week late night: {len(_ln_df[_ln_df['ISO_Week']==_pp_max_wk])}\n")
+
+        # OOS context
+        _oos_ctx = ""
+        if '_oos_df' in dir() and not (_oos_df.empty if hasattr(_oos_df, 'empty') else True):
+            _oos_ctx = f"\nPRODUCTS NOT SOLD THIS WEEK (potential OOS): {', '.join(_oos_df['Product'].head(5).tolist())}\n"
+
+        _pp_ctx = (f"PIKI PARTY STORE ANALYSIS — Current Week: W{_pp_max_wk}\n"
                    f"Total completed orders: {len(_pp_comp):,}\n"
                    f"Total sales: {_pp_comp['SUBTOTAL'].sum()/1e6:.2f}M TZS\n"
                    f"Weeks available: {len(_pp_weekly)}\n\n"
                    f"TOP 10 PRODUCTS:\n{_top5_str}\n\n"
                    f"WEEKLY TREND (last 4 weeks):\n"
-                   + _pp_weekly.tail(4)[['Week_Label','Total_Orders','Total_Sales']].to_string(index=False))
+                   + _pp_weekly.tail(4)[['Week_Label','Total_Orders','Total_Sales']].to_string(index=False)
+                   + _soju_ctx + _can_ctx + _ln_ctx + _oos_ctx)
+
         _pp_prompt = (
             "You are a senior BI analyst for Piki, a Tanzanian food delivery company.\n"
-            "You are analysing the Piki Party Store — a specialty party supply/catering store.\n\n"
+            "You are analysing the Piki Party Store — a specialty party supply/catering store in Tanzania.\n\n"
             + _pp_ctx + "\n\n"
-            "Provide a comprehensive analysis:\n"
-            "1. **Store Performance** — Is Piki Party growing? Key trend observation.\n"
-            "2. **Star Products** — Which products drive the most volume and why does it matter?\n"
-            "3. **Category Health** — Any category growing or declining noticeably?\n"
-            "4. **Customer Behaviour** — What does the order value distribution tell us?\n"
-            "5. **Strategic Actions** — 3 specific recommendations to grow Piki Party sales.\n\n"
-            "Be specific, use real numbers, write as a strategic advisor."
+            "Provide a deep, comprehensive analysis:\n"
+            "1. **Store Performance** — Is Piki Party growing? Key trend observation with numbers.\n"
+            "2. **Star Products & Out-of-Stock Alerts** — Top sellers + flag any products missing this week that were selling before (possible stock-out or system issue).\n"
+            "3. **Soju Performance** — How are soju products selling? Any specific variant spiking or declining?\n"
+            "4. **Cancellation Insights** — Which products appear most in cancelled orders? What could be causing it?\n"
+            "5. **Late Night Opportunity** — Is the late night segment (23–02h) growing? How significant is it to the business?\n"
+            "6. **Wholesale Signals** — Any high-value orders suggesting bulk/wholesale demand? Opportunity?\n"
+            "7. **Strategic Actions** — 3 specific, prioritized recommendations to grow Piki Party revenue next week.\n\n"
+            "Be specific, use real numbers from the data provided, write as a strategic advisor."
         )
-        with st.spinner("Generating Piki Party insight…"):
-            _pp_ins = claude_insight(_pp_prompt, max_tokens=900)
-        ai_block("piki_party", _pp_ctx, _pp_ins)
+
+        def _run_pp_insight():
+            return claude_insight(_pp_prompt, max_tokens=1100), _pp_ctx
+        ai_insight_button("piki_party", "Piki Party Deep Analysis", _run_pp_insight)
     else:
         st.info("Upload more data to generate AI insights for Piki Party.")
 
