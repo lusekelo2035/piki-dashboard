@@ -574,14 +574,17 @@ DB_TABLE = "orders"''')
     st.divider()
     st.subheader("🔍 Global Filters")
 
-    # ── Date range — default last 8 weeks (for trend visibility) ──
+    # ── Date range — default last 8 weeks (clamped to actual data range) ──
     max_date = raw['DELIVERY DATE'].max()
     min_date = raw['DELIVERY DATE'].min()
-    default_from_8w = (max_date - pd.Timedelta(weeks=8)).date()
+    _8w_ago = (max_date - pd.Timedelta(weeks=8)).date()
+    # Clamp: default_from must be >= min_date
+    default_from_8w = max(_8w_ago, min_date.date())
+    default_to_8w   = max_date.date()
 
     date_range = st.date_input(
         "Date Range",
-        value=[default_from_8w, max_date.date()],
+        value=[default_from_8w, default_to_8w],
         min_value=min_date.date(),
         max_value=max_date.date(),
         help="Defaults to last 8 weeks for trend analysis. Narrow down as needed."
@@ -716,8 +719,225 @@ with tab1:
         ), use_container_width=True
     )
 
-    # AI
-    ai_insight_button("trend_orders", "Weekly Orders & Sales Trend", build_trend_insight, weekly, df)
+    # ── Regional Manager Excel Download ──
+    st.markdown('<div class="section-header">📥 Regional Manager Report — Download by City</div>', unsafe_allow_html=True)
+    st.caption("One Excel sheet per city: weekly summary, operations KPIs with issue filtering, top vendors, top drivers.")
+
+    _reg_btn_key = "reg_report_ready"
+    if _reg_btn_key not in st.session_state:
+        st.session_state[_reg_btn_key] = None
+
+    if st.button("⚙️ Generate Regional Report", key="btn_regional_excel", type="secondary", use_container_width=False):
+        from openpyxl import Workbook as _OXLWorkbook
+        from openpyxl.styles import Font as _OXLFont, PatternFill as _OXLFill
+        from openpyxl.utils.dataframe import dataframe_to_rows as _df2rows
+
+        _reg_wb = _OXLWorkbook()
+        _reg_wb.remove(_reg_wb.active)
+
+        # ── Helpers ──────────────────────────────────────────
+        def _categorize_issues(row):
+            issues = []
+            if row['Accepted by Business'] < 0 or row['Accepted by Business'] > 30:
+                issues.append("Accepted by Business Out of Range")
+            if row['Assigned Time'] < 0 or row['Assigned Time'] > 30:
+                issues.append("Assigned Time Out of Range")
+            if row['Accepted by Driver'] < 0 or row['Accepted by Driver'] > 45:
+                issues.append("Accepted by Driver Out of Range")
+            if row['Driver to Business'] < 0 or row['Driver to Business'] > 45:
+                issues.append("Driver to Business Out of Range")
+            if row['Driver in Business'] < 0 or row['Driver in Business'] > 90:
+                issues.append("Driver in Business Out of Range")
+            if row['Pickup to Customer'] < 0 or row['Pickup to Customer'] > 45:
+                issues.append("Pickup to Customer Out of Range")
+            if row['Average Delivery Time'] < 0 or row['Average Delivery Time'] > 100:
+                issues.append("Average Delivery Time Out of Range")
+            return ", ".join(issues)
+
+        def _reg_write_section(_ws, title, dataframe, start_row):
+            if dataframe is None or dataframe.empty:
+                return start_row + 2
+            _ws.merge_cells(start_row=start_row, start_column=1,
+                            end_row=start_row, end_column=max(len(dataframe.columns), 1))
+            _tc = _ws.cell(row=start_row, column=1, value=title)
+            _tc.font = _OXLFont(bold=True, color="FFFFFF")
+            _tc.fill = _OXLFill(start_color="4F81BD", end_color="4F81BD", fill_type="solid")
+            for _r_i, _row in enumerate(_df2rows(dataframe, index=False, header=True), start=start_row+1):
+                for _c_i, _val in enumerate(_row, start=1):
+                    _cell = _ws.cell(row=_r_i, column=_c_i, value=_val)
+                    if _r_i == start_row + 1:  # header row
+                        _cell.font = _OXLFont(bold=True)
+                        _cell.fill = _OXLFill(start_color="FFC000", end_color="FFC000", fill_type="solid")
+            return start_row + len(dataframe) + 3
+
+        # ── Build per-city sheets ────────────────────────────
+        _reg_cities = sorted(df['BUSINESS CITY'].dropna().unique())
+        _df_completed_all = df[df['STATE'].isin(['Delivery Completed By Driver','Completed'])].copy()
+
+        # Ensure datetime columns parsed on the full dataframe
+        for _tc_col in ['DELIVERY TIME','ACCEPTED BUSINESS HOUR','ASSIGNED HOUR',
+                         'ACCEPTED DRIVER HOUR','IN BUSINESS HOUR','PICKUP HOUR','DELIVERY HOUR']:
+            if _tc_col in _df_completed_all.columns:
+                _df_completed_all[_tc_col] = pd.to_datetime(_df_completed_all[_tc_col], errors='coerce')
+
+        _prog = st.progress(0, text="Building city reports…")
+        for _ci, _rcity in enumerate(_reg_cities):
+            _prog.progress(int((_ci / max(len(_reg_cities), 1)) * 100),
+                           text=f"Building: {_rcity}…")
+
+            _df_c   = df[df['BUSINESS CITY'] == _rcity].copy()
+            _df_c_c = _df_completed_all[_df_completed_all['BUSINESS CITY'] == _rcity].copy()
+            if _df_c.empty:
+                continue
+
+            # Week label using period (matches the main dashboard format)
+            _df_c['Week']   = _df_c['DELIVERY DATE'].dt.to_period('W-SUN').apply(
+                lambda p: f"Week {p.week} ({p.start_time.strftime('%d %b')})")
+            if not _df_c_c.empty:
+                _df_c_c['Week'] = _df_c_c['DELIVERY DATE'].dt.to_period('W-SUN').apply(
+                    lambda p: f"Week {p.week} ({p.start_time.strftime('%d %b')})")
+
+            # ── Weekly summary ──
+            _wk_sum = (_df_c.groupby('Week', sort=False)
+                       .agg(**{'Total Orders': ('ID','count')})
+                       .reset_index())
+            if not _df_c_c.empty:
+                _wk_sum['Completed Orders'] = (_df_c_c.groupby('Week')['ID'].count()
+                                               .reindex(_wk_sum['Week'], fill_value=0).values)
+                _wk_sum['Total Sales (TZS)'] = (_df_c_c.groupby('Week')['SUBTOTAL'].sum()
+                                                .reindex(_wk_sum['Week'], fill_value=0).values)
+            else:
+                _wk_sum['Completed Orders']  = 0
+                _wk_sum['Total Sales (TZS)'] = 0
+
+            # ── Operations KPIs — exact logic from reference code ──
+            _df_ops = _df_c_c.copy() if not _df_c_c.empty else pd.DataFrame()
+            _ops_kpi = pd.DataFrame()
+            if not _df_ops.empty:
+                # Calculate each stage
+                _df_ops['Accepted by Business'] = (
+                    (_df_ops['ACCEPTED BUSINESS HOUR'] - _df_ops['DELIVERY TIME'])
+                    .dt.total_seconds() / 60)
+                _df_ops['Accepted by Business'] = _df_ops['Accepted by Business'].mask(
+                    _df_ops['Accepted by Business'] < 0, 0)
+
+                _df_ops['Assigned Time'] = (
+                    (_df_ops['ASSIGNED HOUR'] - _df_ops['ACCEPTED BUSINESS HOUR'])
+                    .dt.total_seconds() / 60)
+                _df_ops['Assigned Time'] = _df_ops['Assigned Time'].mask(
+                    _df_ops['Assigned Time'] < 0, 3)
+
+                _df_ops['Accepted by Driver'] = (
+                    (_df_ops['ACCEPTED DRIVER HOUR'] - _df_ops['ASSIGNED HOUR'])
+                    .dt.total_seconds() / 60)
+                _df_ops['Accepted by Driver'] = _df_ops['Accepted by Driver'].mask(
+                    _df_ops['Accepted by Driver'] < 0, 3)
+
+                _df_ops['Driver to Business'] = (
+                    (_df_ops['IN BUSINESS HOUR'] - _df_ops['ACCEPTED DRIVER HOUR'])
+                    .dt.total_seconds() / 60)
+                _df_ops['Driver to Business'] = _df_ops['Driver to Business'].mask(
+                    _df_ops['Driver to Business'] < 0, 7)
+
+                _df_ops['Driver in Business'] = (
+                    (_df_ops['PICKUP HOUR'] - _df_ops['IN BUSINESS HOUR'])
+                    .dt.total_seconds() / 60)
+                _df_ops['Driver in Business'] = _df_ops['Driver in Business'].mask(
+                    _df_ops['Driver in Business'] < 0, 15)
+
+                _df_ops['Pickup to Customer'] = (
+                    (_df_ops['DELIVERY HOUR'] - _df_ops['PICKUP HOUR'])
+                    .dt.total_seconds() / 60)
+                _df_ops['Pickup to Customer'] = _df_ops['Pickup to Customer'].mask(
+                    _df_ops['Pickup to Customer'] < 0, 15)
+
+                _df_ops['Average Delivery Time'] = (
+                    (_df_ops['DELIVERY HOUR'] - _df_ops['DELIVERY TIME'])
+                    .dt.total_seconds() / 60)
+                _df_ops['Average Delivery Time'] = _df_ops['Average Delivery Time'].mask(
+                    _df_ops['Average Delivery Time'] < 0,
+                    (_df_ops['DELIVERY HOUR'] - _df_ops['ACCEPTED BUSINESS HOUR'])
+                    .dt.total_seconds() / 60)
+                _df_ops['Average Delivery Time'] = _df_ops['Average Delivery Time'].mask(
+                    _df_ops['Average Delivery Time'] < 0, 40)
+
+                # Filter out rows with out-of-range values (exact logic from reference)
+                _df_ops['_Issues'] = _df_ops.apply(_categorize_issues, axis=1)
+                _df_ops = _df_ops[_df_ops['_Issues'] == '']
+
+                if not _df_ops.empty and 'Week' in _df_ops.columns:
+                    _kpi_metric_cols = ['Accepted by Business','Assigned Time','Accepted by Driver',
+                                        'Driver to Business','Driver in Business','Pickup to Customer',
+                                        'Average Delivery Time']
+                    _ops_kpi = (_df_ops.groupby('Week', sort=False)[_kpi_metric_cols]
+                                .mean().round(1).reset_index())
+                    _ops_kpi['Average Delivery Time % Change'] = (
+                        _ops_kpi['Average Delivery Time'].pct_change() * 100).round(1)
+
+            # ── Latest week top lists ──
+            _latest_wk = _df_c['Week'].max() if not _df_c.empty else None
+            _recent    = _df_c[_df_c['Week'] == _latest_wk] if _latest_wk else pd.DataFrame()
+
+            _top_vendors = (
+                _recent.groupby('BUSINESS NAME')
+                .agg(**{'Total Orders': ('ID','count'), 'Total Sales': ('SUBTOTAL','sum')})
+                .reset_index().sort_values('Total Orders', ascending=False).head(10)
+            ) if not _recent.empty else pd.DataFrame()
+
+            _top_drivers = (
+                _recent.groupby('DRIVER NAME')
+                .agg(**{'Total Deliveries': ('ID','count')})
+                .reset_index().sort_values('Total Deliveries', ascending=False).head(10)
+            ) if not _recent.empty else pd.DataFrame()
+
+            # ── Create worksheet ──
+            _ws = _reg_wb.create_sheet(title=_rcity[:31])
+            _cur_row = 1
+            _cur_row = _reg_write_section(
+                _ws, f"Weekly Summary — {_rcity}", _wk_sum, _cur_row)
+            _cur_row = _reg_write_section(
+                _ws, "Operations KPIs (Completed, outliers filtered)", _ops_kpi, _cur_row)
+            _cur_row = _reg_write_section(
+                _ws, f"Top 10 Vendors — {_latest_wk}", _top_vendors, _cur_row)
+            _cur_row = _reg_write_section(
+                _ws, f"Top 10 Drivers — {_latest_wk}", _top_drivers, _cur_row)
+
+        _prog.progress(100, text="✅ Done!")
+
+        # ── Save & store in session ──
+        _reg_buf = io.BytesIO()
+        _reg_wb.save(_reg_buf)
+        _reg_buf.seek(0)
+        st.session_state[_reg_btn_key] = _reg_buf.getvalue()
+
+    # Show download button once generated
+    if st.session_state.get(_reg_btn_key):
+        st.download_button(
+            "📥 Download Regional Report (Excel)",
+            data=st.session_state[_reg_btn_key],
+            file_name=f"Weekly_Report_By_City_{pd.Timestamp.today().strftime('%b_%d_%Y')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_regional_excel"
+        )
+        st.success("✅ Regional report ready — one sheet per city with summary, KPIs, vendors and drivers.")
+    _tr_ins_key = "trend_auto_insight"
+    if _tr_ins_key not in st.session_state:
+        st.session_state[_tr_ins_key] = None
+    _tr_ctx_hash = str(hash(weekly['Week_Label'].iloc[-1] + str(weekly['Total_Orders'].iloc[-1])))
+    if (st.session_state[_tr_ins_key] is None or
+            st.session_state.get(_tr_ins_key + "_hash") != _tr_ctx_hash):
+        with st.spinner("🤖 Analyzing trend…"):
+            _tr_ins, _tr_ctx = build_trend_insight(weekly, df)
+            st.session_state[_tr_ins_key] = (_tr_ins, _tr_ctx)
+            st.session_state[_tr_ins_key + "_hash"] = _tr_ctx_hash
+    if st.session_state[_tr_ins_key]:
+        _tr_ins, _tr_ctx = st.session_state[_tr_ins_key]
+        ai_block("trend_orders", _tr_ctx, _tr_ins)
+    # Refresh button
+    _tr_c1, _ = st.columns([2, 3])
+    if _tr_c1.button("↺ Refresh Trend Insight", key="btn_trend_refresh"):
+        st.session_state[_tr_ins_key] = None
+        st.rerun()
 
     st.divider()
 
@@ -795,47 +1015,175 @@ with tab1:
 
     # ── AI Weather Forecast for Coming Week ──
     st.markdown('<div class="section-header">🌤️ Weather Forecast — Coming Week (Tanzania)</div>', unsafe_allow_html=True)
-    st.caption("AI-predicted weather for key cities in Tanzania. Weather significantly impacts food delivery demand patterns.")
+    st.caption("AI-predicted weather for key cities. Rain >70% = 🔴 high impact on operations. Download the forecast for regional planning.")
 
-    _wf_btn_key = "show_weather_forecast"
-    if _wf_btn_key not in st.session_state:
-        st.session_state[_wf_btn_key] = None
+    _wf_btn_key  = "show_weather_forecast"
+    _wf_data_key = "weather_forecast_df"
+    # Always initialize both keys independently
+    if _wf_btn_key  not in st.session_state: st.session_state[_wf_btn_key]  = None
+    if _wf_data_key not in st.session_state: st.session_state[_wf_data_key] = None
 
-    _wf_col1, _ = st.columns([3,1])
-    with _wf_col1:
+    _wf_c1, _wf_c2 = st.columns([3, 1])
+    with _wf_c1:
         if st.button("🌤️ Generate Weekly Weather Forecast", key="btn_weather", type="primary", use_container_width=True):
-            _weather_prompt = """You are a weather intelligence assistant specialized in Tanzania.
+            from datetime import date, timedelta
+            _today_date = date.today()
+            _days_ahead = [(_today_date + timedelta(days=i)).strftime("%a %d %b") for i in range(1, 8)]
+            _days_str   = ", ".join(_days_ahead)
 
-Generate a **7-day weather forecast table** for the coming week for these cities:
-- Dar es Salaam (coastal, humid)
-- Arusha (highland, cooler)
-- Dodoma (inland, drier)
-- Zanzibar (tropical island)
-- Mwanza (lakeside)
+            _weather_prompt = f"""You are a meteorological analyst for Tanzania food delivery operations.
 
-Format your response as a markdown table with these columns:
-Date | City | Condition | Temp (°C) | Rain Risk | Delivery Impact
+Generate a 7-day weather forecast for the coming week ({_days_str}) for these cities:
+Dar es Salaam, Arusha, Dodoma, Zanzibar, Mwanza
 
-For Delivery Impact, rate how weather will affect food delivery demand:
-🟢 Boost (rainy/hot = more orders) | 🟡 Normal | 🔴 Risk (storms/extreme)
+Return ONLY a JSON array (no markdown, no explanation) like this:
+[
+  {{
+    "Date": "Mon 24 Feb",
+    "City": "Dar es Salaam",
+    "Condition": "Partly Cloudy",
+    "Temp_C": 31,
+    "Rain_Risk_Pct": 25,
+    "Rain_Start_Time": "N/A",
+    "Delivery_Impact": "Normal",
+    "Notes": "Hot afternoon may boost orders"
+  }},
+  ...
+]
 
-Note: This is an AI estimate based on seasonal patterns. For the current week in late February (end of short dry season / start of long rains).
+Rules:
+- Rain_Risk_Pct: integer 0–100 representing % probability of rain
+- Rain_Start_Time: estimated time rain starts if risk > 40%, else "N/A" (e.g. "14:00")
+- Delivery_Impact: one of "Boost", "Normal", "Risk"
+  * Boost = rainy/very hot conditions drive more food orders
+  * Risk = severe storms, flooding risk, extreme conditions that could disrupt riders
+  * Normal = standard conditions
+- Use February seasonal patterns for East Africa (end of short dry, start of long rains approaching)
+- Produce exactly 35 rows (5 cities × 7 days)"""
 
-After the table, add a brief 3-point summary of:
-1. Overall weather outlook for delivery operations
-2. Which city/day will see the biggest demand boost
-3. Any weather risk to prepare for operationally"""
+            with st.spinner("🌦️ Generating forecast…"):
+                _raw_weather = claude_insight(_weather_prompt, max_tokens=1400)
 
-            with st.spinner("Generating weather forecast…"):
-                _weather_result = claude_insight(_weather_prompt, max_tokens=900)
-            st.session_state[_wf_btn_key] = _weather_result
+            # Parse JSON
+            try:
+                import json as _json
+                # Strip any markdown backticks if present
+                _clean = _raw_weather.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+                _weather_rows = _json.loads(_clean)
+                _wf_df = pd.DataFrame(_weather_rows)
+                # Ensure numeric
+                _wf_df['Rain_Risk_Pct'] = pd.to_numeric(_wf_df['Rain_Risk_Pct'], errors='coerce').fillna(0).astype(int)
+                _wf_df['Temp_C']        = pd.to_numeric(_wf_df['Temp_C'], errors='coerce').fillna(28).astype(int)
+                st.session_state[_wf_btn_key]  = True
+                st.session_state[_wf_data_key] = _wf_df
+            except Exception:
+                # JSON parse failed — store raw text separately and show as markdown
+                st.session_state[_wf_btn_key]  = True
+                st.session_state[_wf_data_key] = _raw_weather  # string fallback
 
-    if st.session_state[_wf_btn_key]:
-        st.markdown(
-            f'<div class="ai-insight-card"><span class="ai-insight-label">🌤️ AI Weather Intelligence</span>'
-            f'{st.session_state[_wf_btn_key]}</div>',
-            unsafe_allow_html=True
-        )
+    if st.session_state.get(_wf_btn_key):
+        _wf_df = st.session_state.get(_wf_data_key)
+        if isinstance(_wf_df, pd.DataFrame) and not _wf_df.empty:
+            # Display city-by-city
+            _wf_cities = _wf_df['City'].unique() if 'City' in _wf_df.columns else []
+            _wf_cols = st.columns(min(len(_wf_cities), 5))
+            for _ci, _wcity in enumerate(_wf_cities):
+                with _wf_cols[_ci % len(_wf_cols)]:
+                    st.markdown(f"**{_wcity}**")
+                    _city_rows = _wf_df[_wf_df['City'] == _wcity]
+                    for _, _wr in _city_rows.iterrows():
+                        _risk = int(_wr.get('Rain_Risk_Pct', 0))
+                        _impact = str(_wr.get('Delivery_Impact', 'Normal'))
+                        _rain_time = str(_wr.get('Rain_Start_Time', 'N/A'))
+                        _cond = str(_wr.get('Condition', ''))
+                        _temp = _wr.get('Temp_C', '')
+
+                        # Flag color
+                        if _risk >= 70:
+                            _flag = "🔴"
+                            _border = "#dc3545"
+                            _bg     = "#fff5f5"
+                            _time_note = f"<br><small>⏰ Rain from ~{_rain_time}</small>" if _rain_time != 'N/A' else ""
+                        elif _risk >= 40:
+                            _flag = "🟡"
+                            _border = "#ffc107"
+                            _bg     = "#fffbee"
+                            _time_note = f"<br><small>⏰ Rain possible ~{_rain_time}</small>" if _rain_time != 'N/A' else ""
+                        else:
+                            _flag = "🟢"
+                            _border = "#28a745"
+                            _bg     = "#f5fff5"
+                            _time_note = ""
+
+                        _impact_icon = {"Boost":"📈","Normal":"➡️","Risk":"⚠️"}.get(_impact, "➡️")
+
+                        st.markdown(
+                            f'<div style="border-left:3px solid {_border};background:{_bg};'
+                            f'padding:6px 10px;border-radius:5px;margin:3px 0;font-size:12px;">'
+                            f'<b>{_wr.get("Date","")}</b> &nbsp; {_flag} {_risk}% rain<br>'
+                            f'🌡️ {_temp}°C &nbsp;|&nbsp; {_cond}<br>'
+                            f'{_impact_icon} {_impact}{_time_note}'
+                            f'</div>',
+                            unsafe_allow_html=True
+                        )
+
+            st.markdown("---")
+            # Legend
+            st.markdown(
+                '<small>🔴 ≥70% rain risk — high delivery disruption risk &nbsp;|&nbsp; '
+                '🟡 40–69% — moderate risk &nbsp;|&nbsp; 🟢 &lt;40% — normal operations &nbsp;|&nbsp; '
+                '📈 Demand Boost &nbsp;|&nbsp; ⚠️ Operational Risk</small>',
+                unsafe_allow_html=True
+            )
+
+            # Summary table
+            with st.expander("📋 Full forecast table", expanded=False):
+                _disp_wf = _wf_df.copy()
+                _disp_wf['Rain Alert'] = _disp_wf['Rain_Risk_Pct'].apply(
+                    lambda x: "🔴 HIGH RISK" if x >= 70 else ("🟡 Moderate" if x >= 40 else "🟢 Clear")
+                )
+                st.dataframe(_disp_wf, use_container_width=True)
+
+            # Excel download
+            _wf_excel_buf = io.BytesIO()
+            with pd.ExcelWriter(_wf_excel_buf, engine='xlsxwriter') as _wf_writer:
+                _wf_df.to_excel(_wf_writer, sheet_name='7-Day Forecast', index=False)
+                _wf_ws = _wf_writer.sheets['7-Day Forecast']
+                _wf_wb2 = _wf_writer.book
+                # Format header
+                _hdr_fmt = _wf_wb2.add_format({'bold': True, 'bg_color': '#1f77b4', 'font_color': 'white', 'border': 1})
+                _red_fmt = _wf_wb2.add_format({'bg_color': '#ffcccc', 'bold': True})
+                _yel_fmt = _wf_wb2.add_format({'bg_color': '#fff3cd'})
+                for _col_i, _col_name in enumerate(_wf_df.columns):
+                    _wf_ws.write(0, _col_i, _col_name, _hdr_fmt)
+                    _wf_ws.set_column(_col_i, _col_i, 18)
+                # Highlight high rain rows
+                for _ri, _row in _wf_df.iterrows():
+                    _row_risk = int(_row.get('Rain_Risk_Pct', 0))
+                    if _row_risk >= 70:
+                        for _ci2 in range(len(_wf_df.columns)):
+                            _wf_ws.write(_ri + 1, _ci2, _row.iloc[_ci2], _red_fmt)
+                    elif _row_risk >= 40:
+                        for _ci2 in range(len(_wf_df.columns)):
+                            _wf_ws.write(_ri + 1, _ci2, _row.iloc[_ci2], _yel_fmt)
+
+            st.download_button(
+                "⬇️ Download Weather Forecast (Excel)",
+                data=_wf_excel_buf.getvalue(),
+                file_name=f"Tanzania_Weather_Forecast_{pd.Timestamp.today().strftime('%d_%b_%Y')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+        else:
+            # Raw text fallback (JSON parse failed — show markdown instead)
+            _raw_text = st.session_state.get(_wf_data_key, "")
+            if isinstance(_raw_text, str) and _raw_text:
+                st.markdown(
+                    f'<div class="ai-insight-card"><span class="ai-insight-label">🌤️ AI Weather Intelligence</span>'
+                    f'{_raw_text}</div>',
+                    unsafe_allow_html=True
+                )
+            else:
+                st.info("Weather forecast could not be parsed. Please try generating again.")
 
     st.divider()
 
@@ -1629,10 +1977,21 @@ with tab4:
         Latest week: <b>{_p4_cw_monday.strftime('%d %b')} – {_p4_cw_sunday.strftime('%d %b %Y')}</b>
         </div>""", unsafe_allow_html=True)
 
+    # Compute date bounds — always available
+    _p4_min_date   = _p4_all['DELIVERY DATE'].min().date()
+    _p4_max_date   = _p4_latest_date.date()
+    _p4_8w_clamped = max(_p4_8w_start.date(), _p4_min_date)
+
+    # Always render date pickers (expander keeps them visible/interactive)
     with st.expander("🗓️ Customize date range (default = last 8 weeks)", expanded=False):
         _p4fc1, _p4fc2 = st.columns(2)
-        _p4_from = _p4fc1.date_input("From", value=_p4_8w_start.date(), key="p4_from")
-        _p4_to   = _p4fc2.date_input("To",   value=_p4_latest_date.date(), key="p4_to")
+        _p4_from = _p4fc1.date_input("From", value=_p4_8w_clamped,
+                                      min_value=_p4_min_date, max_value=_p4_max_date, key="p4_from")
+        _p4_to   = _p4fc2.date_input("To",   value=_p4_max_date,
+                                      min_value=_p4_min_date, max_value=_p4_max_date, key="p4_to")
+    # Retrieve from session state as fallback in case expander hasn't been opened
+    _p4_from = st.session_state.get("p4_from", _p4_8w_clamped)
+    _p4_to   = st.session_state.get("p4_to",   _p4_max_date)
 
     # Apply date filter
     _p4_mask = ((_p4_all['DELIVERY DATE'].dt.date >= _p4_from) &
@@ -2022,8 +2381,11 @@ with tab5:
         _cat_sel  = st.multiselect("Category", _all_cats, key="pp_cat")
 
     with _pf3:
+        _pp_min_d = _pp_df['DELIVERY DATE'].min().date()
+        _pp_max_d = _pp_df['DELIVERY DATE'].max().date()
         _pp_date_range = st.date_input("Date Range",
-            [_pp_df['DELIVERY DATE'].min().date(), _pp_df['DELIVERY DATE'].max().date()],
+            value=[_pp_min_d, _pp_max_d],
+            min_value=_pp_min_d, max_value=_pp_max_d,
             key="pp_dates")
 
     with _pf4:
@@ -2253,26 +2615,61 @@ with tab5:
     _all_pp['ISO_Week'] = _all_pp_iso.week
     _all_pp['ISO_Year'] = _all_pp_iso.year
 
-    # Identify latest & previous weeks
-    _pp_max_wk = int(_all_pp['ISO_Week'].max())
-    _pp_max_yr = int(_all_pp[_all_pp['ISO_Week']==_pp_max_wk]['ISO_Year'].max())
-    _pp_prev_wk = _pp_max_wk - 1
+    # Identify latest & previous weeks — use (Year, Week) pair to avoid year boundary bugs
+    _pp_latest_row = (_all_pp.dropna(subset=['DELIVERY DATE'])
+                      .sort_values('DELIVERY DATE').iloc[-1])
+    _pp_max_yr  = int(_pp_latest_row['ISO_Year'])
+    _pp_max_wk  = int(_pp_latest_row['ISO_Week'])
+    # Previous week — handle year boundary (week 1 of new year follows week 52/53)
+    if _pp_max_wk > 1:
+        _pp_prev_wk  = _pp_max_wk - 1
+        _pp_prev_yr  = _pp_max_yr
+    else:
+        _pp_prev_yr  = _pp_max_yr - 1
+        _pp_prev_wk  = 52  # last week of previous year
+    # Filter helpers
+    def _pp_is_cur(r):   return int(r['ISO_Year'])==_pp_max_yr and int(r['ISO_Week'])==_pp_max_wk
+    def _pp_is_prev(r):  return int(r['ISO_Year'])==_pp_prev_yr and int(r['ISO_Week'])==_pp_prev_wk
+    # ── Pre-compute data for all deep analytics tabs (outside tab blocks for scoping) ──
+    # Soju data
+    _soju_rows = []
+    for _, _r in _all_pp.iterrows():
+        for _pn, _qty in extract_products(_r.get('PRODUCTS','')):
+            if 'soju' in _pn.lower():
+                _soju_rows.append({'Product': _pn.strip().title(),
+                                   'Qty': _qty, 'Week': int(_r['ISO_Week']),
+                                   'Year': int(_r['ISO_Year']), 'Sales': _r.get('SUBTOTAL',0)})
+    _soju_df = pd.DataFrame(_soju_rows) if _soju_rows else pd.DataFrame()
+
+    # Cancelled data
+    _can_df = _all_pp[_all_pp['STATE'].str.contains('Reject|Cancel|Failed', case=False, na=False)].copy()
+    _can_prods = defaultdict(int)
+    if not _can_df.empty:
+        for _, _r in _can_df.iterrows():
+            for _pn, _qty in extract_products(_r.get('PRODUCTS','')):
+                _can_prods[standardize_product(_pn)] += _qty
+
+    # Late night data
+    _ln_df = _all_pp[(_all_pp['HOUR'] >= 23) | (_all_pp['HOUR'] <= 2)].copy()
+    _total_all = len(_all_pp)
+
+    # Pickup data
+    if 'DELIVERY TYPE' in _all_pp.columns:
+        _pick_df = _all_pp[_all_pp['DELIVERY TYPE'].str.lower().str.contains('pickup|pick_up|pick up', na=False)].copy()
+    else:
+        _pick_df = pd.DataFrame()
+    _comp_all_pp = _all_pp[_all_pp['STATE'].isin(['Completed','Delivery Completed By Driver'])]
+    _total_comp_pp = len(_comp_all_pp)
+
+    # OOS data — pre-build product weekly data from _pp_wk_prod (populated after tab5 product section runs)
+    _oos_rows_precomp = []
+    _oos_df = pd.DataFrame()  # will be populated after product analysis runs
 
     with _da_tab1:
         st.markdown("#### 🍶 Soju Product Analysis")
-        # Extract all soju products
-        _soju_rows = []
-        for _, _r in _all_pp.iterrows():
-            for _pn, _qty in extract_products(_r.get('PRODUCTS','')):
-                if 'soju' in _pn.lower():
-                    _soju_rows.append({'Product': _pn.strip().title(),
-                                       'Qty': _qty, 'Week': int(_r['ISO_Week']),
-                                       'Year': int(_r['ISO_Year']),
-                                       'Sales': _r.get('SUBTOTAL',0)})
-        if _soju_rows:
-            _soju_df = pd.DataFrame(_soju_rows)
-            _soju_cur  = _soju_df[_soju_df['Week']==_pp_max_wk]
-            _soju_prev = _soju_df[_soju_df['Week']==_pp_prev_wk]
+        if not _soju_df.empty:
+            _soju_cur  = _soju_df[(_soju_df['Week']==_pp_max_wk) & (_soju_df['Year']==_pp_max_yr)]
+            _soju_prev = _soju_df[(_soju_df['Week']==_pp_prev_wk) & (_soju_df['Year']==_pp_prev_yr)]
 
             _sc1, _sc2, _sc3 = st.columns(3)
             _sc1.metric("Soju Units This Week", f"{int(_soju_cur['Qty'].sum()):,}")
@@ -2331,12 +2728,11 @@ with tab5:
 
     with _da_tab3:
         st.markdown("#### ❌ Cancelled & Rejected Orders")
-        _can_df = _all_pp[_all_pp['STATE'].str.contains('Reject|Cancel|Failed', case=False, na=False)].copy()
         if not _can_df.empty:
             _ca1, _ca2, _ca3 = st.columns(3)
             _ca1.metric("Total Cancelled/Rejected", f"{len(_can_df):,}")
             _ca2.metric("This Week",
-                        f"{len(_can_df[_can_df['ISO_Week']==_pp_max_wk]):,}")
+                        f"{len(_can_df[(_can_df['ISO_Week']==_pp_max_wk) & (_can_df['ISO_Year']==_pp_max_yr)]):,}")
             _ca3.metric("Cancellation Rate",
                         f"{len(_can_df)/max(len(_all_pp),1)*100:.1f}%")
 
@@ -2347,10 +2743,6 @@ with tab5:
 
             # Products in cancelled orders
             st.markdown("##### 🏷️ Products Most Appearing in Cancelled Orders")
-            _can_prods = defaultdict(int)
-            for _, _r in _can_df.iterrows():
-                for _pn, _qty in extract_products(_r.get('PRODUCTS','')):
-                    _can_prods[standardize_product(_pn)] += _qty
             if _can_prods:
                 _cp_df = pd.DataFrame(_can_prods.items(), columns=['Product','Qty in Cancellations'])
                 _cp_df = _cp_df.sort_values('Qty in Cancellations', ascending=False)
@@ -2376,9 +2768,8 @@ with tab5:
     with _da_tab4:
         st.markdown("#### 🚗 Pickup Orders Analysis")
         st.caption("STATE = 'Completed' orders analyzed for pickup vs delivery split")
-        _pick_df = _all_pp[_all_pp['DELIVERY TYPE'].str.lower().str.contains('pickup|pick_up|pick up', na=False)].copy() if 'DELIVERY TYPE' in _all_pp.columns else pd.DataFrame()
-        _comp_all = _all_pp[_all_pp['STATE'].isin(['Completed','Delivery Completed By Driver'])]
-        _total_comp = len(_comp_all)
+        _comp_all = _comp_all_pp
+        _total_comp = _total_comp_pp
 
         if not _pick_df.empty:
             _pi1, _pi2, _pi3, _pi4 = st.columns(4)
@@ -2396,6 +2787,15 @@ with tab5:
             _piax.bar(_pick_wk['Week_Label'], _pick_wk['Orders'], color='#2980b9', alpha=0.8, label='Pickup Orders')
             _piax.set_title("Pickup Orders by Week"); _piax.grid(True, alpha=0.3, axis='y')
             _piax.legend(); plt.tight_layout(); st.pyplot(_pifig); plt.close()
+
+            # Top customers for pickup orders
+            st.markdown("##### 👑 Top Customers — Pickup Orders")
+            _pick_top_cust = (_pick_df.groupby('CUSTOMER NAME')
+                              .agg(Orders=('ID','count'), Total_Spend=('SUBTOTAL','sum'))
+                              .reset_index().sort_values('Total_Spend', ascending=False).head(10))
+            _pick_top_cust['Total_Spend'] = _pick_top_cust['Total_Spend'].apply(lambda x: f"{int(x):,} TZS")
+            _pick_top_cust.index = range(1, len(_pick_top_cust)+1)
+            st.dataframe(_pick_top_cust, use_container_width=True)
         else:
             # Fallback: show completed orders analysis
             st.info("DELIVERY TYPE column not found or no pickup entries — showing all completed orders analysis.")
@@ -2412,8 +2812,6 @@ with tab5:
 
     with _da_tab5:
         st.markdown("#### 🌙 Late Night Orders (23:00 – 02:00)")
-        _ln_df = _all_pp[(_all_pp['HOUR'] >= 23) | (_all_pp['HOUR'] <= 2)].copy()
-        _total_all = len(_all_pp)
         if not _ln_df.empty:
             _ln1, _ln2, _ln3, _ln4 = st.columns(4)
             _ln1.metric("Late Night Orders", f"{len(_ln_df):,}")
@@ -2421,7 +2819,7 @@ with tab5:
             _ln3.metric("% of Total Orders",
                         f"{len(_ln_df)/max(_total_all,1)*100:.1f}%")
             _ln4.metric("This Week",
-                        f"{len(_ln_df[_ln_df['ISO_Week']==_pp_max_wk]):,}")
+                        f"{len(_ln_df[(_ln_df['ISO_Week']==_pp_max_wk) & (_ln_df['ISO_Year']==_pp_max_yr)]):,}")
 
             # Weekly trend
             _ln_wk = (_ln_df.groupby(['ISO_Year','ISO_Week'])
@@ -2462,20 +2860,75 @@ with tab5:
     # ────────────────────────────────────────────────
     st.markdown("---")
     st.markdown('<div class="section-header">⚠️ Out-of-Stock & Availability Alerts</div>', unsafe_allow_html=True)
-    if _pp_prod_totals and len(_week_cols_pp if '_week_cols_pp' in dir() else []) >= 2:
+    if _pp_prod_totals:
+        try:
+            _wcp_len = len(_week_cols_pp)
+        except NameError:
+            _week_cols_pp = []
+            _wcp_len = 0
+    if _pp_prod_totals and _wcp_len >= 2:
+        # Rebuild OOS using (ISO_Year, ISO_Week) from _pp_comp for accuracy
+        _pp_cur_max_composite = _pp_max_yr * 100 + _pp_max_wk
+        _pp_wk_prod_yr = defaultdict(lambda: defaultdict(int))
+        for _, _oos_row in _pp_comp.iterrows():
+            _yw = int(_oos_row['ISO_Year'])*100 + int(_oos_row['ISO_Week'])
+            for _pn2, _qty2 in extract_products(_oos_row.get('PRODUCTS','')):
+                _pp_wk_prod_yr[standardize_product(_pn2)][_yw] += _qty2
+
         _oos_rows = []
-        for _prod, _wk_data in _pp_wk_prod.items():
-            _last_sold = max((_w for _w, _q in _wk_data.items() if _q > 0), default=None)
-            if _last_sold and _last_sold < _pp_max_wk:
-                _weeks_missing = _pp_max_wk - _last_sold
+        for _prod, _wk_data in _pp_wk_prod_yr.items():
+            _last_sold_yw = max((_yw for _yw, _q in _wk_data.items() if _q > 0), default=None)
+            if _last_sold_yw and _last_sold_yw < _pp_cur_max_composite:
+                _ls_yr, _ls_wk = _last_sold_yw // 100, _last_sold_yw % 100
+                # How many calendar weeks missing
+                _weeks_missing = ((_pp_max_yr - _ls_yr)*52 + (_pp_max_wk - _ls_wk))
                 _hist_avg = sum(_wk_data.values()) / max(len(_wk_data),1)
-                _oos_rows.append({'Product': _prod, 'Last Sold Week': f"W{_last_sold}",
-                                  'Weeks Since Last Sale': _weeks_missing,
-                                  'Historical Weekly Avg': round(_hist_avg,1)})
+                _oos_rows.append({'Product': _prod,
+                                  'Last Sold': f"{_ls_yr}-W{_ls_wk:02d}",
+                                  'Weeks Missing': _weeks_missing,
+                                  'Hist. Weekly Avg Qty': round(_hist_avg,1)})
         if _oos_rows:
-            _oos_df = pd.DataFrame(_oos_rows).sort_values('Weeks Since Last Sale', ascending=False)
-            st.warning(f"⚠️ {len(_oos_df)} products not sold in the current week — potential stock-out or listing issue:")
-            st.dataframe(_oos_df, use_container_width=True)
+            _oos_df = pd.DataFrame(_oos_rows).sort_values('Weeks Missing', ascending=False)
+
+            # Get avg order value from completed orders to estimate revenue loss
+            _avg_order_val = _pp_comp['SUBTOTAL'].mean() if not _pp_comp.empty else 5000
+            # Estimate revenue lost = hist_avg_qty * avg_items_per_order_revenue
+            # Simpler: use avg price per product unit ~ avg_order_val / avg_items_per_order
+            _avg_items_per_order = max(
+                pd.Series([len(extract_products(r)) for r in _pp_comp['PRODUCTS'].dropna().head(200)]).mean(), 1
+            )
+            _price_per_unit = _avg_order_val / _avg_items_per_order
+
+            _oos_df['Est. Weekly Revenue Lost (TZS)'] = (
+                _oos_df['Hist. Weekly Avg Qty'] * _price_per_unit
+            ).round(0).astype(int)
+
+            # Sort by estimated revenue loss (highest first = most impactful)
+            _oos_df = _oos_df.sort_values('Est. Weekly Revenue Lost (TZS)', ascending=False)
+
+            _total_rev_lost = _oos_df['Est. Weekly Revenue Lost (TZS)'].sum()
+            _top_oos = _oos_df.head(5)
+
+            st.warning(
+                f"⚠️ **{len(_oos_df)} products** not sold this week — "
+                f"estimated **{_total_rev_lost/1e3:.0f}K TZS** in weekly revenue at risk. "
+                f"Sorted by highest revenue impact first."
+            )
+
+            # Highlight the top impactful missing products
+            st.markdown("##### 🔴 Top Products Missing This Week (Highest Revenue Impact)")
+            for _, _oos_r in _top_oos.iterrows():
+                st.markdown(
+                    f"- **{_oos_r['Product']}** — last sold `{_oos_r['Last Sold']}` "
+                    f"({_oos_r['Weeks Missing']} week(s) missing) | "
+                    f"hist. avg **{_oos_r['Hist. Weekly Avg Qty']}** units/week | "
+                    f"~**{_oos_r['Est. Weekly Revenue Lost (TZS)']:,} TZS** lost this week"
+                )
+
+            with st.expander("📋 View all missing products", expanded=False):
+                _oos_display = _oos_df.copy()
+                _oos_display['Est. Weekly Revenue Lost (TZS)'] = _oos_display['Est. Weekly Revenue Lost (TZS)'].apply(lambda x: f"{x:,}")
+                st.dataframe(_oos_display, use_container_width=True)
         else:
             st.success("✅ No products appear to be missing in the current week.")
 
@@ -2489,26 +2942,45 @@ with tab5:
 
         # Soju summary for context
         _soju_ctx = ""
-        if _soju_rows if '_soju_rows' in dir() else False:
-            _soju_ctx = f"\nSOJU THIS WEEK: {int(_soju_df[_soju_df['Week']==_pp_max_wk]['Qty'].sum())} units | PREV WEEK: {int(_soju_df[_soju_df['Week']==_pp_prev_wk]['Qty'].sum())} units\n"
+        try:
+            if not _soju_df.empty:
+                _s_cur  = _soju_df[(_soju_df['Week']==_pp_max_wk) & (_soju_df['Year']==_pp_max_yr)]
+                _s_prev = _soju_df[(_soju_df['Week']==_pp_prev_wk) & (_soju_df['Year']==_pp_prev_yr)]
+                _soju_ctx = (f"\nSOJU THIS WEEK (W{_pp_max_wk}/{_pp_max_yr}): {int(_s_cur['Qty'].sum())} units | "
+                             f"PREV WEEK: {int(_s_prev['Qty'].sum())} units\n")
+        except Exception:
+            pass
 
         # Cancelled context
         _can_ctx = ""
-        if '_can_df' in dir() and not _can_df.empty:
-            _top_can_prod = sorted(_can_prods.items(), key=lambda x: -x[1])[:3] if '_can_prods' in dir() and _can_prods else []
-            _can_ctx = (f"\nCANCELLED ORDERS: {len(_can_df)} total ({len(_can_df)/max(len(_all_pp),1)*100:.1f}% rate)\n"
-                        f"Top cancelled products: {', '.join([p for p,_ in _top_can_prod])}\n")
+        try:
+            if not _can_df.empty:
+                _top_can_prod = sorted(_can_prods.items(), key=lambda x: -x[1])[:3] if _can_prods else []
+                _can_ctx = (f"\nCANCELLED ORDERS: {len(_can_df)} total ({len(_can_df)/max(len(_all_pp),1)*100:.1f}% rate)\n"
+                            f"Top cancelled products: {', '.join([p for p,_ in _top_can_prod])}\n")
+        except Exception:
+            pass
 
         # Late night context
         _ln_ctx = ""
-        if '_ln_df' in dir() and not _ln_df.empty:
-            _ln_ctx = (f"\nLATE NIGHT ORDERS: {len(_ln_df)} ({len(_ln_df)/max(_total_all,1)*100:.1f}% of total)\n"
-                       f"This week late night: {len(_ln_df[_ln_df['ISO_Week']==_pp_max_wk])}\n")
+        try:
+            if not _ln_df.empty:
+                _ln_this_wk = len(_ln_df[(_ln_df['ISO_Week']==_pp_max_wk) & (_ln_df['ISO_Year']==_pp_max_yr)])
+                _ln_ctx = (f"\nLATE NIGHT ORDERS: {len(_ln_df)} ({len(_ln_df)/max(_total_all,1)*100:.1f}% of total)\n"
+                           f"This week (W{_pp_max_wk}/{_pp_max_yr}) late night: {_ln_this_wk}\n")
+        except Exception:
+            pass
 
         # OOS context
         _oos_ctx = ""
-        if '_oos_df' in dir() and not (_oos_df.empty if hasattr(_oos_df, 'empty') else True):
-            _oos_ctx = f"\nPRODUCTS NOT SOLD THIS WEEK (potential OOS): {', '.join(_oos_df['Product'].head(5).tolist())}\n"
+        try:
+            if not _oos_df.empty:
+                _top_oos_names = _oos_df.head(5)['Product'].tolist()
+                _total_loss = _oos_df['Est. Weekly Revenue Lost (TZS)'].sum() if 'Est. Weekly Revenue Lost (TZS)' in _oos_df.columns else 0
+                _oos_ctx = (f"\nPRODUCTS NOT SOLD THIS WEEK (potential OOS): {', '.join(_top_oos_names)}\n"
+                            f"Estimated total revenue at risk from missing products: {_total_loss:,} TZS/week\n")
+        except Exception:
+            _oos_ctx = ""
 
         _pp_ctx = (f"PIKI PARTY STORE ANALYSIS — Current Week: W{_pp_max_wk}\n"
                    f"Total completed orders: {len(_pp_comp):,}\n"
@@ -2534,9 +3006,23 @@ with tab5:
             "Be specific, use real numbers from the data provided, write as a strategic advisor."
         )
 
-        def _run_pp_insight():
-            return claude_insight(_pp_prompt, max_tokens=1100), _pp_ctx
-        ai_insight_button("piki_party", "Piki Party Deep Analysis", _run_pp_insight)
+        # Auto-run AI insight (no button needed — users want immediate insight)
+        _pp_ins_key = "pp_auto_insight"
+        if _pp_ins_key not in st.session_state:
+            st.session_state[_pp_ins_key] = None
+        # Recompute if context changed (use hash of first 200 chars as proxy)
+        _pp_ctx_hash = str(hash(_pp_ctx[:200]))
+        if (st.session_state[_pp_ins_key] is None or
+                st.session_state.get(_pp_ins_key + "_hash") != _pp_ctx_hash):
+            with st.spinner("🤖 Generating Piki Party deep analysis…"):
+                st.session_state[_pp_ins_key] = claude_insight(_pp_prompt, max_tokens=1100)
+                st.session_state[_pp_ins_key + "_hash"] = _pp_ctx_hash
+        if st.session_state[_pp_ins_key]:
+            ai_block("piki_party", _pp_ctx, st.session_state[_pp_ins_key])
+        # Still allow manual refresh
+        if st.button("↺ Refresh AI Insight", key="pp_ins_refresh"):
+            st.session_state[_pp_ins_key] = None
+            st.rerun()
     else:
         st.info("Upload more data to generate AI insights for Piki Party.")
 
