@@ -2622,11 +2622,13 @@ with tab5:
     _pp_max_wk  = int(_pp_latest_row['ISO_Week'])
     # Previous week — handle year boundary (week 1 of new year follows week 52/53)
     if _pp_max_wk > 1:
-        _pp_prev_wk  = _pp_max_wk - 1
-        _pp_prev_yr  = _pp_max_yr
+        _pp_prev_wk = _pp_max_wk - 1
+        _pp_prev_yr = _pp_max_yr
     else:
-        _pp_prev_yr  = _pp_max_yr - 1
-        _pp_prev_wk  = 52  # last week of previous year
+        _pp_prev_yr = _pp_max_yr - 1
+        # Check if prev year had 53 ISO weeks (e.g. 2020, 2015 had 53)
+        _dec28_prev = pd.Timestamp(f"{_pp_prev_yr}-12-28")
+        _pp_prev_wk = int(_dec28_prev.isocalendar()[1])  # Dec 28 always in last ISO week
     # Filter helpers
     def _pp_is_cur(r):   return int(r['ISO_Year'])==_pp_max_yr and int(r['ISO_Week'])==_pp_max_wk
     def _pp_is_prev(r):  return int(r['ISO_Year'])==_pp_prev_yr and int(r['ISO_Week'])==_pp_prev_wk
@@ -2640,6 +2642,11 @@ with tab5:
                                    'Qty': _qty, 'Week': int(_r['ISO_Week']),
                                    'Year': int(_r['ISO_Year']), 'Sales': _r.get('SUBTOTAL',0)})
     _soju_df = pd.DataFrame(_soju_rows) if _soju_rows else pd.DataFrame()
+    # Add composite key for safe year-boundary filtering
+    if not _soju_df.empty:
+        _soju_df['YW'] = _soju_df['Year'] * 100 + _soju_df['Week']
+    _pp_cur_yw  = _pp_max_yr  * 100 + _pp_max_wk
+    _pp_prev_yw = _pp_prev_yr * 100 + _pp_prev_wk
 
     # Cancelled data
     _can_df = _all_pp[_all_pp['STATE'].str.contains('Reject|Cancel|Failed', case=False, na=False)].copy()
@@ -2668,8 +2675,8 @@ with tab5:
     with _da_tab1:
         st.markdown("#### 🍶 Soju Product Analysis")
         if not _soju_df.empty:
-            _soju_cur  = _soju_df[(_soju_df['Week']==_pp_max_wk) & (_soju_df['Year']==_pp_max_yr)]
-            _soju_prev = _soju_df[(_soju_df['Week']==_pp_prev_wk) & (_soju_df['Year']==_pp_prev_yr)]
+            _soju_cur  = _soju_df[_soju_df['YW']==_pp_cur_yw]  if 'YW' in _soju_df.columns else _soju_df[(_soju_df['Week']==_pp_max_wk)&(_soju_df['Year']==_pp_max_yr)]
+            _soju_prev = _soju_df[_soju_df['YW']==_pp_prev_yw] if 'YW' in _soju_df.columns else _soju_df[(_soju_df['Week']==_pp_prev_wk)&(_soju_df['Year']==_pp_prev_yr)]
 
             _sc1, _sc2, _sc3 = st.columns(3)
             _sc1.metric("Soju Units This Week", f"{int(_soju_cur['Qty'].sum()):,}")
@@ -2678,15 +2685,16 @@ with tab5:
             _sc3.metric("Soju Revenue (TZS)", f"{_soju_cur['Sales'].sum()/1e3:.0f}K")
 
             # Weekly trend per soju variant
-            _soju_wk = (_soju_df.groupby(['Product','Week'])['Qty'].sum().reset_index()
-                        .pivot(index='Product', columns='Week', values='Qty').fillna(0))
-            st.dataframe(_soju_wk, use_container_width=True)
+            _soju_wk = (_soju_df.groupby(['Year','Week','Product'])['Qty'].sum().reset_index())
+            _soju_wk['Period'] = _soju_wk['Year'].astype(str) + "-W" + _soju_wk['Week'].astype(str).str.zfill(2)
+            _soju_pivot = _soju_wk.pivot_table(index='Product', columns='Period', values='Qty', aggfunc='sum').fillna(0).astype(int)
+            st.dataframe(_soju_pivot, use_container_width=True)
 
             _sfig, _sax = plt.subplots(figsize=(11,4))
-            _soju_weekly_total = _soju_df.groupby('Week')['Qty'].sum()
-            _sax.bar(_soju_weekly_total.index.astype(str), _soju_weekly_total.values,
-                     color='#9b59b6', alpha=0.8)
-            _sax.set_xlabel("ISO Week"); _sax.set_ylabel("Units Sold")
+            _soju_weekly_total = _soju_df.groupby('YW')['Qty'].sum().reset_index()
+            _soju_weekly_total['Label'] = (_soju_weekly_total['YW'] // 100).astype(str) + "-W" + (_soju_weekly_total['YW'] % 100).astype(str).str.zfill(2)
+            _sax.bar(_soju_weekly_total['Label'], _soju_weekly_total['Qty'], color='#9b59b6', alpha=0.8)
+            _sax.set_xlabel("Year-Week"); _sax.set_ylabel("Units Sold")
             _sax.set_title("Total Soju Sales by Week"); _sax.grid(True, alpha=0.3, axis='y')
             plt.tight_layout(); st.pyplot(_sfig); plt.close()
         else:
@@ -2787,6 +2795,17 @@ with tab5:
             _piax.bar(_pick_wk['Week_Label'], _pick_wk['Orders'], color='#2980b9', alpha=0.8, label='Pickup Orders')
             _piax.set_title("Pickup Orders by Week"); _piax.grid(True, alpha=0.3, axis='y')
             _piax.legend(); plt.tight_layout(); st.pyplot(_pifig); plt.close()
+
+            # Top customers for pickup
+            st.markdown("##### 👤 Top Pickup Customers")
+            _pick_cust = (_pick_df.groupby('CUSTOMER NAME')
+                          .agg(Pickup_Orders=('ID','count'), Total_Spend=('SUBTOTAL','sum'),
+                               Avg_Order=('SUBTOTAL','mean'))
+                          .reset_index().sort_values('Pickup_Orders', ascending=False))
+            _pick_cust['Total_Spend'] = _pick_cust['Total_Spend'].apply(lambda x: f"{int(x):,} TZS")
+            _pick_cust['Avg_Order']   = _pick_cust['Avg_Order'].apply(lambda x: f"{int(x):,} TZS")
+            _pick_cust.index = range(1, len(_pick_cust)+1)
+            st.dataframe(_pick_cust.head(20), use_container_width=True)
 
             # Top customers for pickup orders
             st.markdown("##### 👑 Top Customers — Pickup Orders")
@@ -2933,7 +2952,7 @@ with tab5:
             st.success("✅ No products appear to be missing in the current week.")
 
     # ────────────────────────────────────────────────
-    # AI INSIGHT (ON-DEMAND)
+    # AI INSIGHT — AUTO-RUNS (cached in session state)
     # ────────────────────────────────────────────────
     st.markdown("---")
     if not _pp_weekly.empty and _pp_prod_totals:
@@ -2944,8 +2963,8 @@ with tab5:
         _soju_ctx = ""
         try:
             if not _soju_df.empty:
-                _s_cur  = _soju_df[(_soju_df['Week']==_pp_max_wk) & (_soju_df['Year']==_pp_max_yr)]
-                _s_prev = _soju_df[(_soju_df['Week']==_pp_prev_wk) & (_soju_df['Year']==_pp_prev_yr)]
+                _s_cur  = _soju_df[_soju_df['YW']==_pp_cur_yw]
+                _s_prev = _soju_df[_soju_df['YW']==_pp_prev_yw]
                 _soju_ctx = (f"\nSOJU THIS WEEK (W{_pp_max_wk}/{_pp_max_yr}): {int(_s_cur['Qty'].sum())} units | "
                              f"PREV WEEK: {int(_s_prev['Qty'].sum())} units\n")
         except Exception:
@@ -2965,7 +2984,8 @@ with tab5:
         _ln_ctx = ""
         try:
             if not _ln_df.empty:
-                _ln_this_wk = len(_ln_df[(_ln_df['ISO_Week']==_pp_max_wk) & (_ln_df['ISO_Year']==_pp_max_yr)])
+                _ln_yw = _ln_df['ISO_Year'] * 100 + _ln_df['ISO_Week']
+                _ln_this_wk = len(_ln_df[_ln_yw==_pp_cur_yw])
                 _ln_ctx = (f"\nLATE NIGHT ORDERS: {len(_ln_df)} ({len(_ln_df)/max(_total_all,1)*100:.1f}% of total)\n"
                            f"This week (W{_pp_max_wk}/{_pp_max_yr}) late night: {_ln_this_wk}\n")
         except Exception:
@@ -3006,21 +3026,24 @@ with tab5:
             "Be specific, use real numbers from the data provided, write as a strategic advisor."
         )
 
-        # Auto-run AI insight (no button needed — users want immediate insight)
+        # Auto-run AI insight — cached per data context, refresh button available
         _pp_ins_key = "pp_auto_insight"
+        _pp_ctx_hash = str(hash(_pp_ctx[:300]))
         if _pp_ins_key not in st.session_state:
-            st.session_state[_pp_ins_key] = None
-        # Recompute if context changed (use hash of first 200 chars as proxy)
-        _pp_ctx_hash = str(hash(_pp_ctx[:200]))
+            st.session_state[_pp_ins_key]            = None
+            st.session_state[_pp_ins_key + "_hash"]  = None
         if (st.session_state[_pp_ins_key] is None or
                 st.session_state.get(_pp_ins_key + "_hash") != _pp_ctx_hash):
             with st.spinner("🤖 Generating Piki Party deep analysis…"):
-                st.session_state[_pp_ins_key] = claude_insight(_pp_prompt, max_tokens=1100)
-                st.session_state[_pp_ins_key + "_hash"] = _pp_ctx_hash
+                try:
+                    st.session_state[_pp_ins_key]           = claude_insight(_pp_prompt, max_tokens=1200)
+                    st.session_state[_pp_ins_key + "_hash"] = _pp_ctx_hash
+                except Exception as _pp_err:
+                    st.session_state[_pp_ins_key] = f"Error generating insight: {_pp_err}"
         if st.session_state[_pp_ins_key]:
             ai_block("piki_party", _pp_ctx, st.session_state[_pp_ins_key])
-        # Still allow manual refresh
-        if st.button("↺ Refresh AI Insight", key="pp_ins_refresh"):
+        _pp_ref_c1, _ = st.columns([2, 4])
+        if _pp_ref_c1.button("↺ Refresh AI Insight", key="pp_ins_refresh"):
             st.session_state[_pp_ins_key] = None
             st.rerun()
     else:
