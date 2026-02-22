@@ -517,57 +517,78 @@ with st.sidebar:
         except Exception as e:
             return None, str(e)
 
-    # ── Data loading UI ──
-    _load_btn  = st.button("🔄 Refresh Data", type="primary", use_container_width=True)
+    # ── Default data file — auto-loads when app opens ──
+    DEFAULT_CSV = "February Week 3.csv"   # keep this file in the same folder as Weekly_Report.py
 
+    def _try_load_default():
+        """Load the default CSV from the same directory as this script."""
+        _try_paths = [
+            DEFAULT_CSV,
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), DEFAULT_CSV),
+        ]
+        for _p in _try_paths:
+            if os.path.exists(_p):
+                try:
+                    return pd.read_csv(_p, encoding='utf-8', on_bad_lines='skip'), _p
+                except Exception:
+                    try:
+                        return pd.read_csv(_p, encoding='latin-1', on_bad_lines='skip'), _p
+                    except Exception:
+                        pass
+        return None, None
+
+    # ── Optional file override (always visible in sidebar) ──
+    with st.expander("📂 Upload different file (optional)", expanded=False):
+        _uploaded = st.file_uploader(
+            "CSV or Excel — replaces the default dataset",
+            type=["csv", "xlsx"],
+            key="override_upload",
+            label_visibility="collapsed"
+        )
+        st.caption(f"Default: **{DEFAULT_CSV}** (auto-loaded)")
+
+    _load_btn = st.button("🔄 Refresh Data", type="secondary", use_container_width=True)
+
+    # ── Load logic: DB → Upload → Default CSV ──
     if _load_btn or "raw_df" not in st.session_state:
         if SUPABASE_URL and SUPABASE_KEY:
             with st.spinner("Loading from database…"):
                 _df_raw, _err = _load_from_supabase(SUPABASE_URL, SUPABASE_KEY, DB_TABLE)
             if _df_raw is not None:
                 raw = _parse_dates(_df_raw)
-                st.session_state.raw_df = raw
-                st.success(f"✅ {len(raw):,} rows loaded from database")
+                st.session_state.raw_df  = raw
+                st.session_state["_src"] = "database"
+                st.success(f"✅ {len(raw):,} rows from database")
             else:
-                st.error(f"❌ Database error: {_err}")
+                st.error(f"❌ DB error: {_err}")
                 st.stop()
+        elif _uploaded:
+            with st.spinner(f"Reading {_uploaded.name}…"):
+                try:
+                    raw = (pd.read_csv(_uploaded, encoding='utf-8', on_bad_lines='skip')
+                           if _uploaded.name.endswith(".csv") else pd.read_excel(_uploaded))
+                    raw = _parse_dates(raw)
+                    st.session_state.raw_df  = raw
+                    st.session_state["_src"] = _uploaded.name
+                    st.success(f"✅ {len(raw):,} rows from **{_uploaded.name}**")
+                except Exception as _ue:
+                    st.error(f"❌ Cannot read file: {_ue}")
+                    st.stop()
         else:
-            # FALLBACK: CSV / Excel upload
-            st.markdown("#### 📂 Upload Data File")
-            _uploaded = st.file_uploader(
-                "Upload your orders CSV or Excel file",
-                type=["csv","xlsx"],
-                key="fallback_upload",
-                help="Upload the orders export from your system"
-            )
-            if _uploaded:
-                with st.spinner("Reading file…"):
-                    try:
-                        if _uploaded.name.endswith(".csv"):
-                            raw = pd.read_csv(_uploaded, encoding='utf-8', on_bad_lines='skip')
-                        else:
-                            raw = pd.read_excel(_uploaded)
-                        raw = _parse_dates(raw)
-                        st.session_state.raw_df = raw
-                        st.success(f"✅ {len(raw):,} rows loaded from **{_uploaded.name}**")
-                    except Exception as _ue:
-                        st.error(f"❌ Could not read file: {_ue}")
-                        st.stop()
+            # Auto-load default CSV — silent on success (no spinner needed for local file)
+            _def_df, _def_path = _try_load_default()
+            if _def_df is not None:
+                raw = _parse_dates(_def_df)
+                st.session_state.raw_df  = raw
+                st.session_state["_src"] = DEFAULT_CSV
             elif "raw_df" not in st.session_state:
-                st.markdown("""
-                <div style="background:#f8f9fa;border:2px dashed #dee2e6;border-radius:12px;
-                            padding:20px 24px;text-align:center;margin:10px 0;">
-                  <div style="font-size:32px;margin-bottom:8px;">📂</div>
-                  <div style="font-weight:600;font-size:15px;color:#495057;">No data loaded yet</div>
-                  <div style="font-size:13px;color:#6c757d;margin-top:4px;">
-                    Upload a CSV or Excel export above to get started.<br>
-                    Or add Supabase credentials to <code>.streamlit/secrets.toml</code>
-                  </div>
-                </div>""", unsafe_allow_html=True)
+                st.error(f"⚠️ **{DEFAULT_CSV}** not found in app folder.")
+                st.info("Place the file next to Weekly_Report.py, or expand '📂 Upload' above.")
                 st.stop()
 
     raw = st.session_state.raw_df
-    st.markdown(f"📊 **{len(raw):,} rows** loaded")
+    _src_lbl = st.session_state.get("_src", DEFAULT_CSV)
+    st.markdown(f"📊 **{len(raw):,} rows** — `{_src_lbl}`")
 
     st.divider()
     st.subheader("🔍 Global Filters")
@@ -1082,7 +1103,7 @@ Rules:
     if st.session_state.get(_wf_btn_key):
         _wf_df = st.session_state.get(_wf_data_key)
         if isinstance(_wf_df, pd.DataFrame) and not _wf_df.empty:
-            # Display city-by-city
+            # Display city-by-city — 5 columns, one per city
             _wf_cities = _wf_df['City'].unique() if 'City' in _wf_df.columns else []
             _wf_cols = st.columns(min(len(_wf_cities), 5))
             for _ci, _wcity in enumerate(_wf_cities):
@@ -1096,7 +1117,6 @@ Rules:
                         _cond = str(_wr.get('Condition', ''))
                         _temp = _wr.get('Temp_C', '')
 
-                        # Flag color
                         if _risk >= 70:
                             _flag = "🔴"
                             _border = "#dc3545"
@@ -1126,7 +1146,6 @@ Rules:
                         )
 
             st.markdown("---")
-            # Legend
             st.markdown(
                 '<small>🔴 ≥70% rain risk — high delivery disruption risk &nbsp;|&nbsp; '
                 '🟡 40–69% — moderate risk &nbsp;|&nbsp; 🟢 &lt;40% — normal operations &nbsp;|&nbsp; '
@@ -1134,7 +1153,6 @@ Rules:
                 unsafe_allow_html=True
             )
 
-            # Summary table
             with st.expander("📋 Full forecast table", expanded=False):
                 _disp_wf = _wf_df.copy()
                 _disp_wf['Rain Alert'] = _disp_wf['Rain_Risk_Pct'].apply(
@@ -1142,20 +1160,17 @@ Rules:
                 )
                 st.dataframe(_disp_wf, use_container_width=True)
 
-            # Excel download
             _wf_excel_buf = io.BytesIO()
             with pd.ExcelWriter(_wf_excel_buf, engine='xlsxwriter') as _wf_writer:
                 _wf_df.to_excel(_wf_writer, sheet_name='7-Day Forecast', index=False)
                 _wf_ws = _wf_writer.sheets['7-Day Forecast']
                 _wf_wb2 = _wf_writer.book
-                # Format header
                 _hdr_fmt = _wf_wb2.add_format({'bold': True, 'bg_color': '#1f77b4', 'font_color': 'white', 'border': 1})
                 _red_fmt = _wf_wb2.add_format({'bg_color': '#ffcccc', 'bold': True})
                 _yel_fmt = _wf_wb2.add_format({'bg_color': '#fff3cd'})
                 for _col_i, _col_name in enumerate(_wf_df.columns):
                     _wf_ws.write(0, _col_i, _col_name, _hdr_fmt)
                     _wf_ws.set_column(_col_i, _col_i, 18)
-                # Highlight high rain rows
                 for _ri, _row in _wf_df.iterrows():
                     _row_risk = int(_row.get('Rain_Risk_Pct', 0))
                     if _row_risk >= 70:
@@ -1164,15 +1179,14 @@ Rules:
                     elif _row_risk >= 40:
                         for _ci2 in range(len(_wf_df.columns)):
                             _wf_ws.write(_ri + 1, _ci2, _row.iloc[_ci2], _yel_fmt)
-
             st.download_button(
                 "⬇️ Download Weather Forecast (Excel)",
                 data=_wf_excel_buf.getvalue(),
                 file_name=f"Tanzania_Weather_Forecast_{pd.Timestamp.today().strftime('%d_%b_%Y')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_weather_excel"
             )
         else:
-            # Raw text fallback (JSON parse failed — show markdown instead)
             _raw_text = st.session_state.get(_wf_data_key, "")
             if isinstance(_raw_text, str) and _raw_text:
                 st.markdown(
@@ -1183,7 +1197,7 @@ Rules:
             else:
                 st.info("Weather forecast could not be parsed. Please try generating again.")
 
-    st.divider()
+        st.divider()
 
     # ── Failed & Rejected Orders ──
     st.markdown('<div class="section-header">❌ Failed & Rejected Orders Analysis</div>', unsafe_allow_html=True)
@@ -2161,11 +2175,10 @@ with tab4:
             with _p1c1:
                 _m4 = folium.Map(location=_center, zoom_start=13, tiles="CartoDB positron")
 
-                # Customer heatmap
+                # Customer heatmap — folium default palette (matches Delivery Times tab)
                 if _map4_type != "Businesses":
                     _cust_coords = _geo4[['CUSTOMER LATITUDE','CUSTOMER LONGITUDE']].values.tolist()
-                    HeatMap(_cust_coords, radius=14, blur=12, name="Customer Density",
-                            gradient={0.3:'#74b9ff',0.6:'#0984e3',1.0:'#2d3436'}).add_to(_m4)
+                    HeatMap(_cust_coords, radius=12, blur=10).add_to(_m4)
 
                 # Restaurant circle markers
                 if _map4_type != "Customers":
