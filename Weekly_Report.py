@@ -53,12 +53,12 @@ st.markdown("""
 <style>
     .metric-card {
         background: #f8f9fa; border-radius: 10px;
-        padding: 16px; text-align: center; border-left: 4px solid #1f77b4;
+        padding: 16px; text-align: center; border-left: 4px solid #FF6B00;
     }
-    .metric-value { font-size: 28px; font-weight: 700; color: #1f77b4; }
+    .metric-value { font-size: 28px; font-weight: 700; color: #FF6B00; }
     .metric-label { font-size: 13px; color: #666; margin-top: 4px; }
     .section-header {
-        background: linear-gradient(90deg, #1f77b4 0%, #0d5fa3 100%);
+        background: linear-gradient(90deg, #FF6B00 0%, #CC5500 100%);
         color: white; padding: 10px 18px; border-radius: 8px;
         font-size: 16px; font-weight: 600; margin-bottom: 16px;
     }
@@ -67,9 +67,9 @@ st.markdown("""
     div[data-testid="stTabs"] button { font-size: 15px; font-weight: 600; }
     /* AI Insight card */
     .ai-insight-card {
-        background: #fafbff;
+        background: #FFF9F5;
         border: 1px solid #e0e6f0;
-        border-left: 3px solid #1f77b4;
+        border-left: 3px solid #FF6B00;
         border-radius: 8px;
         padding: 14px 18px;
         margin: 8px 0;
@@ -80,7 +80,7 @@ st.markdown("""
     .ai-insight-card h1, .ai-insight-card h2, .ai-insight-card h3 {
         font-size: 14px !important;
         font-weight: 600 !important;
-        color: #1a3a5c !important;
+        color: #8B3000 !important;
         margin: 8px 0 4px 0 !important;
     }
     .ai-insight-card p { margin: 4px 0 !important; }
@@ -91,7 +91,7 @@ st.markdown("""
     .ai-insight-label {
         font-size: 11px;
         font-weight: 600;
-        color: #1f77b4;
+        color: #FF6B00;
         text-transform: uppercase;
         letter-spacing: 0.5px;
         margin-bottom: 6px;
@@ -805,7 +805,7 @@ with tab1:
     # ── Chart ──
     fig, ax1 = plt.subplots(figsize=(13, 5))
     ax1.plot(weekly['Week_Label'], weekly['Total_Orders'],
-             color='#1f77b4', marker='o', lw=2, label='Total Orders')
+             color='#FF6B00', marker='o', lw=2, label='Total Orders')
     if 'Growth KPI Orders' in weekly.columns:
         ax1.plot(weekly['Week_Label'], weekly['Growth KPI Orders'],
                  color='green', lw=2, linestyle='--', label='1.2% Growth KPI')
@@ -1157,7 +1157,7 @@ with tab1:
         # Chart: actual + forecast
         fig2, ax2 = plt.subplots(figsize=(13, 5))
         ax2.plot(weekly['Week_Label'], weekly['Total_Orders'],
-                 marker='o', color='#1f77b4', lw=2, label='Actual Orders')
+                 marker='o', color='#FF6B00', lw=2, label='Actual Orders')
         if 'Growth KPI Orders' in weekly.columns:
             ax2.plot(weekly['Week_Label'], weekly['Growth KPI Orders'],
                      linestyle='--', color='green', lw=1.5, label='KPI Trajectory')
@@ -1349,7 +1349,7 @@ Rules:
                 _wf_df.to_excel(_wf_writer, sheet_name='7-Day Forecast', index=False)
                 _wf_ws = _wf_writer.sheets['7-Day Forecast']
                 _wf_wb2 = _wf_writer.book
-                _hdr_fmt = _wf_wb2.add_format({'bold': True, 'bg_color': '#1f77b4', 'font_color': 'white', 'border': 1})
+                _hdr_fmt = _wf_wb2.add_format({'bold': True, 'bg_color': '#FF6B00', 'font_color': 'white', 'border': 1})
                 _red_fmt = _wf_wb2.add_format({'bg_color': '#ffcccc', 'bold': True})
                 _yel_fmt = _wf_wb2.add_format({'bg_color': '#fff3cd'})
                 for _col_i, _col_name in enumerate(_wf_df.columns):
@@ -1695,7 +1695,7 @@ with tab2:
 
         # Main line in blue
         _ax_adt.plot(range(len(_adt_labels)), _adt_vals,
-                     marker='o', color='#2980b9', lw=2, label='Avg Delivery Time')
+                     marker='o', color='#FF6B00', lw=2, label='Avg Delivery Time')
 
         # Last week point highlighted in arrow colour
         _ax_adt.plot(len(_adt_labels) - 1, _last_val, 'o',
@@ -2358,7 +2358,7 @@ with tab4:
     _p4_cw_sunday   = _p4_cw_monday + pd.Timedelta(days=6)
 
     st.markdown(
-        f"""<div style="background:#e8f4fd;border-left:3px solid #1f77b4;
+        f"""<div style="background:#FFF4EC;border-left:3px solid #FF6B00;
             padding:10px 14px;border-radius:6px;margin-bottom:12px;font-size:13px;">
         📅 <b>Analysis period:</b> Last 8 weeks 
         ({_p4_8w_start.strftime('%d %b')} – {_p4_latest_date.strftime('%d %b %Y')}) &nbsp;|&nbsp;
@@ -2441,7 +2441,7 @@ with tab4:
         st.subheader("🏆 Top 10 Businesses")
         st.dataframe(biz_perf, use_container_width=True)
         fig_biz, ax_biz = plt.subplots(figsize=(7, 4))
-        ax_biz.barh(biz_perf['BUSINESS NAME'], biz_perf['Total_Orders'], color='#1f77b4')
+        ax_biz.barh(biz_perf['BUSINESS NAME'], biz_perf['Total_Orders'], color='#FF6B00')
         ax_biz.set_xlabel("Orders"); ax_biz.invert_yaxis()
         ax_biz.set_title("Top 10 by Orders"); plt.tight_layout()
         st.pyplot(fig_biz); plt.close()
@@ -2534,7 +2534,7 @@ with tab4:
             # ── PANEL 1: Density + Polygon Area Analysis ──
             st.markdown("### 📍 Panel 1 — Density Map & Area Analysis")
             st.markdown(
-                '''<div style="background:#e8f4fd;border-left:3px solid #1f77b4;padding:8px 14px;
+                '''<div style="background:#FFF4EC;border-left:3px solid #FF6B00;padding:8px 14px;
                 border-radius:6px;font-size:13px;margin-bottom:10px;">
                 🔵 <b>Blue heatmap</b> = Customer density &nbsp;|&nbsp;
                 🔴 <b>Red circles</b> = Restaurants &nbsp;|&nbsp;
@@ -3332,7 +3332,7 @@ with tab5:
                         .reset_index().sort_values(['ISO_Year','ISO_Week']))
             _pick_wk['Week_Label'] = "W" + _pick_wk['ISO_Week'].astype(str)
             _pifig, _piax = plt.subplots(figsize=(11,4))
-            _piax.bar(_pick_wk['Week_Label'], _pick_wk['Orders'], color='#2980b9', alpha=0.8, label='Pickup Orders')
+            _piax.bar(_pick_wk['Week_Label'], _pick_wk['Orders'], color='#FF6B00', alpha=0.8, label='Pickup Orders')
             _piax.set_title("Pickup Orders by Week"); _piax.grid(True, alpha=0.3, axis='y')
             _piax.legend(); plt.tight_layout(); st.pyplot(_pifig); plt.close()
 
@@ -3629,26 +3629,25 @@ with tab5:
 st.divider()
 st.markdown(
     """
-    <div style="background:#1a1a2e;color:#ccc;padding:18px 28px;border-radius:10px;
+    <div style="background:#1a1a2e;color:#ccc;padding:20px 28px;border-radius:10px;
                 font-size:12px;text-align:center;line-height:2.0;margin-top:12px;">
-        <div style="font-size:22px;font-weight:700;color:#ffffff;letter-spacing:2px;margin-bottom:4px;">
+        <div style="font-size:26px;font-weight:800;color:#FF6B00;letter-spacing:3px;margin-bottom:2px;">
             🛵 PIKI
         </div>
-        <div style="color:#aaa;margin-bottom:8px;font-size:11px;letter-spacing:1px;">
+        <div style="color:#FF8C3A;margin-bottom:8px;font-size:11px;letter-spacing:1.5px;font-weight:600;">
             BUSINESS INTELLIGENCE DASHBOARD
         </div>
-        <div style="border-top:1px solid #444;padding-top:10px;margin-top:4px;">
-            For any questions or recommendations, please contact:<br>
-            <span style="color:#4fc3f7;font-weight:600;">Lusekelo Kangele</span>
+        <div style="border-top:1px solid #FF6B00;opacity:0.4;margin:8px 0;"></div>
+        <div style="opacity:1;">
+            For any questions or recommendations:<br>
+            📞 <a href="tel:+255767871795" style="color:#FF8C3A;text-decoration:none;font-weight:600;">Tel: +255 767 871 795</a>
             &nbsp;|&nbsp;
-            📞 <a href="tel:+255767871795" style="color:#4fc3f7;text-decoration:none;">+255 767 871 795</a>
+            ✉️ <a href="mailto:lusekelo.kangele@piki.co.tz" style="color:#FF8C3A;text-decoration:none;">lusekelo.kangele@piki.co.tz</a>
             &nbsp;|&nbsp;
-            ✉️ <a href="mailto:lusekelo.kangele@piki.co.tz" style="color:#4fc3f7;text-decoration:none;">lusekelo.kangele@piki.co.tz</a>
-            &nbsp;|&nbsp;
-            🌐 <a href="https://www.piki.co.tz" target="_blank" style="color:#4fc3f7;text-decoration:none;">www.piki.co.tz</a>
+            🌐 <a href="https://www.piki.co.tz" target="_blank" style="color:#FF8C3A;text-decoration:none;font-weight:600;">www.piki.co.tz</a>
         </div>
-        <div style="margin-top:8px;color:#888;font-size:11px;">
-            🏙️ Dar es Salaam &nbsp;|&nbsp; Arusha &nbsp;|&nbsp; Dodoma &nbsp;|&nbsp; Mwanza &nbsp;|&nbsp; Zanzibar
+        <div style="margin-top:8px;color:#aaa;font-size:11px;letter-spacing:0.5px;">
+            🏙️ Dar es Salaam &nbsp;&bull;&nbsp; Arusha &nbsp;&bull;&nbsp; Dodoma &nbsp;&bull;&nbsp; Mwanza &nbsp;&bull;&nbsp; Zanzibar
         </div>
     </div>
     """,
