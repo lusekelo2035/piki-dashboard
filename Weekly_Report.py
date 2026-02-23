@@ -354,35 +354,81 @@ def build_trend_insight(weekly, full_df):
         l, p = weekly.iloc[-1], weekly.iloc[-2]
         do = l['Total_Orders'] - p['Total_Orders']
         ds = l['Total_Sales']  - p['Total_Sales']
-        prev_lbl  = p['Week_Label']
-        wow = (f"WoW Orders: {do:+.0f} ({do/p['Total_Orders']*100:+.1f}%)\n"
-               f"WoW Sales: {ds:+,.0f} TZS ({ds/p['Total_Sales']*100:+.1f}%)")
+        prev_lbl = p['Week_Label']
+        wow = (f"WoW Orders: {do:+.0f} ({do/max(p['Total_Orders'],1)*100:+.1f}%)\n"
+               f"WoW Sales:  {ds:+,.0f} TZS ({ds/max(p['Total_Sales'],1)*100:+.1f}%)")
 
+    # ── Business-level movers ──
     contrib = ""
     if prev_lbl and 'BUSINESS NAME' in full_df.columns:
         _df = full_df.copy()
         _df['wl'] = (_df['DELIVERY DATE'].dt.isocalendar().year.astype(str)
                      + "-W" + _df['DELIVERY DATE'].dt.isocalendar().week.astype(str).str.zfill(2))
         lbl = weekly.iloc[-1]['Week_Label']
-        lb = _df[_df['wl']==lbl].groupby('BUSINESS NAME').size().reset_index(name='Latest')
-        pb = _df[_df['wl']==prev_lbl].groupby('BUSINESS NAME').size().reset_index(name='Prev')
+        lb = _df[_df['wl']==lbl].groupby('BUSINESS NAME').agg(
+            Latest=('ID','count'), Sales_L=('SUBTOTAL','sum')).reset_index()
+        pb = _df[_df['wl']==prev_lbl].groupby('BUSINESS NAME').agg(
+            Prev=('ID','count'), Sales_P=('SUBTOTAL','sum')).reset_index()
         bz = pd.merge(lb, pb, on='BUSINESS NAME', how='outer').fillna(0)
-        bz['Δ'] = bz['Latest'] - bz['Prev']
-        bz = bz.sort_values('Δ', ascending=False)
-        contrib = (f"\nTop Growers:\n{bz.head(5).to_string(index=False)}"
-                   f"\nTop Decliners:\n{bz.tail(5).to_string(index=False)}")
+        bz['Order_Δ'] = bz['Latest'] - bz['Prev']
+        bz['Sales_Δ'] = bz['Sales_L'] - bz['Sales_P']
+        bz = bz.sort_values('Order_Δ', ascending=False)
+        contrib = (f"\nBUSINESS MOVERS (latest vs prev week):"
+                   f"\nTop Growers:\n{bz.head(6)[['BUSINESS NAME','Latest','Prev','Order_Δ','Sales_Δ']].to_string(index=False)}"
+                   f"\nTop Decliners:\n{bz.tail(6)[['BUSINESS NAME','Latest','Prev','Order_Δ','Sales_Δ']].to_string(index=False)}")
 
-    context = f"WEEKLY TREND:\n{ws}\n\nWEEK-OVER-WEEK:\n{wow}{contrib}"
-    prompt = f"""Senior BI analyst for a Tanzanian food delivery company.
+    # ── City performance vs KPI ──
+    city_ctx = ""
+    if 'BUSINESS CITY' in full_df.columns and len(weekly) >= 2:
+        _df2 = full_df.copy()
+        _df2['wl'] = (_df2['DELIVERY DATE'].dt.isocalendar().year.astype(str)
+                      + "-W" + _df2['DELIVERY DATE'].dt.isocalendar().week.astype(str).str.zfill(2))
+        lbl = weekly.iloc[-1]['Week_Label']
+        kpi_rate = GROWTH_RATE  # e.g. 0.012
+
+        _city_l = (_df2[_df2['wl']==lbl].groupby('BUSINESS CITY')
+                   .agg(Orders_Now=('ID','count'), Sales_Now=('SUBTOTAL','sum')).reset_index())
+        _city_p = (_df2[_df2['wl']==prev_lbl].groupby('BUSINESS CITY')
+                   .agg(Orders_Prev=('ID','count')).reset_index())
+        _city_m = pd.merge(_city_l, _city_p, on='BUSINESS CITY', how='outer').fillna(0)
+        _city_m['Orders_WoW_%'] = (
+            (_city_m['Orders_Now'] - _city_m['Orders_Prev']) /
+            _city_m['Orders_Prev'].replace(0, 1) * 100).round(1)
+        _city_m['KPI_Target'] = (_city_m['Orders_Prev'] * (1 + kpi_rate)).round(0)
+        _city_m['vs_KPI'] = (_city_m['Orders_Now'] - _city_m['KPI_Target']).round(0)
+        _city_m['Status'] = _city_m['vs_KPI'].apply(
+            lambda x: '✅ Beat KPI' if x >= 0 else f'❌ Miss by {abs(int(x))}')
+        _city_m = _city_m.sort_values('Orders_WoW_%', ascending=False)
+        city_ctx = f"\n\nCITY PERFORMANCE vs 1.2% GROWTH KPI:\n{_city_m[['BUSINESS CITY','Orders_Prev','Orders_Now','Orders_WoW_%','vs_KPI','Status']].to_string(index=False)}"
+
+    context = (f"WEEKLY TREND (all weeks):\n{ws}\n\n"
+               f"CURRENT WEEK: {weekly.iloc[-1]['Week_Label']} | "
+               f"Orders: {int(weekly.iloc[-1]['Total_Orders'])} | "
+               f"Sales: {weekly.iloc[-1]['Total_Sales']/1e6:.2f}M TZS\n\n"
+               f"WEEK-OVER-WEEK:\n{wow}{contrib}{city_ctx}")
+
+    prompt = f"""You are a senior BI analyst for Piki, a Tanzanian food delivery company.
 {context}
-Provide:
-1. **Trend Direction** – Growing, flat or declining? Key turning points.
-2. **KPI Performance** – Which weeks beat/miss the 1.2% growth KPI?
-3. **WoW Deep Dive** – Top business drivers of change this week.
-4. **Sales vs Orders** – Is average order value shifting?
-5. **Actions** – 2 specific, prioritized actions for this week.
-Use real numbers. Be concise."""
-    return claude_insight(prompt, 900), context
+
+Write a comprehensive weekly executive report. Structure it exactly as:
+
+**1. Overall Performance**
+State clearly: is the business growing, flat or declining? What is the trend direction over the last 3 weeks?
+
+**2. KPI Scorecard — Cities**
+For EACH city, state: orders this week vs last week, % change, whether they beat or missed the 1.2% growth KPI, and a one-line recommendation. Present as clear text (not just numbers).
+
+**3. Top Movers This Week**
+Which businesses drove the biggest gains? Which had the biggest drops? Give specific numbers.
+
+**4. Sales vs Orders**
+Is average order value changing? Are we getting bigger or smaller orders?
+
+**5. Priority Actions**
+3 specific, numbered actions for the operations team — each tied to a city or business with real numbers.
+
+Be specific. Use exact numbers from the data. Write like a real analyst report, not a bullet dump."""
+    return claude_insight(prompt, 1400), context
 
 
 def build_failed_insight(failed_weekly, pivot_df=None, week_label_str=None):
@@ -939,6 +985,49 @@ with tab1:
             key="dl_regional_excel"
         )
         st.success("✅ Regional report ready — one sheet per city with summary, KPIs, vendors and drivers.")
+    # ── City KPI Summary Table (always visible, no AI needed) ──
+    if 'BUSINESS CITY' in df.columns and len(weekly) >= 2:
+        st.markdown("#### 📊 City Performance vs 1.2% Weekly Growth KPI")
+        _wl_cur  = weekly.iloc[-1]['Week_Label']
+        _wl_prev = weekly.iloc[-2]['Week_Label']
+        _df_tr = df.copy()
+        _df_tr['wl'] = (_df_tr['DELIVERY DATE'].dt.isocalendar().year.astype(str)
+                        + "-W" + _df_tr['DELIVERY DATE'].dt.isocalendar().week.astype(str).str.zfill(2))
+        _city_now  = (_df_tr[_df_tr['wl']==_wl_cur].groupby('BUSINESS CITY')
+                      .agg(Orders_Now=('ID','count'), Sales_Now=('SUBTOTAL','sum')).reset_index())
+        _city_prev = (_df_tr[_df_tr['wl']==_wl_prev].groupby('BUSINESS CITY')
+                      .agg(Orders_Prev=('ID','count')).reset_index())
+        _city_tbl  = pd.merge(_city_now, _city_prev, on='BUSINESS CITY', how='outer').fillna(0)
+        _city_tbl['Orders vs Last Week'] = (
+            _city_tbl['Orders_Now'].astype(int).astype(str) + " (" +
+            ((_city_tbl['Orders_Now'] - _city_tbl['Orders_Prev'])
+             .apply(lambda x: f"{x:+.0f}")) + ")")
+        _city_tbl['WoW %'] = (
+            (_city_tbl['Orders_Now'] - _city_tbl['Orders_Prev']) /
+            _city_tbl['Orders_Prev'].replace(0,1) * 100).round(1)
+        _city_tbl['KPI Target (+1.2%)'] = (_city_tbl['Orders_Prev'] * 1.012).round(0).astype(int)
+        _city_tbl['vs KPI'] = (_city_tbl['Orders_Now'] - _city_tbl['KPI Target (+1.2%)']).round(0).astype(int)
+        _city_tbl['KPI Status'] = _city_tbl['vs KPI'].apply(
+            lambda x: '✅ Beat KPI' if x >= 0 else f'❌ -{abs(int(x))} orders')
+        _city_tbl['Recommendation'] = _city_tbl.apply(lambda r: (
+            f"Investigate drop — lost {abs(int(r['vs KPI']))} orders vs target"
+            if r['vs KPI'] < -5
+            else ("Strong growth — sustain momentum" if r['WoW %'] > 5
+                  else ("Near target — small push needed" if r['vs KPI'] < 0
+                        else "On track"))), axis=1)
+        _city_tbl['Sales (TZS)'] = _city_tbl['Sales_Now'].apply(lambda x: f"{int(x):,}")
+        _kpi_tbl_disp = _city_tbl[['BUSINESS CITY','Orders vs Last Week','WoW %',
+                                   'KPI Target (+1.2%)','KPI Status','Sales (TZS)','Recommendation']]
+        _kpi_tbl_disp = _kpi_tbl_disp.sort_values('WoW %', ascending=False).reset_index(drop=True)
+        _kpi_tbl_disp.index = range(1, len(_kpi_tbl_disp)+1)
+        st.dataframe(_kpi_tbl_disp, use_container_width=True)
+        st.download_button("⬇️ City KPI Table (Excel)",
+            data=excel_bytes(_kpi_tbl_disp.reset_index(drop=True), "City KPI"),
+            file_name=f"City_KPI_{_wl_cur}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_city_kpi")
+
+    # ── Auto-running AI insight ──
     _tr_ins_key = "trend_auto_insight"
     if _tr_ins_key not in st.session_state:
         st.session_state[_tr_ins_key] = None
@@ -1083,22 +1172,26 @@ Rules:
             with st.spinner("🌦️ Generating forecast…"):
                 _raw_weather = claude_insight(_weather_prompt, max_tokens=1400)
 
-            # Parse JSON
+            # Parse JSON — use regex to strip markdown fences robustly
             try:
-                import json as _json
-                # Strip any markdown backticks if present
-                _clean = _raw_weather.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+                import json as _json, re as _re
+                # Remove ```json ... ``` or ``` ... ``` wrappers
+                _clean = _re.sub(r'^```(?:json)?\s*', '', _raw_weather.strip(), flags=_re.MULTILINE)
+                _clean = _re.sub(r'\s*```$', '', _clean.strip(), flags=_re.MULTILINE).strip()
+                # Find first '[' in case there's preamble text
+                _bracket_start = _clean.find('[')
+                if _bracket_start > 0:
+                    _clean = _clean[_bracket_start:]
                 _weather_rows = _json.loads(_clean)
                 _wf_df = pd.DataFrame(_weather_rows)
-                # Ensure numeric
-                _wf_df['Rain_Risk_Pct'] = pd.to_numeric(_wf_df['Rain_Risk_Pct'], errors='coerce').fillna(0).astype(int)
-                _wf_df['Temp_C']        = pd.to_numeric(_wf_df['Temp_C'], errors='coerce').fillna(28).astype(int)
+                _wf_df['Rain_Risk_Pct'] = pd.to_numeric(_wf_df.get('Rain_Risk_Pct', 0), errors='coerce').fillna(0).astype(int)
+                _wf_df['Temp_C']        = pd.to_numeric(_wf_df.get('Temp_C', 28),       errors='coerce').fillna(28).astype(int)
                 st.session_state[_wf_btn_key]  = True
                 st.session_state[_wf_data_key] = _wf_df
             except Exception:
-                # JSON parse failed — store raw text separately and show as markdown
+                # Store raw text — display will handle gracefully
                 st.session_state[_wf_btn_key]  = True
-                st.session_state[_wf_data_key] = _raw_weather  # string fallback
+                st.session_state[_wf_data_key] = _raw_weather
 
     if st.session_state.get(_wf_btn_key):
         _wf_df = st.session_state.get(_wf_data_key)
@@ -1274,11 +1367,93 @@ Rules:
                 ai_insight_button("failed_orders", "Failed Orders", build_failed_insight, failed_weekly_wl, pivot, sel_week)
 
         if not rejected_df.empty:
-            st.markdown("#### 🚫 Rejected Orders Trend")
+            st.markdown("#### 🚫 Rejected Orders Analysis")
             result_r = _weekly_state_trend(rejected_df, "Rejected Orders", "#9467bd")
             if result_r:
                 fig_r, rej_weekly = result_r
                 st.pyplot(fig_r); plt.close()
+
+                # ── City breakdown ──
+                _rej_city = (rejected_df.groupby('BUSINESS CITY')
+                             .agg(Count=('ID','count'), Revenue_Lost=('SUBTOTAL','sum'))
+                             .reset_index().sort_values('Count', ascending=False))
+                _rej_city['Revenue_Lost'] = _rej_city['Revenue_Lost'].apply(lambda x: f"{int(x):,} TZS")
+                _rej_city['% of Total'] = (_rej_city['Count'] / max(len(rejected_df),1) * 100).round(1)
+
+                # ── Top restaurants with repeated cancellations ──
+                _rej_biz = (rejected_df.groupby('BUSINESS NAME')
+                            .agg(Rejections=('ID','count'), Revenue_Lost=('SUBTOTAL','sum'))
+                            .reset_index().sort_values('Rejections', ascending=False).head(15))
+                _total_lost = rejected_df['SUBTOTAL'].sum()
+
+                # ── Time of day pattern ──
+                _rej_hour = (rejected_df.groupby('HOUR').size().reset_index(name='Rejections')
+                             if 'HOUR' in rejected_df.columns else pd.DataFrame())
+
+                _rj1, _rj2 = st.columns(2)
+                with _rj1:
+                    st.markdown("##### 🏙️ Rejected Orders by City")
+                    st.dataframe(_rej_city, use_container_width=True)
+                with _rj2:
+                    st.markdown("##### 🍽️ Top Restaurants with Rejections")
+                    _rej_biz_disp = _rej_biz.copy()
+                    _rej_biz_disp['Revenue_Lost'] = _rej_biz_disp['Revenue_Lost'].apply(lambda x: f"{int(x):,} TZS")
+                    st.dataframe(_rej_biz_disp, use_container_width=True)
+
+                st.metric("💸 Total Revenue Lost to Rejections",
+                          f"{_total_lost/1e6:.2f}M TZS",
+                          delta=f"{len(rejected_df)} orders lost", delta_color="inverse")
+
+                if not _rej_hour.empty:
+                    fig_rh, ax_rh = plt.subplots(figsize=(12,4))
+                    ax_rh.bar(_rej_hour['HOUR'].astype(str).apply(lambda h: f"{int(h):02d}:00"),
+                              _rej_hour['Rejections'], color='#9467bd', alpha=0.8)
+                    ax_rh.set_title("Rejected Orders by Hour of Day")
+                    ax_rh.set_xlabel("Hour"); ax_rh.set_ylabel("Rejections")
+                    ax_rh.grid(True, alpha=0.3, axis='y')
+                    plt.xticks(rotation=45); plt.tight_layout()
+                    st.pyplot(fig_rh); plt.close()
+
+                # ── AI insight — auto-runs ──
+                _rej_ctx = (
+                    f"REJECTED ORDERS ANALYSIS\n"
+                    f"Total rejected: {len(rejected_df):,} | Revenue lost: {_total_lost/1e6:.2f}M TZS\n"
+                    f"Rejection rate: {len(rejected_df)/max(len(df),1)*100:.1f}% of all orders\n\n"
+                    f"BY CITY:\n{_rej_city.to_string(index=False)}\n\n"
+                    f"TOP BUSINESSES BY REJECTIONS:\n{_rej_biz.head(10).to_string(index=False)}\n\n"
+                    f"WEEKLY TREND:\n{rej_weekly[['Week_Label','Rejected Orders']].to_string(index=False)}"
+                )
+                _rej_prompt = (
+                    "You are a senior operations analyst for Piki, a Tanzanian food delivery company.\n\n"
+                    + _rej_ctx + "\n\n"
+                    "Provide a deep rejected orders analysis:\n"
+                    "1. **Rejection Trend** — Is it improving or worsening week over week? Key inflection points.\n"
+                    "2. **Worst Offenders** — Which restaurants have the highest rejections? What might cause this (capacity, hours, system)?\n"
+                    "3. **City Concentration** — Which cities drive the most rejections? Is it proportional to their order volume?\n"
+                    "4. **Revenue Impact** — Quantify the financial loss. If this rate continues, what is the monthly revenue at risk?\n"
+                    "5. **Time Pattern** — Based on the hour data, when do rejections peak? What operational change does this suggest?\n"
+                    "6. **Recommendations** — 3 specific, actionable steps to reduce rejections by 30% within 2 weeks.\n"
+                    "Use exact numbers. Be direct and operational."
+                )
+                _rej_ins_key = "rej_auto_insight"
+                _rej_ctx_hash = str(hash(_rej_ctx[:200]))
+                if _rej_ins_key not in st.session_state:
+                    st.session_state[_rej_ins_key] = None
+                    st.session_state[_rej_ins_key + "_h"] = None
+                if (st.session_state[_rej_ins_key] is None or
+                        st.session_state.get(_rej_ins_key + "_h") != _rej_ctx_hash):
+                    with st.spinner("🤖 Analyzing rejected orders…"):
+                        try:
+                            st.session_state[_rej_ins_key] = claude_insight(_rej_prompt, 900)
+                            st.session_state[_rej_ins_key + "_h"] = _rej_ctx_hash
+                        except Exception as _re2:
+                            st.session_state[_rej_ins_key] = f"Error: {_re2}"
+                if st.session_state[_rej_ins_key]:
+                    ai_block("rejected_orders", _rej_ctx, st.session_state[_rej_ins_key])
+                _rj_rc1, _ = st.columns([2,4])
+                if _rj_rc1.button("↺ Refresh Rejection Insight", key="btn_rej_refresh"):
+                    st.session_state[_rej_ins_key] = None
+                    st.rerun()
 
         # PDF download
         st.divider()
@@ -1335,13 +1510,32 @@ with tab2:
     _yr = int(sel_del_week.split("-W")[0]); _wn = int(sel_del_week.split("-W")[1])
     df2_week = df2[(df2['ISO_Year']==_yr) & (df2['ISO_Week']==_wn)]
 
-    # ── KPI metrics — selected week only ──
-    _comp = (df2_week[df2_week['STATE'].isin(['Delivery Completed By Driver','Completed'])]
-             if 'STATE' in df2_week.columns else df2_week)
-    avg_adt = _comp['Average Delivery Time'].mean() if not _comp.empty else 0
-    avg_dib = _comp['Driver in Business'].mean()    if not _comp.empty else 0
-    avg_p2c = _comp['Pickup to Customer'].mean()    if not _comp.empty else 0
-    avg_abb = _comp['Accepted by Business'].mean()  if not _comp.empty else 0
+    # ── KPI metrics — selected week, completed only, OUTLIERS EXCLUDED ──
+    def _filter_clean_completed(frame):
+        """Return only completed orders with all stages within valid operational ranges.
+        Excludes outliers that inflate average delivery time.
+        """
+        _fc = (frame[frame["STATE"].isin(["Delivery Completed By Driver","Completed"])].copy()
+               if "STATE" in frame.columns else frame.copy())
+        _stage_limits = {
+            "Accepted by Business": (0, 30),
+            "Assigned Time":        (0, 30),
+            "Accepted by Driver":   (0, 45),
+            "Driver to Business":   (0, 45),
+            "Driver in Business":   (0, 90),
+            "Pickup to Customer":   (0, 45),
+            "Average Delivery Time":(0,100),
+        }
+        for _fcol, (_lo, _hi) in _stage_limits.items():
+            if _fcol in _fc.columns:
+                _fc = _fc[(_fc[_fcol] >= _lo) & (_fc[_fcol] <= _hi)]
+        return _fc
+
+    _comp = _filter_clean_completed(df2_week)
+    avg_adt = _comp["Average Delivery Time"].mean() if not _comp.empty else 0
+    avg_dib = _comp["Driver in Business"].mean()    if not _comp.empty else 0
+    avg_p2c = _comp["Pickup to Customer"].mean()    if not _comp.empty else 0
+    avg_abb = _comp["Accepted by Business"].mean()  if not _comp.empty else 0
 
     mc1, mc2, mc3, mc4 = st.columns(4)
     mc1.metric("⏱ Avg Delivery Time",    f"{avg_adt:.1f} min",
@@ -1356,10 +1550,10 @@ with tab2:
     stage_cols = ['Accepted by Business','Assigned Time','Accepted by Driver',
                   'Driver to Business','Driver in Business','Pickup to Customer',
                   'Average Delivery Time']
-    city_stage = (df2_week.groupby('BUSINESS CITY')[stage_cols]
+    # City stage averages from clean completed orders only
+    city_stage = (_comp.groupby("BUSINESS CITY")[stage_cols]
                   .mean().round(1).reset_index()
-                  .sort_values('Average Delivery Time', ascending=True))
-    st.dataframe(city_stage, use_container_width=True)
+                  .sort_values("Average Delivery Time", ascending=True))
     st.download_button("⬇️ Download Delivery Table",
                        data=city_stage.to_csv(index=False).encode(),
                        file_name=f"delivery_{sel_del_week}.csv", mime="text/csv")
@@ -1367,7 +1561,9 @@ with tab2:
     # ── Hourly chart ──
     st.subheader("📈 Hourly Delivery Time vs Volume")
     df2['HOUR'] = df2['DELIVERY TIME'].dt.hour
-    hourly = (df2[df2['HOUR'].isin(OPERATING_HOURS)]
+    # Hourly: use clean completed orders only
+    _df2_clean = _filter_clean_completed(df2)
+    hourly = (_df2_clean[_df2_clean['HOUR'].isin(OPERATING_HOURS)]
               .groupby('HOUR')
               .agg(avg_dt=('Average Delivery Time','mean'), orders=('ID','count'))
               .reset_index())
@@ -3251,4 +3447,4 @@ with tab5:
 # FOOTER
 # ─────────────────────────────────────────────────
 st.divider()
-st.caption("Piki Business Intelligence Dashboard · for any question or recommendation please call me 0767871795 ")
+st.caption("Piki Business Intelligence Dashboard · Built with Streamlit & Claude AI · Tanzania 🇹🇿")
