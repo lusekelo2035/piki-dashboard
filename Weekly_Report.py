@@ -42,7 +42,8 @@ PIKI_LOGO_B64 = "/9j/4AAQSkZJRgABAgAAAQABAAD/wAARCANIBbADACIAAREBAhEB/9sAQwAIBgY
 # CONFIG
 # ─────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Piki BI Dashboard",
+    page_title="Piki Weekly Report",
+    page_icon="🛵",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -358,16 +359,44 @@ def build_trend_insight(weekly, full_df):
         wow = (f"WoW Orders: {do:+.0f} ({do/max(p['Total_Orders'],1)*100:+.1f}%)\n"
                f"WoW Sales:  {ds:+,.0f} TZS ({ds/max(p['Total_Sales'],1)*100:+.1f}%)")
 
+    # ── 7-week rolling average comparison ──
+    avg7_ctx = ""
+    if len(weekly) >= 2:
+        _cur_orders = int(weekly.iloc[-1]['Total_Orders'])
+        _cur_sales  = weekly.iloc[-1]['Total_Sales']
+        _prev_n = weekly.iloc[:-1].tail(7)   # up to 7 preceding weeks
+        _avg7_orders = _prev_n['Total_Orders'].mean()
+        _avg7_sales  = _prev_n['Total_Sales'].mean()
+        _n_weeks = len(_prev_n)
+        _diff_orders = _cur_orders - _avg7_orders
+        _diff_pct    = _diff_orders / max(_avg7_orders, 1) * 100
+        avg7_ctx = (
+            f"\n\n7-WEEK ROLLING AVERAGE COMPARISON (vs last {_n_weeks} weeks):\n"
+            f"  This week orders:        {_cur_orders:,}\n"
+            f"  Avg of last {_n_weeks} weeks:    {_avg7_orders:,.0f}\n"
+            f"  Difference:              {_diff_orders:+,.0f} ({_diff_pct:+.1f}%)\n"
+            f"  This week sales:         {_cur_sales/1e6:.2f}M TZS\n"
+            f"  Avg sales last {_n_weeks} weeks: {_avg7_sales/1e6:.2f}M TZS"
+        )
+
     # ── Business-level movers ──
     contrib = ""
-    if prev_lbl and 'BUSINESS NAME' in full_df.columns:
-        _df = full_df.copy()
-        _df['wl'] = (_df['DELIVERY DATE'].dt.isocalendar().year.astype(str)
-                     + "-W" + _df['DELIVERY DATE'].dt.isocalendar().week.astype(str).str.zfill(2))
-        lbl = weekly.iloc[-1]['Week_Label']
-        lb = _df[_df['wl']==lbl].groupby('BUSINESS NAME').agg(
+    _df = full_df.copy()
+    _df['_yw'] = (_df['DELIVERY DATE'].dt.isocalendar().year.astype(str)
+                  + "-W" + _df['DELIVERY DATE'].dt.isocalendar().week.astype(str).str.zfill(2))
+    _yw_pairs = (_df[['DELIVERY DATE']].assign(
+        _iso_yr=_df['DELIVERY DATE'].dt.isocalendar().year,
+        _iso_wk=_df['DELIVERY DATE'].dt.isocalendar().week
+    )[['_iso_yr','_iso_wk']].drop_duplicates().sort_values(['_iso_yr','_iso_wk']))
+    _yw_cur  = (_yw_pairs.iloc[-1]['_iso_yr'].astype(str)
+                + "-W" + str(_yw_pairs.iloc[-1]['_iso_wk']).zfill(2))
+    _yw_prev = (_yw_pairs.iloc[-2]['_iso_yr'].astype(str)
+                + "-W" + str(_yw_pairs.iloc[-2]['_iso_wk']).zfill(2)) if len(_yw_pairs) >= 2 else _yw_cur
+
+    if 'BUSINESS NAME' in full_df.columns and len(_yw_pairs) >= 2:
+        lb = _df[_df['_yw']==_yw_cur].groupby('BUSINESS NAME').agg(
             Latest=('ID','count'), Sales_L=('SUBTOTAL','sum')).reset_index()
-        pb = _df[_df['wl']==prev_lbl].groupby('BUSINESS NAME').agg(
+        pb = _df[_df['_yw']==_yw_prev].groupby('BUSINESS NAME').agg(
             Prev=('ID','count'), Sales_P=('SUBTOTAL','sum')).reset_index()
         bz = pd.merge(lb, pb, on='BUSINESS NAME', how='outer').fillna(0)
         bz['Order_Δ'] = bz['Latest'] - bz['Prev']
@@ -377,35 +406,49 @@ def build_trend_insight(weekly, full_df):
                    f"\nTop Growers:\n{bz.head(6)[['BUSINESS NAME','Latest','Prev','Order_Δ','Sales_Δ']].to_string(index=False)}"
                    f"\nTop Decliners:\n{bz.tail(6)[['BUSINESS NAME','Latest','Prev','Order_Δ','Sales_Δ']].to_string(index=False)}")
 
-    # ── City performance vs KPI ──
+    # ── City performance vs KPI + 7-week avg per city ──
     city_ctx = ""
-    if 'BUSINESS CITY' in full_df.columns and len(weekly) >= 2:
-        _df2 = full_df.copy()
-        _df2['wl'] = (_df2['DELIVERY DATE'].dt.isocalendar().year.astype(str)
-                      + "-W" + _df2['DELIVERY DATE'].dt.isocalendar().week.astype(str).str.zfill(2))
-        lbl = weekly.iloc[-1]['Week_Label']
-        kpi_rate = GROWTH_RATE  # e.g. 0.012
+    if 'BUSINESS CITY' in full_df.columns and len(_yw_pairs) >= 2:
+        kpi_rate = GROWTH_RATE
+        _city_now  = (_df[_df['_yw']==_yw_cur].groupby('BUSINESS CITY')
+                      .agg(Orders_Now=('ID','count'), Sales_Now=('SUBTOTAL','sum')).reset_index())
+        _city_prev = (_df[_df['_yw']==_yw_prev].groupby('BUSINESS CITY')
+                      .agg(Orders_Prev=('ID','count')).reset_index())
 
-        _city_l = (_df2[_df2['wl']==lbl].groupby('BUSINESS CITY')
-                   .agg(Orders_Now=('ID','count'), Sales_Now=('SUBTOTAL','sum')).reset_index())
-        _city_p = (_df2[_df2['wl']==prev_lbl].groupby('BUSINESS CITY')
-                   .agg(Orders_Prev=('ID','count')).reset_index())
-        _city_m = pd.merge(_city_l, _city_p, on='BUSINESS CITY', how='outer').fillna(0)
-        _city_m['Orders_WoW_%'] = (
-            (_city_m['Orders_Now'] - _city_m['Orders_Prev']) /
-            _city_m['Orders_Prev'].replace(0, 1) * 100).round(1)
+        # 7-week rolling avg per city
+        _prev7_yws = _yw_pairs.iloc[:-1].tail(7)
+        _prev7_yw_list = (_prev7_yws['_iso_yr'].astype(str)
+                          + "-W" + _prev7_yws['_iso_wk'].astype(str).str.zfill(2)).tolist()
+        _city_7wk = (_df[_df['_yw'].isin(_prev7_yw_list)]
+                     .groupby(['BUSINESS CITY','_yw'])
+                     .agg(Wk_Orders=('ID','count')).reset_index()
+                     .groupby('BUSINESS CITY')['Wk_Orders'].mean()
+                     .reset_index().rename(columns={'Wk_Orders':'Avg7Wk_Orders'}))
+        _city_m = pd.merge(_city_now, _city_prev, on='BUSINESS CITY', how='outer').fillna(0)
+        _city_m = pd.merge(_city_m, _city_7wk, on='BUSINESS CITY', how='left').fillna(0)
+        _city_m['WoW_%']      = ((_city_m['Orders_Now'] - _city_m['Orders_Prev']) /
+                                  _city_m['Orders_Prev'].replace(0,1) * 100).round(1)
         _city_m['KPI_Target'] = (_city_m['Orders_Prev'] * (1 + kpi_rate)).round(0)
-        _city_m['vs_KPI'] = (_city_m['Orders_Now'] - _city_m['KPI_Target']).round(0)
-        _city_m['Status'] = _city_m['vs_KPI'].apply(
-            lambda x: '✅ Beat KPI' if x >= 0 else f'❌ Miss by {abs(int(x))}')
-        _city_m = _city_m.sort_values('Orders_WoW_%', ascending=False)
-        city_ctx = f"\n\nCITY PERFORMANCE vs 1.2% GROWTH KPI:\n{_city_m[['BUSINESS CITY','Orders_Prev','Orders_Now','Orders_WoW_%','vs_KPI','Status']].to_string(index=False)}"
+        _city_m['vs_KPI']     = (_city_m['Orders_Now'] - _city_m['KPI_Target']).round(0)
+        _city_m['vs_7wk_avg'] = (_city_m['Orders_Now'] - _city_m['Avg7Wk_Orders']).round(0)
+        _city_m['vs_7wk_%']   = ((_city_m['Orders_Now'] - _city_m['Avg7Wk_Orders']) /
+                                   _city_m['Avg7Wk_Orders'].replace(0,1) * 100).round(1)
+        _city_m['KPI_Status'] = _city_m['vs_KPI'].apply(
+            lambda x: '✅ Beat' if x >= 0 else f'❌ Miss {abs(int(x))}')
+        _city_m = _city_m.sort_values('WoW_%', ascending=False)
+        city_ctx = (
+            f"\n\nCITY PERFORMANCE vs 1.2% KPI + 7-WEEK AVERAGE:\n"
+            f"{_city_m[['BUSINESS CITY','Orders_Prev','Orders_Now','WoW_%','vs_KPI','KPI_Status','Avg7Wk_Orders','vs_7wk_avg','vs_7wk_%']].to_string(index=False)}"
+        )
 
     context = (f"WEEKLY TREND (all weeks):\n{ws}\n\n"
                f"CURRENT WEEK: {weekly.iloc[-1]['Week_Label']} | "
                f"Orders: {int(weekly.iloc[-1]['Total_Orders'])} | "
                f"Sales: {weekly.iloc[-1]['Total_Sales']/1e6:.2f}M TZS\n\n"
-               f"WEEK-OVER-WEEK:\n{wow}{contrib}{city_ctx}")
+               f"WEEK-OVER-WEEK:\n{wow}"
+               f"{avg7_ctx}"
+               f"{contrib}"
+               f"{city_ctx}")
 
     prompt = f"""You are a senior BI analyst for Piki, a Tanzanian food delivery company.
 {context}
@@ -413,21 +456,21 @@ def build_trend_insight(weekly, full_df):
 Write a comprehensive weekly executive report. Structure it exactly as:
 
 **1. Overall Performance**
-State clearly: is the business growing, flat or declining? What is the trend direction over the last 3 weeks?
+Is the business growing, flat or declining? Compare this week to both last week AND the 7-week rolling average — are we above or below the trend? Mention exact numbers.
 
 **2. KPI Scorecard — Cities**
-For EACH city, state: orders this week vs last week, % change, whether they beat or missed the 1.2% growth KPI, and a one-line recommendation. Present as clear text (not just numbers).
+For EACH city in the data: orders this week vs last week (WoW%), whether they beat or missed the 1.2% growth KPI, how they compare to their own 7-week average, and a one-line recommendation. Cities significantly below the 7-week average need urgent attention.
 
-**3. Top Movers This Week**
-Which businesses drove the biggest gains? Which had the biggest drops? Give specific numbers.
+**3. Top Business Movers**
+Which businesses drove the biggest gains? Which had the biggest drops? Use exact numbers.
 
-**4. Sales vs Orders**
-Is average order value changing? Are we getting bigger or smaller orders?
+**4. Sales vs Orders (Order Value)**
+Is average order value (sales ÷ orders) shifting? Compare this week vs last week trend.
 
 **5. Priority Actions**
-3 specific, numbered actions for the operations team — each tied to a city or business with real numbers.
+3 specific, numbered actions for the operations team — each tied to a specific city or business with real numbers. Prioritize cities that are both missing KPI AND below 7-week average.
 
-Be specific. Use exact numbers from the data. Write like a real analyst report, not a bullet dump."""
+Be specific. Use exact numbers. Write like a real analyst report, not a bullet dump."""
     return claude_insight(prompt, 1400), context
 
 
@@ -988,44 +1031,82 @@ with tab1:
     # ── City KPI Summary Table (always visible, no AI needed) ──
     if 'BUSINESS CITY' in df.columns and len(weekly) >= 2:
         st.markdown("#### 📊 City Performance vs 1.2% Weekly Growth KPI")
-        _wl_cur  = weekly.iloc[-1]['Week_Label']
-        _wl_prev = weekly.iloc[-2]['Week_Label']
+        # Build ISO year+week key directly from df so it matches regardless of Week_Label format
         _df_tr = df.copy()
-        _df_tr['wl'] = (_df_tr['DELIVERY DATE'].dt.isocalendar().year.astype(str)
-                        + "-W" + _df_tr['DELIVERY DATE'].dt.isocalendar().week.astype(str).str.zfill(2))
-        _city_now  = (_df_tr[_df_tr['wl']==_wl_cur].groupby('BUSINESS CITY')
-                      .agg(Orders_Now=('ID','count'), Sales_Now=('SUBTOTAL','sum')).reset_index())
-        _city_prev = (_df_tr[_df_tr['wl']==_wl_prev].groupby('BUSINESS CITY')
-                      .agg(Orders_Prev=('ID','count')).reset_index())
-        _city_tbl  = pd.merge(_city_now, _city_prev, on='BUSINESS CITY', how='outer').fillna(0)
-        _city_tbl['Orders vs Last Week'] = (
-            _city_tbl['Orders_Now'].astype(int).astype(str) + " (" +
-            ((_city_tbl['Orders_Now'] - _city_tbl['Orders_Prev'])
-             .apply(lambda x: f"{x:+.0f}")) + ")")
-        _city_tbl['WoW %'] = (
-            (_city_tbl['Orders_Now'] - _city_tbl['Orders_Prev']) /
-            _city_tbl['Orders_Prev'].replace(0,1) * 100).round(1)
-        _city_tbl['KPI Target (+1.2%)'] = (_city_tbl['Orders_Prev'] * 1.012).round(0).astype(int)
-        _city_tbl['vs KPI'] = (_city_tbl['Orders_Now'] - _city_tbl['KPI Target (+1.2%)']).round(0).astype(int)
-        _city_tbl['KPI Status'] = _city_tbl['vs KPI'].apply(
-            lambda x: '✅ Beat KPI' if x >= 0 else f'❌ -{abs(int(x))} orders')
-        _city_tbl['Recommendation'] = _city_tbl.apply(lambda r: (
-            f"Investigate drop — lost {abs(int(r['vs KPI']))} orders vs target"
-            if r['vs KPI'] < -5
-            else ("Strong growth — sustain momentum" if r['WoW %'] > 5
-                  else ("Near target — small push needed" if r['vs KPI'] < 0
-                        else "On track"))), axis=1)
-        _city_tbl['Sales (TZS)'] = _city_tbl['Sales_Now'].apply(lambda x: f"{int(x):,}")
-        _kpi_tbl_disp = _city_tbl[['BUSINESS CITY','Orders vs Last Week','WoW %',
-                                   'KPI Target (+1.2%)','KPI Status','Sales (TZS)','Recommendation']]
-        _kpi_tbl_disp = _kpi_tbl_disp.sort_values('WoW %', ascending=False).reset_index(drop=True)
-        _kpi_tbl_disp.index = range(1, len(_kpi_tbl_disp)+1)
-        st.dataframe(_kpi_tbl_disp, use_container_width=True)
-        st.download_button("⬇️ City KPI Table (Excel)",
-            data=excel_bytes(_kpi_tbl_disp.reset_index(drop=True), "City KPI"),
-            file_name=f"City_KPI_{_wl_cur}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key="dl_city_kpi")
+        _df_tr['_iso_yr'] = _df_tr['DELIVERY DATE'].dt.isocalendar().year
+        _df_tr['_iso_wk'] = _df_tr['DELIVERY DATE'].dt.isocalendar().week
+        _df_tr['_yw']     = (_df_tr['_iso_yr'].astype(str)
+                             + "-W" + _df_tr['_iso_wk'].astype(str).str.zfill(2))
+        # Get 2 most recent distinct year-week combinations from data
+        _yw_pairs = (_df_tr[['_iso_yr','_iso_wk','_yw']]
+                     .drop_duplicates()
+                     .sort_values(['_iso_yr','_iso_wk']))
+        if len(_yw_pairs) >= 2:
+            _yw_cur  = _yw_pairs.iloc[-1]['_yw']
+            _yw_prev = _yw_pairs.iloc[-2]['_yw']
+            _city_now  = (_df_tr[_df_tr['_yw']==_yw_cur]
+                          .groupby('BUSINESS CITY')
+                          .agg(Orders_Now=('ID','count'), Sales_Now=('SUBTOTAL','sum'))
+                          .reset_index())
+            _city_prev = (_df_tr[_df_tr['_yw']==_yw_prev]
+                          .groupby('BUSINESS CITY')
+                          .agg(Orders_Prev=('ID','count'))
+                          .reset_index())
+
+            # ── 7-week rolling average per city ──
+            _prev7_pairs = (_df_tr[['_iso_yr','_iso_wk','_yw']]
+                            .drop_duplicates()
+                            .sort_values(['_iso_yr','_iso_wk'])
+                            .iloc[:-1].tail(7))
+            _prev7_yw_list = _prev7_pairs['_yw'].tolist()
+            _city_7wk = (_df_tr[_df_tr['_yw'].isin(_prev7_yw_list)]
+                         .groupby(['BUSINESS CITY','_yw'])
+                         .agg(Wk_Orders=('ID','count')).reset_index()
+                         .groupby('BUSINESS CITY')['Wk_Orders'].mean()
+                         .reset_index().rename(columns={'Wk_Orders':'Avg_7Wk'}))
+
+            _city_tbl = pd.merge(_city_now, _city_prev, on='BUSINESS CITY', how='outer').fillna(0)
+            _city_tbl = pd.merge(_city_tbl, _city_7wk, on='BUSINESS CITY', how='left').fillna(0)
+            _city_tbl['Orders_Now']  = _city_tbl['Orders_Now'].astype(int)
+            _city_tbl['Orders_Prev'] = _city_tbl['Orders_Prev'].astype(int)
+            _city_tbl['Delta']       = _city_tbl['Orders_Now'] - _city_tbl['Orders_Prev']
+            _city_tbl['Orders vs Last Week'] = (
+                _city_tbl['Orders_Now'].astype(str)
+                + " (" + _city_tbl['Delta'].apply(lambda x: f"{x:+d}") + ")")
+            _city_tbl['WoW %'] = (
+                _city_tbl['Delta'] / _city_tbl['Orders_Prev'].replace(0, 1) * 100).round(1)
+            _city_tbl['KPI Target (+1.2%)'] = (_city_tbl['Orders_Prev'] * 1.012).round(0).astype(int)
+            _city_tbl['vs KPI']    = (_city_tbl['Orders_Now'] - _city_tbl['KPI Target (+1.2%)']).astype(int)
+            _city_tbl['KPI Status'] = _city_tbl['vs KPI'].apply(
+                lambda x: '✅ Beat KPI' if x >= 0 else f'❌ -{abs(x)} short')
+            _city_tbl['7-Wk Avg'] = _city_tbl['Avg_7Wk'].round(0).astype(int)
+            _city_tbl['vs 7-Wk Avg'] = (_city_tbl['Orders_Now'] - _city_tbl['Avg_7Wk']).round(0).astype(int)
+            _city_tbl['vs 7-Wk %'] = (
+                (_city_tbl['Orders_Now'] - _city_tbl['Avg_7Wk']) /
+                _city_tbl['Avg_7Wk'].replace(0, 1) * 100).round(1)
+            _city_tbl['Recommendation'] = _city_tbl.apply(lambda r: (
+                f"🔴 Urgent — {abs(int(r['vs KPI']))} below KPI & below 7wk avg"
+                if (r['vs KPI'] < -10 and r['vs 7-Wk Avg'] < 0) else (
+                "🔴 KPI miss — investigate drop" if r['vs KPI'] < -10 else (
+                "🟡 Close — small push to hit KPI" if r['vs KPI'] < 0 else (
+                "🟢 Strong — sustain" if r['WoW %'] > 5
+                else "✅ On track")))), axis=1)
+            _city_tbl['Sales (TZS)'] = _city_tbl['Sales_Now'].apply(lambda x: f"{int(x):,}")
+            _kpi_tbl_disp = (_city_tbl[['BUSINESS CITY','Orders vs Last Week','WoW %',
+                                        'KPI Target (+1.2%)','KPI Status',
+                                        '7-Wk Avg','vs 7-Wk Avg','vs 7-Wk %',
+                                        'Sales (TZS)','Recommendation']]
+                             .sort_values('WoW %', ascending=False)
+                             .reset_index(drop=True))
+            _kpi_tbl_disp.index = range(1, len(_kpi_tbl_disp)+1)
+            st.dataframe(_kpi_tbl_disp, use_container_width=True)
+            st.download_button("⬇️ City KPI Table (Excel)",
+                data=excel_bytes(_kpi_tbl_disp.reset_index(drop=True), "City KPI"),
+                file_name=f"City_KPI_{_yw_cur}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_city_kpi")
+        else:
+            st.info("Need at least 2 weeks of data to show city KPI comparison.")
 
     # ── Auto-running AI insight ──
     _tr_ins_key = "trend_auto_insight"
@@ -1196,52 +1277,62 @@ Rules:
     if st.session_state.get(_wf_btn_key):
         _wf_df = st.session_state.get(_wf_data_key)
         if isinstance(_wf_df, pd.DataFrame) and not _wf_df.empty:
-            # Display city-by-city — 5 columns, one per city
-            _wf_cities = _wf_df['City'].unique() if 'City' in _wf_df.columns else []
-            _wf_cols = st.columns(min(len(_wf_cities), 5))
-            for _ci, _wcity in enumerate(_wf_cities):
-                with _wf_cols[_ci % len(_wf_cols)]:
-                    st.markdown(f"**{_wcity}**")
-                    _city_rows = _wf_df[_wf_df['City'] == _wcity]
-                    for _, _wr in _city_rows.iterrows():
-                        _risk = int(_wr.get('Rain_Risk_Pct', 0))
-                        _impact = str(_wr.get('Delivery_Impact', 'Normal'))
-                        _rain_time = str(_wr.get('Rain_Start_Time', 'N/A'))
-                        _cond = str(_wr.get('Condition', ''))
-                        _temp = _wr.get('Temp_C', '')
+            # ── Display: DAY-BY-DAY layout — each day is a row of city cards ──
+            _wf_cities = sorted(_wf_df['City'].unique().tolist()) if 'City' in _wf_df.columns else []
+            _wf_dates  = _wf_df['Date'].unique().tolist() if 'Date' in _wf_df.columns else []
+
+            for _di, _wdate in enumerate(_wf_dates):
+                # Day header with separator
+                if _di > 0:
+                    st.markdown("<hr style='margin:14px 0 8px 0;border:none;border-top:2px solid #e0e0e0;'>", unsafe_allow_html=True)
+                st.markdown(
+                    f'<div style="background:#1a1a2e;color:#fff;padding:6px 14px;border-radius:6px;'
+                    f'font-size:13px;font-weight:700;letter-spacing:1px;margin-bottom:6px;">'
+                    f'📅 {_wdate}</div>',
+                    unsafe_allow_html=True
+                )
+                _day_cols = st.columns(len(_wf_cities)) if _wf_cities else [st]
+                for _ci, _wcity in enumerate(_wf_cities):
+                    _city_day = _wf_df[(_wf_df['City'] == _wcity) & (_wf_df['Date'] == _wdate)]
+                    with _day_cols[_ci]:
+                        st.markdown(f"<div style='font-size:11px;font-weight:700;color:#555;margin-bottom:3px;'>{_wcity}</div>", unsafe_allow_html=True)
+                        if _city_day.empty:
+                            st.markdown("<small style='color:#aaa;'>No data</small>", unsafe_allow_html=True)
+                            continue
+                        _wr = _city_day.iloc[0]
+                        _risk     = int(_wr.get('Rain_Risk_Pct', 0))
+                        _impact   = str(_wr.get('Delivery_Impact', 'Normal'))
+                        _rain_t   = str(_wr.get('Rain_Start_Time', 'N/A'))
+                        _cond     = str(_wr.get('Condition', ''))
+                        _temp     = _wr.get('Temp_C', '')
+                        _notes    = str(_wr.get('Notes', ''))
 
                         if _risk >= 70:
-                            _flag = "🔴"
-                            _border = "#dc3545"
-                            _bg     = "#fff5f5"
-                            _time_note = f"<br><small>⏰ Rain from ~{_rain_time}</small>" if _rain_time != 'N/A' else ""
+                            _flag, _border, _bg = "🔴", "#dc3545", "#fff5f5"
+                            _time_note = f"<br><small style='color:#888;'>⏰ ~{_rain_t}</small>" if _rain_t != 'N/A' else ""
                         elif _risk >= 40:
-                            _flag = "🟡"
-                            _border = "#ffc107"
-                            _bg     = "#fffbee"
-                            _time_note = f"<br><small>⏰ Rain possible ~{_rain_time}</small>" if _rain_time != 'N/A' else ""
+                            _flag, _border, _bg = "🟡", "#ffc107", "#fffbee"
+                            _time_note = f"<br><small style='color:#888;'>⏰ ~{_rain_t}</small>" if _rain_t != 'N/A' else ""
                         else:
-                            _flag = "🟢"
-                            _border = "#28a745"
-                            _bg     = "#f5fff5"
+                            _flag, _border, _bg = "🟢", "#28a745", "#f5fff5"
                             _time_note = ""
 
-                        _impact_icon = {"Boost":"📈","Normal":"➡️","Risk":"⚠️"}.get(_impact, "➡️")
+                        _imp_icon = {"Boost": "📈", "Normal": "➡️", "Risk": "⚠️"}.get(_impact, "➡️")
 
                         st.markdown(
-                            f'<div style="border-left:3px solid {_border};background:{_bg};'
-                            f'padding:6px 10px;border-radius:5px;margin:3px 0;font-size:12px;">'
-                            f'<b>{_wr.get("Date","")}</b> &nbsp; {_flag} {_risk}% rain<br>'
-                            f'🌡️ {_temp}°C &nbsp;|&nbsp; {_cond}<br>'
-                            f'{_impact_icon} {_impact}{_time_note}'
+                            f'<div style="border-left:4px solid {_border};background:{_bg};'
+                            f'padding:8px 10px;border-radius:6px;font-size:11.5px;line-height:1.55;">'
+                            f'<b>{_flag} {_risk}% rain</b><br>'
+                            f'🌡️ {_temp}°C &nbsp; {_cond}<br>'
+                            f'{_imp_icon} <em>{_impact}</em>{_time_note}'
                             f'</div>',
                             unsafe_allow_html=True
                         )
 
-            st.markdown("---")
+            st.markdown("<br>", unsafe_allow_html=True)
             st.markdown(
-                '<small>🔴 ≥70% rain risk — high delivery disruption risk &nbsp;|&nbsp; '
-                '🟡 40–69% — moderate risk &nbsp;|&nbsp; 🟢 &lt;40% — normal operations &nbsp;|&nbsp; '
+                '<small>🔴 ≥70% rain — high disruption risk &nbsp;|&nbsp; '
+                '🟡 40–69% — moderate &nbsp;|&nbsp; 🟢 &lt;40% — normal &nbsp;|&nbsp; '
                 '📈 Demand Boost &nbsp;|&nbsp; ⚠️ Operational Risk</small>',
                 unsafe_allow_html=True
             )
@@ -1554,9 +1645,98 @@ with tab2:
     city_stage = (_comp.groupby("BUSINESS CITY")[stage_cols]
                   .mean().round(1).reset_index()
                   .sort_values("Average Delivery Time", ascending=True))
+
+    # ── TABLE first, then download ──
+    st.dataframe(city_stage, use_container_width=True)
     st.download_button("⬇️ Download Delivery Table",
                        data=city_stage.to_csv(index=False).encode(),
                        file_name=f"delivery_{sel_del_week}.csv", mime="text/csv")
+
+    # ── Weekly Average Delivery Time trend ──
+    st.subheader("📈 Weekly Average Delivery Time Trend")
+    _wk_adt_raw = _filter_clean_completed(df2)
+    _wk_adt = (_wk_adt_raw
+               .groupby(df2.loc[_wk_adt_raw.index, 'DELIVERY DATE'].dt.to_period('W-SUN'))
+               .agg(Avg_DT=('Average Delivery Time', 'mean'))
+               .reset_index())
+    _wk_adt.columns = ['Week_Period', 'Avg_DT']
+    _wk_adt['Avg_DT'] = _wk_adt['Avg_DT'].round(1)
+    _wk_adt['Week_Str'] = _wk_adt['Week_Period'].apply(
+        lambda p: f"W{p.week}\n({p.start_time.strftime('%d %b')})")
+
+    if len(_wk_adt) >= 2:
+        _adt_vals   = _wk_adt['Avg_DT'].tolist()
+        _adt_labels = _wk_adt['Week_Str'].tolist()
+        _prev_avg   = float(pd.Series(_adt_vals[:-1]).mean())
+        _last_val   = _adt_vals[-1]
+        _delta      = _last_val - _prev_avg
+
+        # Arrow: for delivery time, UP is BAD (slower), DOWN is GOOD (faster)
+        if _delta > 0.5:
+            _arrow, _arrow_col = '↑', '#e74c3c'
+            _story = (f"Last week avg delivery was **{_last_val:.1f} min** — "
+                      f"**{_delta:.1f} min slower** than the {len(_adt_vals)-1}-week average "
+                      f"of {_prev_avg:.1f} min. ↑ Delivery times are worsening.")
+        elif _delta < -0.5:
+            _arrow, _arrow_col = '↓', '#27ae60'
+            _story = (f"Last week avg delivery was **{_last_val:.1f} min** — "
+                      f"**{abs(_delta):.1f} min faster** than the {len(_adt_vals)-1}-week average "
+                      f"of {_prev_avg:.1f} min. ↓ Delivery times are improving.")
+        else:
+            _arrow, _arrow_col = '→', '#f39c12'
+            _story = (f"Last week avg delivery was **{_last_val:.1f} min** — "
+                      f"stable vs previous average of {_prev_avg:.1f} min →.")
+
+        _fig_adt, _ax_adt = plt.subplots(figsize=(max(10, len(_adt_labels) * 1.2), 5))
+
+        # Previous average dashed line
+        _ax_adt.axhline(_prev_avg, color='#95a5a6', linestyle='--', lw=1.5, alpha=0.8,
+                        label=f"Previous avg: {_prev_avg:.1f} min")
+
+        # Main line in blue
+        _ax_adt.plot(range(len(_adt_labels)), _adt_vals,
+                     marker='o', color='#2980b9', lw=2, label='Avg Delivery Time')
+
+        # Last week point highlighted in arrow colour
+        _ax_adt.plot(len(_adt_labels) - 1, _last_val, 'o',
+                     color=_arrow_col, markersize=12, zorder=5, label='Last week')
+
+        # Numbers on every point
+        _y_pad = max(_adt_vals) * 0.025
+        for _i, _v in enumerate(_adt_vals):
+            _ax_adt.text(_i, _v + _y_pad, f"{_v:.1f}", ha='center', fontsize=9,
+                         fontweight='bold',
+                         color=(_arrow_col if _i == len(_adt_vals) - 1 else '#2c3e50'))
+
+        # Arrow above last point
+        _ax_adt.text(len(_adt_labels) - 1, _last_val + _y_pad * 3.5,
+                     _arrow, ha='center', fontsize=20, fontweight='bold', color=_arrow_col)
+
+        # Light shading between prev_avg line and last segment
+        _ax_adt.fill_between(
+            [len(_adt_labels) - 2, len(_adt_labels) - 1],
+            [_prev_avg, _prev_avg],
+            [_adt_vals[-2], _last_val],
+            alpha=0.12, color=_arrow_col)
+
+        _ax_adt.set_xticks(range(len(_adt_labels)))
+        _ax_adt.set_xticklabels(_adt_labels, fontsize=9)
+        _ax_adt.set_ylabel("Avg Delivery Time (min)")
+        _ax_adt.set_xlabel("Week")
+        _ax_adt.set_title("Weekly Avg Delivery Time Trend — Clean Completed Orders (Outliers Excluded)")
+        _ax_adt.grid(True, alpha=0.25, axis='y')
+        _ax_adt.legend(fontsize=9)
+        plt.tight_layout()
+        st.pyplot(_fig_adt); plt.close()
+
+        # Story explanation card
+        st.markdown(
+            f'<div style="background:#f8f9fa;border-left:4px solid {_arrow_col};'
+            f'padding:10px 16px;border-radius:6px;font-size:13px;margin:6px 0 14px 0;">'
+            f'{_story}</div>',
+            unsafe_allow_html=True)
+    else:
+        st.info("Need at least 2 weeks of data for the trend chart.")
 
     # ── Hourly chart ──
     st.subheader("📈 Hourly Delivery Time vs Volume")
@@ -3447,4 +3627,30 @@ with tab5:
 # FOOTER
 # ─────────────────────────────────────────────────
 st.divider()
-st.caption("Piki Business Intelligence Dashboard · Built with Streamlit & Claude AI · Tanzania 🇹🇿")
+st.markdown(
+    """
+    <div style="background:#1a1a2e;color:#ccc;padding:18px 28px;border-radius:10px;
+                font-size:12px;text-align:center;line-height:2.0;margin-top:12px;">
+        <div style="font-size:22px;font-weight:700;color:#ffffff;letter-spacing:2px;margin-bottom:4px;">
+            🛵 PIKI
+        </div>
+        <div style="color:#aaa;margin-bottom:8px;font-size:11px;letter-spacing:1px;">
+            BUSINESS INTELLIGENCE DASHBOARD
+        </div>
+        <div style="border-top:1px solid #444;padding-top:10px;margin-top:4px;">
+            For any questions or recommendations, please contact:<br>
+            <span style="color:#4fc3f7;font-weight:600;">Lusekelo Kangele</span>
+            &nbsp;|&nbsp;
+            📞 <a href="tel:+255767871795" style="color:#4fc3f7;text-decoration:none;">+255 767 871 795</a>
+            &nbsp;|&nbsp;
+            ✉️ <a href="mailto:lusekelo.kangele@piki.co.tz" style="color:#4fc3f7;text-decoration:none;">lusekelo.kangele@piki.co.tz</a>
+            &nbsp;|&nbsp;
+            🌐 <a href="https://www.piki.co.tz" target="_blank" style="color:#4fc3f7;text-decoration:none;">www.piki.co.tz</a>
+        </div>
+        <div style="margin-top:8px;color:#888;font-size:11px;">
+            🏙️ Dar es Salaam &nbsp;|&nbsp; Arusha &nbsp;|&nbsp; Dodoma &nbsp;|&nbsp; Mwanza &nbsp;|&nbsp; Zanzibar
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
