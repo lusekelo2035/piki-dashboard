@@ -776,12 +776,13 @@ st.divider()
 # ─────────────────────────────────────────────────
 # MAIN TABS
 # ─────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "📈 Weekly Trends",
     "⏰ Delivery Times",
     "🚴 Rider Attendance",
     "📦 Products & Geo",
     "🎉 Piki Party Store",
+    "🏆 Staff Bonus Tracker",
 ])
 
 # ═══════════════════════════════════════════════════════════════
@@ -3622,6 +3623,865 @@ with tab5:
                              data=_exp_buf2.getvalue(),
                              file_name="Piki_Party_Full_Report.xlsx",
                              mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+# ═══════════════════════════════════════════════════════════════
+# TAB 6 — STAFF MONTHLY BONUS TRACKER
+# ═══════════════════════════════════════════════════════════════
+with tab6:
+    # ─── CSS for bonus tracker styling ───
+    st.markdown("""
+    <style>
+    .kpi-section-hdr {
+        background: linear-gradient(90deg,#FF6B00,#CC5500);
+        color:#fff; font-weight:700; font-size:13px;
+        padding:7px 14px; border-radius:6px; margin:12px 0 6px 0;
+    }
+    .auto-chip {
+        background:#E8F5E9; border:1px solid #4CAF50; border-radius:5px;
+        padding:7px 12px; font-size:12.5px; margin-bottom:4px;
+    }
+    .manual-chip {
+        background:#FFFDE7; border:1px solid #F9A825; border-radius:5px;
+        padding:7px 12px; font-size:12.5px; margin-bottom:4px;
+    }
+    .score-row {
+        background:#F3F4F6; border-radius:5px;
+        padding:5px 12px; font-size:12px; margin-top:3px;
+    }
+    .verdict-approved {
+        background: linear-gradient(135deg,#E8F5E9,#C8E6C9);
+        border:2px solid #4CAF50; border-radius:10px;
+        padding:16px 20px; text-align:center; margin-top:12px;
+    }
+    .verdict-rejected {
+        background: linear-gradient(135deg,#FFEBEE,#FFCDD2);
+        border:2px solid #E53935; border-radius:10px;
+        padding:16px 20px; text-align:center; margin-top:12px;
+    }
+    .summary-card {
+        background:#fff; border:1px solid #e0e0e0; border-left:4px solid #FF6B00;
+        border-radius:8px; padding:14px; margin:6px 0;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    st.markdown('<div class="section-header">🏆 Staff Monthly Bonus Tracker</div>', unsafe_allow_html=True)
+
+    # intro banner
+    st.markdown("""
+    <div style="background:#FFF4EC;border-left:4px solid #FF6B00;border-radius:8px;
+                padding:12px 16px;margin-bottom:14px;font-size:13px;">
+      <b>How this works:</b> &nbsp;
+      🟢 <b>Green cells</b> are <i>auto-filled</i> from your uploaded data (delivery times, failed orders, rider ratios, regions) — no typing needed. &nbsp;
+      🟡 <b>Yellow cells</b> require <i>manual input</i> (compliance scores, CSAT, FCR, retention, etc.). &nbsp;
+      Results, verdicts and a styled Excel report generate <i>instantly</i> as you fill in values.
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── period label ──
+    _b_period = st.text_input("📅 Assessment Period (e.g. Month 1 – W1 to W4)",
+                               "Month 1 – W1 to W4", key="b_period_lbl")
+
+    # ════════════════════════════════════════════════════════
+    # AUTO-KPI ENGINE — pull everything from the loaded df
+    # ════════════════════════════════════════════════════════
+    @st.cache_data(show_spinner=False)
+    def _bonus_auto_kpis(_df_hash, df_bytes):
+        """Compute every auto-fillable KPI from the main dataframe."""
+        import hashlib, pickle
+        df_src = pickle.loads(df_bytes)
+        out = {}
+        try:
+            df_s = compute_delivery_stages(df_src.copy())
+
+            # ── Average Delivery Time (clean completed, outliers excluded) ──
+            _comp = df_s[df_s['STATE'].isin(['Delivery Completed By Driver','Completed'])].copy()
+            _lims = {'Accepted by Business':(0,30),'Assigned Time':(0,30),
+                     'Accepted by Driver':(0,45),'Driver to Business':(0,45),
+                     'Driver in Business':(0,90),'Pickup to Customer':(0,45),
+                     'Average Delivery Time':(0,100)}
+            for _sc,(_lo,_hi) in _lims.items():
+                if _sc in _comp.columns:
+                    _comp = _comp[(_comp[_sc]>=_lo)&(_comp[_sc]<=_hi)]
+            out['adt']         = round(_comp['Average Delivery Time'].mean(), 1) if not _comp.empty else 0.0
+            out['adt_count']   = len(_comp)
+
+            # ── Failed orders ──
+            _fail = df_s[df_s['STATE'].astype(str).str.contains('Failed|failed', na=False)]
+            out['failed_n']    = len(_fail)
+            out['total_n']     = len(df_s)
+            out['failed_pct']  = round(out['failed_n']/max(out['total_n'],1)*100, 2)
+
+            # ── Rejected orders ──
+            _rej = df_s[df_s['STATE'].astype(str).str.contains('Rejected|rejected', na=False)]
+            out['rejected_n']  = len(_rej)
+            out['rejected_pct']= round(out['rejected_n']/max(out['total_n'],1)*100, 2)
+
+            # ── Weekly failed trend (for reduction calc) ──
+            if 'DELIVERY DATE' in df_s.columns:
+                df_s['_yw'] = (df_s['DELIVERY DATE'].dt.isocalendar().year.astype(str)
+                               +"-W"+df_s['DELIVERY DATE'].dt.isocalendar().week.astype(str).str.zfill(2))
+                _wk_fail = (df_s[df_s['STATE'].astype(str).str.contains('Failed|failed',na=False)]
+                            .groupby('_yw').size())
+                _yw_sorted = sorted(_wk_fail.index.tolist())
+                if len(_yw_sorted) >= 2:
+                    _last2  = [_wk_fail.get(_yw_sorted[-1],0), _wk_fail.get(_yw_sorted[-2],0)]
+                    out['fail_reduction_pct'] = round((_last2[1]-_last2[0])/max(_last2[1],1)*100, 1)
+                else:
+                    out['fail_reduction_pct'] = 0.0
+            else:
+                out['fail_reduction_pct'] = 0.0
+
+            # ── Morning / Peak driver:order ratios ──
+            if 'DELIVERY TIME' in df_s.columns and 'DRIVER ID' in df_s.columns:
+                df_s['_hr'] = pd.to_datetime(df_s['DELIVERY TIME'], errors='coerce').dt.hour
+                _morn  = df_s[df_s['_hr'].between(7,11)]
+                _peak  = df_s[df_s['_hr'].between(12,20)]
+                out['morning_drivers'] = _morn['DRIVER ID'].nunique()
+                out['morning_orders']  = len(_morn)
+                out['morning_ratio']   = round(out['morning_drivers']/max(out['morning_orders'],1), 2)
+                out['peak_drivers']    = _peak['DRIVER ID'].nunique()
+                out['peak_orders']     = len(_peak)
+                out['peak_ratio']      = round(out['peak_drivers']/max(out['peak_orders'],1), 2)
+            else:
+                out.update(morning_drivers=0,morning_orders=0,morning_ratio=0,
+                            peak_drivers=0,peak_orders=0,peak_ratio=0)
+
+            # ── Rider active days (proxy for retention) ──
+            if 'DRIVER ID' in df_s.columns and 'DELIVERY DATE' in df_s.columns:
+                _dr_days = (df_s.groupby('DRIVER ID')['DELIVERY DATE']
+                              .nunique().reset_index(name='active_days'))
+                _tot_dr  = _dr_days['DRIVER ID'].nunique()
+                _active_dr = (_dr_days['active_days'] >= 10).sum()
+                out['driver_retention_pct'] = round(_active_dr/max(_tot_dr,1)*100, 1)
+                out['total_drivers']        = int(_tot_dr)
+                out['active_drivers_10d']   = int(_active_dr)
+            else:
+                out.update(driver_retention_pct=0, total_drivers=0, active_drivers_10d=0)
+
+            # ── Regions on KPI target ──
+            if 'BUSINESS CITY' in df_s.columns:
+                df_s['_yw2'] = (df_s['DELIVERY DATE'].dt.isocalendar().year.astype(str)
+                                +"-W"+df_s['DELIVERY DATE'].dt.isocalendar().week.astype(str).str.zfill(2))
+                _yws  = sorted(df_s['_yw2'].unique())
+                _r_on = 0; _r_tot = 0
+                if len(_yws) >= 2:
+                    _cn = df_s[df_s['_yw2']==_yws[-1]].groupby('BUSINESS CITY').size()
+                    _cp = df_s[df_s['_yw2']==_yws[-2]].groupby('BUSINESS CITY').size()
+                    for _city in _cn.index:
+                        _r_tot += 1
+                        if _cn[_city] >= _cp.get(_city,0)*(1+GROWTH_RATE): _r_on += 1
+                out['regions_on']      = _r_on
+                out['regions_total']   = _r_tot
+                out['regions_pct']     = round(_r_on/max(_r_tot,1)*100,1)
+            else:
+                out.update(regions_on=0, regions_total=0, regions_pct=0)
+
+            # ── Weekly order volume for w1-w4 split ──
+            if 'DELIVERY DATE' in df_s.columns:
+                _by_wk = (df_s.groupby('_yw').size()
+                           .reset_index(name='orders').sort_values('_yw').tail(4))
+                out['wk_orders'] = _by_wk['orders'].tolist()
+                out['wk_labels'] = _by_wk['_yw'].tolist()
+            else:
+                out['wk_orders'] = [0,0,0,0]
+                out['wk_labels'] = ['W1','W2','W3','W4']
+        except Exception as _e:
+            st.warning(f"Auto-KPI engine error: {_e}")
+        return out
+
+    # Run engine (cache by df shape+hash)
+    import pickle, hashlib
+    _df_bytes  = pickle.dumps(df[['STATE','DELIVERY DATE','DELIVERY TIME','DRIVER ID',
+                                   'BUSINESS CITY','SUBTOTAL'] if 'BUSINESS CITY' in df.columns
+                                  else ['STATE','DELIVERY DATE','DELIVERY TIME','DRIVER ID','SUBTOTAL']].head(5000))
+    _df_hash   = hashlib.md5(_df_bytes).hexdigest()
+    _auto      = _bonus_auto_kpis(_df_hash, _df_bytes)
+
+    # ── Auto-data reference expander ──
+    with st.expander("🔍 Auto-filled Data Reference (from your dataset)", expanded=False):
+        _ref_rows = [
+            ("Avg Delivery Time (clean)", f"{_auto.get('adt',0):.1f} min",          f"From {_auto.get('adt_count',0):,} clean completed orders"),
+            ("Failed Orders",             f"{_auto.get('failed_n',0):,} orders",    f"{_auto.get('failed_pct',0):.2f}% of total {_auto.get('total_n',0):,}"),
+            ("Failed Order Reduction",    f"{_auto.get('fail_reduction_pct',0):+.1f}%","vs previous week"),
+            ("Rejected Orders",           f"{_auto.get('rejected_n',0):,}",          f"{_auto.get('rejected_pct',0):.2f}% rejection rate"),
+            ("Morning Driver:Order Ratio",f"{_auto.get('morning_ratio',0):.2f}",    f"{_auto.get('morning_drivers',0)} drivers / {_auto.get('morning_orders',0)} orders (07–11h)"),
+            ("Peak Driver:Order Ratio",   f"{_auto.get('peak_ratio',0):.2f}",       f"{_auto.get('peak_drivers',0)} drivers / {_auto.get('peak_orders',0)} orders (12–20h)"),
+            ("Driver Retention (≥10 days)",f"{_auto.get('driver_retention_pct',0):.1f}%",f"{_auto.get('active_drivers_10d',0)} of {_auto.get('total_drivers',0)} drivers"),
+            ("Regions on KPI Target",     f"{_auto.get('regions_on',0)}/{_auto.get('regions_total',0)}",f"{_auto.get('regions_pct',0):.1f}% — based on 1.2% WoW growth"),
+        ]
+        _ref_df = pd.DataFrame(_ref_rows, columns=['KPI','Auto Value','Source / Notes'])
+        st.dataframe(_ref_df, use_container_width=True, hide_index=True)
+
+    # ── Scoring helpers ──
+    def _pct_band(val, bands):
+        """bands = list of (min_threshold, score_pct) in descending order."""
+        for thr, pct in sorted(bands, reverse=True):
+            if val >= thr: return pct
+        return 0.0
+
+    def _score_bar(earned, max_val, label=""):
+        pct = earned/max_val*100 if max_val else 0
+        col_fill = "#FF6B00" if pct>=75 else ("#FF8C3A" if pct>=50 else "#FFD9B3")
+        return (f'<div class="score-row"><b style="color:#333;">{label}</b> &nbsp;'
+                f'<span style="color:{col_fill};font-weight:700;">TSh {earned:,}</span>'
+                f' / TSh {max_val:,} &nbsp;'
+                f'<span style="background:{col_fill};color:#fff;border-radius:3px;'
+                f'padding:1px 7px;font-size:11px;">{pct:.0f}%</span></div>')
+
+    def _pt_bar(earned, max_pts, label=""):
+        pct = earned/max_pts*100 if max_pts else 0
+        col_fill = "#FF6B00" if pct>=75 else ("#FF8C3A" if pct>=50 else "#FFD9B3")
+        return (f'<div class="score-row"><b style="color:#333;">{label}</b> &nbsp;'
+                f'<span style="color:{col_fill};font-weight:700;">{earned}/{max_pts} pts</span>'
+                f' &nbsp;<span style="background:{col_fill};color:#fff;border-radius:3px;'
+                f'padding:1px 7px;font-size:11px;">{pct:.0f}%</span></div>')
+
+    # ════════════════════════════════════════════════════════════
+    # THREE ROLE SUB-TABS
+    # ════════════════════════════════════════════════════════════
+    _btab1, _btab2, _btab3 = st.tabs([
+        "🏢 Head of Operations",
+        "📞 Head of Customer Service",
+        "📍 Zonal Manager",
+    ])
+
+    # ══════════════════════════════════════════════════════
+    # ROLE 1 — HEAD OF OPERATIONS  (TSh 400,000 max)
+    # ══════════════════════════════════════════════════════
+    with _btab1:
+        st.markdown("### 🏢 Head of Operations — Monthly Bonus Assessment")
+        st.caption("Max Bonus: TSh 400,000 &nbsp;|&nbsp; Period = 4 consecutive weeks")
+
+        # ── KPI 1: Delivery Time — AUTO ──
+        st.markdown('<div class="kpi-section-hdr">KPI 1 – Delivery Time Performance &nbsp;|&nbsp; Weight: 25% &nbsp;|&nbsp; Max: TSh 100,000</div>', unsafe_allow_html=True)
+        _h1_adt = _auto.get('adt', 0)
+        st.markdown(f'<div class="auto-chip">🟢 <b>Auto-filled from data:</b> &nbsp; Average Delivery Time = <b>{_h1_adt:.1f} min</b> &nbsp; (from {_auto.get("adt_count",0):,} clean completed orders, outliers excluded)</div>', unsafe_allow_html=True)
+        if _h1_adt == 0:    _h1_kpi1_s = 0.0
+        elif _h1_adt <= 41: _h1_kpi1_s = 1.00
+        elif _h1_adt <= 43: _h1_kpi1_s = 0.75
+        elif _h1_adt <= 45: _h1_kpi1_s = 0.50
+        else:               _h1_kpi1_s = 0.00
+        _h1_kpi1_p = int(100000 * _h1_kpi1_s)
+        st.markdown(_score_bar(_h1_kpi1_p, 100000, "KPI 1 Payout:") + "&nbsp;&nbsp;<small style='color:#888;'>≤41 min→100% | ≤43→75% | ≤45→50% | >45→0%</small>", unsafe_allow_html=True)
+
+        # ── KPI 2: Rider Availability — MANUAL ──
+        st.markdown('<div class="kpi-section-hdr">KPI 2 – Rider Availability & Utilisation &nbsp;|&nbsp; Weight: 20% &nbsp;|&nbsp; Max: TSh 80,000</div>', unsafe_allow_html=True)
+        st.markdown('<div class="manual-chip">🟡 <b>Manual input:</b> Active rider hours ÷ planned rider hours × 100</div>', unsafe_allow_html=True)
+        _h1_avail = st.number_input("Rider Availability % (actual ÷ planned × 100)", 0.0, 100.0, 0.0, 0.5, key="h1_avail", format="%.1f")
+        _h1_kpi2_s = _pct_band(_h1_avail, [(95,1.0),(85,0.75),(80,0.5)])
+        _h1_kpi2_p = int(80000 * _h1_kpi2_s)
+        st.markdown(_score_bar(_h1_kpi2_p, 80000, "KPI 2 Payout:") + "&nbsp;&nbsp;<small style='color:#888;'>≥95%→100% | 85–94%→75% | 80–84%→50% | &lt;80%→0%</small>", unsafe_allow_html=True)
+
+        # ── KPI 3: Rider Compliance — MANUAL ──
+        st.markdown('<div class="kpi-section-hdr">KPI 3 – Rider Compliance & Professional Standards &nbsp;|&nbsp; Weight: 15% &nbsp;|&nbsp; Max: TSh 60,000</div>', unsafe_allow_html=True)
+        st.markdown('<div class="manual-chip">🟡 <b>Manual input:</b> Compliance score % (uniform, safety, complaints, incidents)</div>', unsafe_allow_html=True)
+        _h1_comp = st.number_input("Compliance Score %", 0.0, 100.0, 0.0, 0.5, key="h1_comp", format="%.1f")
+        _h1_kpi3_s = _pct_band(_h1_comp, [(95,1.0),(90,0.75),(85,0.5)])
+        _h1_kpi3_p = int(60000 * _h1_kpi3_s)
+        st.markdown(_score_bar(_h1_kpi3_p, 60000, "KPI 3 Payout:") + "&nbsp;&nbsp;<small style='color:#888;'>≥95%→100% | 90–94%→75% | 85–89%→50% | &lt;85%→0%</small>", unsafe_allow_html=True)
+
+        # ── KPI 4: Regional Performance — AUTO ──
+        st.markdown('<div class="kpi-section-hdr">KPI 4 – Regional Performance Management &nbsp;|&nbsp; Weight: 20% &nbsp;|&nbsp; Max: TSh 80,000</div>', unsafe_allow_html=True)
+        _h1_reg_pct = _auto.get('regions_pct', 0)
+        st.markdown(f'<div class="auto-chip">🟢 <b>Auto-filled:</b> &nbsp; {_auto.get("regions_on",0)} of {_auto.get("regions_total",0)} regions on the 1.2% growth KPI target = <b>{_h1_reg_pct:.1f}%</b></div>', unsafe_allow_html=True)
+        _h1_kpi4_s = _pct_band(_h1_reg_pct, [(90,1.0),(80,0.75),(70,0.5)])
+        _h1_kpi4_p = int(80000 * _h1_kpi4_s)
+        st.markdown(_score_bar(_h1_kpi4_p, 80000, "KPI 4 Payout:") + "&nbsp;&nbsp;<small style='color:#888;'>≥90%→100% | 80–89%→75% | 70–79%→50% | &lt;70%→0%</small>", unsafe_allow_html=True)
+
+        # ── KPI 5: Rider Performance Reviews — MANUAL ──
+        st.markdown('<div class="kpi-section-hdr">KPI 5 – Rider Performance Reviews &nbsp;|&nbsp; Weight: 20% &nbsp;|&nbsp; Max: TSh 80,000</div>', unsafe_allow_html=True)
+        st.markdown('<div class="manual-chip">🟡 <b>Manual input:</b> % riders reviewed + documented scorecards + improvement plans completed</div>', unsafe_allow_html=True)
+        _h1_rev = st.number_input("% Riders fully reviewed this month", 0.0, 100.0, 0.0, 0.5, key="h1_rev", format="%.1f")
+        _h1_kpi5_s = _pct_band(_h1_rev, [(95,1.0),(85,0.75),(75,0.5)])
+        _h1_kpi5_p = int(80000 * _h1_kpi5_s)
+        st.markdown(_score_bar(_h1_kpi5_p, 80000, "KPI 5 Payout:") + "&nbsp;&nbsp;<small style='color:#888;'>≥95%→100% | 85–94%→75% | 75–84%→50% | &lt;75%→0%</small>", unsafe_allow_html=True)
+
+        # ── TOTAL + VERDICT ──
+        _h1_total = _h1_kpi1_p + _h1_kpi2_p + _h1_kpi3_p + _h1_kpi4_p + _h1_kpi5_p
+        _h1_pct   = _h1_total / 400000 * 100
+        st.divider()
+
+        _verdict_class = "verdict-approved" if _h1_total > 0 else "verdict-rejected"
+        _verdict_icon  = "✅" if _h1_total > 0 else "❌"
+        _verdict_text  = "BONUS APPROVED" if _h1_total > 0 else "NO BONUS — all KPIs scored 0"
+        st.markdown(f"""
+        <div class="{_verdict_class}">
+          <div style="font-size:28px;">{_verdict_icon}</div>
+          <div style="font-size:20px;font-weight:800;margin:4px 0;">{_verdict_text}</div>
+          <div style="font-size:30px;font-weight:900;color:#FF6B00;">TSh {_h1_total:,}</div>
+          <div style="font-size:13px;color:#555;">out of TSh 400,000 maximum ({_h1_pct:.1f}% achieved)</div>
+        </div>""", unsafe_allow_html=True)
+
+        # Visualisation
+        st.markdown("#### 📊 KPI Breakdown Visualisation")
+        _fig_h1, (_ax_h1a, _ax_h1b) = plt.subplots(1, 2, figsize=(12, 4.5))
+        _h1_labels  = ['KPI 1\nDelivery Time\n(25%)', 'KPI 2\nRider Avail.\n(20%)',
+                        'KPI 3\nCompliance\n(15%)', 'KPI 4\nRegional\n(20%)', 'KPI 5\nReviews\n(20%)']
+        _h1_earned  = [_h1_kpi1_p, _h1_kpi2_p, _h1_kpi3_p, _h1_kpi4_p, _h1_kpi5_p]
+        _h1_maxvals = [100000, 80000, 60000, 80000, 80000]
+        _h1_colors  = ['#FF6B00' if e==m else ('#FF8C3A' if e>0 else '#FFD9B3') for e,m in zip(_h1_earned, _h1_maxvals)]
+        _ax_h1a.bar(range(5), _h1_maxvals, color='#FFD9B3', width=0.55, zorder=1)
+        _ax_h1a.bar(range(5), _h1_earned,  color=_h1_colors, width=0.55, zorder=2)
+        for i,(e,m) in enumerate(zip(_h1_earned, _h1_maxvals)):
+            _ax_h1a.text(i, m+2500, f"Max\n{m//1000}k", ha='center', fontsize=7.5, color='#999')
+            if e>0: _ax_h1a.text(i, e/2, f"TSh\n{e//1000}k", ha='center', fontsize=8.5, fontweight='bold', color='white')
+        _ax_h1a.set_xticks(range(5)); _ax_h1a.set_xticklabels(_h1_labels, fontsize=8.5)
+        _ax_h1a.set_ylabel("TSh"); _ax_h1a.set_title("KPI Bonus Breakdown (TSh)", fontweight='bold')
+        _ax_h1a.yaxis.set_major_formatter(plt.FuncFormatter(lambda x,_: f"{int(x/1000)}k"))
+        _ax_h1a.grid(True, axis='y', alpha=0.25)
+        # Donut chart total
+        _h1_remaining = 400000 - _h1_total
+        _ax_h1b.pie([_h1_total, max(_h1_remaining,0)],
+                    labels=[f'Earned\nTSh {_h1_total:,}', f'Remaining\nTSh {max(_h1_remaining,0):,}'],
+                    colors=['#FF6B00','#FFD9B3'], startangle=90, wedgeprops={'width':0.55},
+                    autopct='%1.0f%%', pctdistance=0.75, textprops={'fontsize':10})
+        _ax_h1b.set_title(f"Bonus Achievement\n{_h1_pct:.1f}% of Maximum", fontweight='bold')
+        plt.tight_layout()
+        st.pyplot(_fig_h1); plt.close()
+
+        # ── Download Excel ──
+        def _build_h1_excel():
+            import openpyxl
+            from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+            wb = openpyxl.Workbook(); ws = wb.active; ws.title = "Head of Ops"
+            _thin = Border(left=Side(style='thin'),right=Side(style='thin'),
+                           top=Side(style='thin'),bottom=Side(style='thin'))
+            _fill_or  = PatternFill("solid", fgColor="FF6B00")
+            _fill_or2 = PatternFill("solid", fgColor="FFD9B3")
+            _fill_grn = PatternFill("solid", fgColor="E8F5E9")
+            _fill_yel = PatternFill("solid", fgColor="FFFDE7")
+            _fill_hdr = PatternFill("solid", fgColor="2D2D2D")
+            _fill_tot = PatternFill("solid", fgColor="FFF4EC")
+            _f_wh = Font(color="FFFFFF", bold=True, size=11)
+            _f_or = Font(color="FF6B00", bold=True, size=12)
+            _f_b  = Font(bold=True)
+            _ctr  = Alignment(horizontal='center', vertical='center', wrap_text=True)
+            _lft  = Alignment(horizontal='left',   vertical='center', wrap_text=True)
+            # column widths
+            for col,w in [('A',38),('B',18),('C',36),('D',12),('E',16),('F',16)]:
+                ws.column_dimensions[col].width = w
+            ws.row_dimensions[1].height = 28; ws.row_dimensions[4].height = 18
+            # Title
+            ws.merge_cells("A1:F1")
+            _c = ws["A1"]; _c.value = "HEAD OF OPERATIONS – MONTHLY BONUS TRACKER"
+            _c.fill = _fill_or; _c.font = _f_wh; _c.alignment = _ctr
+            ws["A2"] = "Period:"; ws["B2"] = _b_period; ws["A2"].font = _f_b
+            ws["A3"] = f"Assessment generated by Piki BI Dashboard  |  Total auto-KPIs from {_auto.get('total_n',0):,} orders"
+            ws["A3"].font = Font(italic=True, color="888888", size=9)
+            ws.merge_cells("A3:F3")
+            # Column headers
+            for ci,(hdr) in enumerate(["KPI Description","Value","Target / Scoring Rule","Score %","Max (TSh)","Earned (TSh)"],1):
+                _c2 = ws.cell(4, ci, hdr); _c2.fill = _fill_hdr; _c2.font = _f_wh; _c2.alignment = _ctr; _c2.border = _thin
+            # Data rows
+            _rows_h1 = [
+                ("KPI 1 – Avg Delivery Time", f"{_h1_adt:.1f} min (AUTO)", "≤41→100% | ≤43→75% | ≤45→50% | >45→0%", _h1_kpi1_s, 100000, _h1_kpi1_p, True),
+                ("KPI 2 – Rider Availability %", f"{_h1_avail:.1f}% (MANUAL)", "≥95%→100% | 85–94%→75% | 80–84%→50% | <80%→0%", _h1_kpi2_s, 80000, _h1_kpi2_p, False),
+                ("KPI 3 – Rider Compliance %", f"{_h1_comp:.1f}% (MANUAL)", "≥95%→100% | 90–94%→75% | 85–89%→50% | <85%→0%", _h1_kpi3_s, 60000, _h1_kpi3_p, False),
+                ("KPI 4 – Regions on Target %", f"{_h1_reg_pct:.1f}% (AUTO)", "≥90%→100% | 80–89%→75% | 70–79%→50% | <70%→0%", _h1_kpi4_s, 80000, _h1_kpi4_p, True),
+                ("KPI 5 – Rider Reviews %", f"{_h1_rev:.1f}% (MANUAL)", "≥95%→100% | 85–94%→75% | 75–84%→50% | <75%→0%", _h1_kpi5_s, 80000, _h1_kpi5_p, False),
+            ]
+            for ri, (desc, val, tgt, sc, mx, earned, is_auto) in enumerate(_rows_h1, 5):
+                ws.row_dimensions[ri].height = 20
+                _vf = _fill_grn if is_auto else _fill_yel
+                for ci, v in enumerate([desc, val, tgt, f"{sc*100:.0f}%", mx, earned], 1):
+                    _c3 = ws.cell(ri, ci, v); _c3.border = _thin
+                    _c3.alignment = _ctr if ci >= 3 else _lft
+                    if ci == 2: _c3.fill = _vf
+                    if ci == 4: _c3.font = _f_b
+                    if ci == 6: _c3.font = _f_or; _c3.number_format = '#,##0'
+                    if ci == 5: _c3.number_format = '#,##0'
+            # Total row
+            _tr = len(_rows_h1) + 5
+            ws.row_dimensions[_tr].height = 24
+            ws.merge_cells(f"A{_tr}:D{_tr}")
+            _tc = ws.cell(_tr, 1, "TOTAL BONUS EARNED"); _tc.fill = _fill_tot; _tc.font = Font(bold=True,size=12); _tc.alignment = _ctr; _tc.border = _thin
+            ws.cell(_tr, 5, 400000).number_format = '#,##0'; ws.cell(_tr,5).border = _thin
+            _te = ws.cell(_tr, 6, _h1_total); _te.fill = _fill_tot; _te.font = Font(bold=True,color="FF6B00",size=13); _te.number_format = '#,##0'; _te.border = _thin; _te.alignment = _ctr
+            # Verdict
+            _vr = _tr + 1; ws.row_dimensions[_vr].height = 22
+            ws.merge_cells(f"A{_vr}:E{_vr}")
+            ws.cell(_vr,1, "RESULT VERDICT").font = Font(bold=True); ws.cell(_vr,1).alignment = _ctr; ws.cell(_vr,1).border = _thin
+            _vc = ws.cell(_vr, 6, "✅ APPROVED" if _h1_total>0 else "❌ NO BONUS")
+            _vc.font = Font(bold=True, color="008000" if _h1_total>0 else "CC0000"); _vc.border = _thin; _vc.alignment = _ctr
+            # Legend
+            _lr = _vr + 2
+            ws.cell(_lr,1,"🟢 Green = auto-filled from data  |  🟡 Yellow = manual input").font = Font(italic=True,color="888888",size=9)
+            ws.merge_cells(f"A{_lr}:F{_lr}")
+            buf = io.BytesIO(); wb.save(buf); buf.seek(0); return buf.read()
+
+        st.download_button("⬇️ Download Head of Ops Bonus Sheet (Excel)",
+            data=_build_h1_excel(),
+            file_name=f"HeadOfOps_Bonus_{_b_period.replace(' ','_').replace('–','to')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_h1_bonus")
+
+    # ══════════════════════════════════════════════════════
+    # ROLE 2 — HEAD OF CUSTOMER SERVICE  (TSh 400,000 max)
+    # ══════════════════════════════════════════════════════
+    with _btab2:
+        st.markdown("### 📞 Head of Customer Service — Monthly Bonus Assessment")
+        st.caption("Max Bonus: TSh 400,000 &nbsp;|&nbsp; Period = 4 consecutive weeks")
+
+        # KPI 1 — CSAT (manual)
+        st.markdown('<div class="kpi-section-hdr">KPI 1 – Customer Satisfaction (CSAT) &nbsp;|&nbsp; Weight: 30% &nbsp;|&nbsp; Max: TSh 120,000</div>', unsafe_allow_html=True)
+        st.markdown('<div class="manual-chip">🟡 <b>Manual:</b> Positive ratings (4.5–5 stars) ÷ total responses × 100</div>', unsafe_allow_html=True)
+        _h2_csat = st.number_input("CSAT % (positive ÷ total × 100)", 0.0, 100.0, 0.0, 0.5, key="h2_csat", format="%.1f")
+        _h2_k1_s = _pct_band(_h2_csat, [(95,1.0),(85,0.75),(80,0.5)])
+        _h2_k1_p = int(120000 * _h2_k1_s)
+        st.markdown(_score_bar(_h2_k1_p,120000,"KPI 1 Payout:")+"&nbsp;&nbsp;<small style='color:#888;'>≥95%→100% | 85–94%→75% | 80–84%→50% | &lt;80%→0%</small>", unsafe_allow_html=True)
+
+        # KPI 2 — FCR (manual)
+        st.markdown('<div class="kpi-section-hdr">KPI 2 – First Contact Resolution (FCR) &nbsp;|&nbsp; Weight: 15% &nbsp;|&nbsp; Max: TSh 60,000</div>', unsafe_allow_html=True)
+        st.markdown('<div class="manual-chip">🟡 <b>Manual:</b> Resolved on first contact ÷ total contacts × 100</div>', unsafe_allow_html=True)
+        _h2_fcr = st.number_input("FCR %", 0.0, 100.0, 0.0, 0.5, key="h2_fcr", format="%.1f")
+        _h2_k2_s = _pct_band(_h2_fcr, [(80,1.0),(75,0.5)])
+        _h2_k2_p = int(60000 * _h2_k2_s)
+        st.markdown(_score_bar(_h2_k2_p,60000,"KPI 2 Payout:")+"&nbsp;&nbsp;<small style='color:#888;'>≥80%→100% | 75–79%→50% | &lt;75%→0%</small>", unsafe_allow_html=True)
+
+        # KPI 3 — SLA / AHT / Unanswered (all 3 conditions)
+        st.markdown('<div class="kpi-section-hdr">KPI 3 – SLA & Call Handling Efficiency &nbsp;|&nbsp; Weight: 20% &nbsp;|&nbsp; Max: TSh 80,000 &nbsp;(ALL 3 conditions required)</div>', unsafe_allow_html=True)
+        st.markdown('<div class="manual-chip">🟡 <b>Manual — three sub-metrics, all conditions needed for full payout</b></div>', unsafe_allow_html=True)
+        _h2c1, _h2c2, _h2c3 = st.columns(3)
+        with _h2c1:
+            _h2_sla = st.number_input("3a — SLA Met (%)", 0.0, 100.0, 0.0, 0.5, key="h2_sla", format="%.1f")
+            _h2_sla_ok = _h2_sla >= 90
+            st.markdown(f"{'✅ Target met (≥90%)' if _h2_sla_ok else '❌ Below target (<90%)'}")
+        with _h2c2:
+            _h2_aht = st.number_input("3b — Avg Handle Time (min)", 0.0, 30.0, 0.0, 0.1, key="h2_aht", format="%.1f")
+            _h2_aht_ok = _h2_aht <= 1.0 and _h2_aht >= 0
+            st.markdown(f"{'✅ Target met (≤1 min)' if _h2_aht_ok else '❌ Above target (>1 min)'}")
+        with _h2c3:
+            _h2_unans = st.number_input("3c — Unanswered Calls (%)", 0.0, 100.0, 0.0, 0.1, key="h2_unans", format="%.1f")
+            _h2_unans_ok = _h2_unans <= 1.0
+            st.markdown(f"{'✅ Target met (≤1%)' if _h2_unans_ok else '❌ Above target (>1%)'}")
+        _h2_k3_conds = sum([_h2_sla_ok, _h2_aht_ok, _h2_unans_ok])
+        _h2_k3_s = 1.0 if _h2_k3_conds == 3 else (0.5 if _h2_k3_conds == 2 else 0.0)
+        _h2_k3_p = int(80000 * _h2_k3_s)
+        st.markdown(_score_bar(_h2_k3_p,80000,"KPI 3 Payout:")+f"&nbsp;&nbsp;<small style='color:#888;'>{_h2_k3_conds}/3 conditions met — All 3→100% | 2/3→50% | &lt;2→0%</small>", unsafe_allow_html=True)
+
+        # KPI 4 — Schedule Adherence (manual)
+        st.markdown('<div class="kpi-section-hdr">KPI 4 – Agent Productivity / Schedule Adherence &nbsp;|&nbsp; Weight: 15% &nbsp;|&nbsp; Max: TSh 60,000</div>', unsafe_allow_html=True)
+        st.markdown('<div class="manual-chip">🟡 <b>Manual:</b> Schedule adherence rate (%)</div>', unsafe_allow_html=True)
+        _h2_adhr = st.number_input("Schedule Adherence %", 0.0, 100.0, 0.0, 0.5, key="h2_adhr", format="%.1f")
+        _h2_k4_s = _pct_band(_h2_adhr, [(95,1.0),(90,0.5)])
+        _h2_k4_p = int(60000 * _h2_k4_s)
+        st.markdown(_score_bar(_h2_k4_p,60000,"KPI 4 Payout:")+"&nbsp;&nbsp;<small style='color:#888;'>≥95%→100% | 90–94%→50% | &lt;90%→0%</small>", unsafe_allow_html=True)
+
+        # KPI 5 — Failed Order Reduction (auto-assisted)
+        st.markdown('<div class="kpi-section-hdr">KPI 5 – Failed Order Cost Reduction &nbsp;|&nbsp; Weight: 20% &nbsp;|&nbsp; Max: TSh 80,000</div>', unsafe_allow_html=True)
+        _h2_fail_auto = _auto.get('fail_reduction_pct', 0)
+        st.markdown(f'<div class="auto-chip">🟢 <b>Auto-reference:</b> Failed order rate = <b>{_auto.get("failed_pct",0):.2f}%</b> ({_auto.get("failed_n",0):,} failed / {_auto.get("total_n",0):,} orders). &nbsp; Estimated week-on-week reduction: <b>{_h2_fail_auto:+.1f}%</b></div>', unsafe_allow_html=True)
+        st.markdown('<div class="manual-chip">🟡 <b>Manual override:</b> Enter the actual month-on-month failed order rate reduction %</div>', unsafe_allow_html=True)
+        _h2_fail_red = st.number_input("Failed order rate reduction vs previous month (%)", -50.0, 100.0,
+                                        max(0.0, float(_h2_fail_auto)), 0.1, key="h2_fail_red", format="%.1f",
+                                        help="Positive = improvement (fewer failed orders). Auto-value pre-filled from data but you can override.")
+        _h2_k5_s = 1.0 if _h2_fail_red >= 15 else (0.5 if _h2_fail_red >= 6 else 0.0)
+        _h2_k5_p = int(80000 * _h2_k5_s)
+        st.markdown(_score_bar(_h2_k5_p,80000,"KPI 5 Payout:")+"&nbsp;&nbsp;<small style='color:#888;'>≥15% reduction→100% | 6–14%→50% | &lt;5%→0%</small>", unsafe_allow_html=True)
+
+        # ── TOTAL + VERDICT ──
+        _h2_total = _h2_k1_p + _h2_k2_p + _h2_k3_p + _h2_k4_p + _h2_k5_p
+        _h2_pct   = _h2_total / 400000 * 100
+        st.divider()
+        _v2_class = "verdict-approved" if _h2_total > 0 else "verdict-rejected"
+        _v2_icon  = "✅" if _h2_total > 0 else "❌"
+        _v2_text  = "BONUS APPROVED" if _h2_total > 0 else "NO BONUS — all KPIs scored 0"
+        st.markdown(f"""
+        <div class="{_v2_class}">
+          <div style="font-size:28px;">{_v2_icon}</div>
+          <div style="font-size:20px;font-weight:800;margin:4px 0;">{_v2_text}</div>
+          <div style="font-size:30px;font-weight:900;color:#FF6B00;">TSh {_h2_total:,}</div>
+          <div style="font-size:13px;color:#555;">out of TSh 400,000 maximum ({_h2_pct:.1f}% achieved)</div>
+        </div>""", unsafe_allow_html=True)
+
+        st.markdown("#### 📊 KPI Breakdown Visualisation")
+        _fig_h2, (_ax_h2a, _ax_h2b) = plt.subplots(1, 2, figsize=(12, 4.5))
+        _h2_labels  = ['KPI 1\nCSAT\n(30%)', 'KPI 2\nFCR\n(15%)', 'KPI 3\nSLA/AHT\n(20%)', 'KPI 4\nAdherence\n(15%)', 'KPI 5\nFailed Red.\n(20%)']
+        _h2_earned  = [_h2_k1_p, _h2_k2_p, _h2_k3_p, _h2_k4_p, _h2_k5_p]
+        _h2_maxvals = [120000, 60000, 80000, 60000, 80000]
+        _h2_colors  = ['#FF6B00' if e==m else ('#FF8C3A' if e>0 else '#FFD9B3') for e,m in zip(_h2_earned, _h2_maxvals)]
+        _ax_h2a.bar(range(5), _h2_maxvals, color='#FFD9B3', width=0.55, zorder=1)
+        _ax_h2a.bar(range(5), _h2_earned,  color=_h2_colors, width=0.55, zorder=2)
+        for i,(e,m) in enumerate(zip(_h2_earned, _h2_maxvals)):
+            _ax_h2a.text(i, m+2500, f"Max\n{m//1000}k", ha='center', fontsize=7.5, color='#999')
+            if e>0: _ax_h2a.text(i, e/2, f"TSh\n{e//1000}k", ha='center', fontsize=8.5, fontweight='bold', color='white')
+        _ax_h2a.set_xticks(range(5)); _ax_h2a.set_xticklabels(_h2_labels, fontsize=8.5)
+        _ax_h2a.set_ylabel("TSh"); _ax_h2a.set_title("KPI Bonus Breakdown (TSh)", fontweight='bold')
+        _ax_h2a.yaxis.set_major_formatter(plt.FuncFormatter(lambda x,_: f"{int(x/1000)}k"))
+        _ax_h2a.grid(True, axis='y', alpha=0.25)
+        _h2_rem = 400000 - _h2_total
+        _ax_h2b.pie([_h2_total, max(_h2_rem,0)],
+                    labels=[f'Earned\nTSh {_h2_total:,}',f'Remaining\nTSh {max(_h2_rem,0):,}'],
+                    colors=['#FF6B00','#FFD9B3'], startangle=90, wedgeprops={'width':0.55},
+                    autopct='%1.0f%%', pctdistance=0.75, textprops={'fontsize':10})
+        _ax_h2b.set_title(f"Bonus Achievement\n{_h2_pct:.1f}% of Maximum", fontweight='bold')
+        plt.tight_layout(); st.pyplot(_fig_h2); plt.close()
+
+        def _build_h2_excel():
+            import openpyxl
+            from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+            wb2 = openpyxl.Workbook(); ws2 = wb2.active; ws2.title = "Head of CS"
+            _thin2 = Border(left=Side(style='thin'),right=Side(style='thin'),top=Side(style='thin'),bottom=Side(style='thin'))
+            _fo2 = PatternFill("solid",fgColor="FF6B00"); _fh2 = PatternFill("solid",fgColor="2D2D2D")
+            _fg2 = PatternFill("solid",fgColor="E8F5E9"); _fy2 = PatternFill("solid",fgColor="FFFDE7")
+            _ft2 = PatternFill("solid",fgColor="FFF4EC")
+            _fw2 = Font(color="FFFFFF",bold=True,size=11); _fb2 = Font(bold=True)
+            _fo2f = Font(color="FF6B00",bold=True,size=12); _ctr2 = Alignment(horizontal='center',vertical='center',wrap_text=True)
+            _lft2 = Alignment(horizontal='left',vertical='center',wrap_text=True)
+            for col,w in [('A',38),('B',20),('C',38),('D',12),('E',16),('F',16)]: ws2.column_dimensions[col].width = w
+            ws2.merge_cells("A1:F1"); _c2 = ws2["A1"]
+            _c2.value = "HEAD OF CUSTOMER SERVICE – MONTHLY BONUS TRACKER"
+            _c2.fill = _fo2; _c2.font = _fw2; _c2.alignment = _ctr2; ws2.row_dimensions[1].height = 28
+            ws2["A2"] = "Period:"; ws2["B2"] = _b_period; ws2["A2"].font = _fb2
+            for ci,hdr in enumerate(["KPI Description","Value","Target / Scoring","Score %","Max (TSh)","Earned (TSh)"],1):
+                _cc = ws2.cell(4,ci,hdr); _cc.fill = _fh2; _cc.font = _fw2; _cc.alignment = _ctr2; _cc.border = _thin2
+            _rows_h2 = [
+                ("KPI 1 – CSAT %",                   f"{_h2_csat:.1f}% (MANUAL)", "≥95→100% | 85–94→75% | 80–84→50% | <80→0%", _h2_k1_s, 120000, _h2_k1_p, False),
+                ("KPI 2 – First Contact Resolution %",f"{_h2_fcr:.1f}% (MANUAL)",  "≥80→100% | 75–79→50% | <75→0%",              _h2_k2_s, 60000, _h2_k2_p,  False),
+                ("KPI 3 – SLA/AHT/Unanswered",        f"SLA:{_h2_sla:.0f}% AHT:{_h2_aht:.1f}m Unans:{_h2_unans:.1f}%","All 3 met→100% | 2/3→50% | <2→0%", _h2_k3_s, 80000, _h2_k3_p, False),
+                ("KPI 4 – Schedule Adherence %",      f"{_h2_adhr:.1f}% (MANUAL)", "≥95→100% | 90–94→50% | <90→0%",               _h2_k4_s, 60000, _h2_k4_p,  False),
+                ("KPI 5 – Failed Order Reduction %",  f"{_h2_fail_red:.1f}% (MANUAL/AUTO)", "≥15→100% | 6–14→50% | <5→0%",         _h2_k5_s, 80000, _h2_k5_p,  False),
+            ]
+            for ri,(_desc,_val,_tgt,_sc,_mx,_earned,_is_auto) in enumerate(_rows_h2,5):
+                ws2.row_dimensions[ri].height = 20
+                for ci,v in enumerate([_desc,_val,_tgt,f"{_sc*100:.0f}%",_mx,_earned],1):
+                    _c3 = ws2.cell(ri,ci,v); _c3.border = _thin2; _c3.alignment = _ctr2 if ci>=3 else _lft2
+                    if ci==2: _c3.fill = _fg2 if _is_auto else _fy2
+                    if ci==4: _c3.font = _fb2
+                    if ci==6: _c3.font = _fo2f; _c3.number_format='#,##0'
+                    if ci==5: _c3.number_format='#,##0'
+            _tr2 = len(_rows_h2)+5; ws2.row_dimensions[_tr2].height = 24
+            ws2.merge_cells(f"A{_tr2}:D{_tr2}")
+            ws2.cell(_tr2,1,"TOTAL BONUS EARNED").fill=_ft2; ws2.cell(_tr2,1).font=Font(bold=True,size=12); ws2.cell(_tr2,1).alignment=_ctr2; ws2.cell(_tr2,1).border=_thin2
+            ws2.cell(_tr2,5,400000).number_format='#,##0'; ws2.cell(_tr2,5).border=_thin2
+            _te2=ws2.cell(_tr2,6,_h2_total); _te2.fill=_ft2; _te2.font=Font(bold=True,color="FF6B00",size=13); _te2.number_format='#,##0'; _te2.border=_thin2; _te2.alignment=_ctr2
+            _vr2=_tr2+1; ws2.cell(_vr2,6,"✅ APPROVED" if _h2_total>0 else "❌ NO BONUS").font=Font(bold=True,color="008000" if _h2_total>0 else "CC0000"); ws2.cell(_vr2,6).border=_thin2; ws2.cell(_vr2,6).alignment=_ctr2
+            buf2 = io.BytesIO(); wb2.save(buf2); buf2.seek(0); return buf2.read()
+
+        st.download_button("⬇️ Download Head of CS Bonus Sheet (Excel)",
+            data=_build_h2_excel(),
+            file_name=f"HeadOfCS_Bonus_{_b_period.replace(' ','_').replace('–','to')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_h2_bonus")
+
+    # ══════════════════════════════════════════════════════
+    # ROLE 3 — ZONAL MANAGER  (20 points scoring)
+    # ══════════════════════════════════════════════════════
+    with _btab3:
+        st.markdown("### 📍 Zonal Operations Manager — Monthly Bonus Assessment")
+        st.caption("Max Score: 20 Points &nbsp;|&nbsp; Minimum threshold to earn bonus: 14/20 &nbsp;|&nbsp; Period = 4 consecutive weeks")
+
+        # Identity
+        _zm_c1, _zm_c2 = st.columns(2)
+        _zm_name = _zm_c1.text_input("Manager Name", "", key="zm_name_inp")
+        _zm_zone = _zm_c2.text_input("Zone / City", "", key="zm_zone_inp")
+
+        # ── KPI 1 — Driver Availability (5 pts) ──
+        st.markdown('<div class="kpi-section-hdr">KPI 1 – Driver Availability &nbsp;|&nbsp; 5 Points</div>', unsafe_allow_html=True)
+        _morn_r = _auto.get('morning_ratio', 0)
+        _peak_r  = _auto.get('peak_ratio', 0)
+        st.markdown(f'<div class="auto-chip">🟢 <b>Auto-reference from data:</b> Morning driver:order ratio = <b>{_morn_r:.2f}</b> ({_auto.get("morning_drivers",0)} drivers / {_auto.get("morning_orders",0)} orders, 07–11h) &nbsp;|&nbsp; Peak ratio = <b>{_peak_r:.2f}</b> ({_auto.get("peak_drivers",0)} drivers / {_auto.get("peak_orders",0)} orders, 12–20h)</div>', unsafe_allow_html=True)
+
+        _zm1_col1, _zm1_col2, _zm1_col3 = st.columns(3)
+        with _zm1_col1:
+            st.markdown("**1a — Morning Hours Ratio** *(2 pts max)*")
+            st.caption("Enter weekly driver:order ratios (e.g. 1.3 = 1.3 drivers per order). Auto-reference above.")
+            _z1a = [st.number_input(f"W{i+1} Morning ratio", 0.0, 5.0, float(round(_morn_r,2)), 0.05, key=f"z1a_w{i}", format="%.2f") for i in range(4)]
+        with _zm1_col2:
+            st.markdown("**1b — Peak Hours Ratio** *(1 pt max)*")
+            st.caption("Peak hours driver:order ratio per week")
+            _z1b = [st.number_input(f"W{i+1} Peak ratio", 0.0, 5.0, float(round(_peak_r,2)), 0.05, key=f"z1b_w{i}", format="%.2f") for i in range(4)]
+        with _zm1_col3:
+            st.markdown("**1c — Monthly Availability %** *(2 pts max)*")
+            st.caption("Actual ÷ required drivers × 100 per week")
+            _dr_ret = _auto.get('driver_retention_pct', 0)
+            _z1c = [st.number_input(f"W{i+1} Availability %", 0.0, 100.0, float(_dr_ret), 0.5, key=f"z1c_w{i}", format="%.1f") for i in range(4)]
+
+        _z1a_avg = float(np.mean(_z1a)); _z1b_avg = float(np.mean(_z1b)); _z1c_avg = float(np.mean(_z1c))
+        _z_kpi1a = 2 if _z1a_avg >= 1.2 else (1 if _z1a_avg >= 1.0 else 0)
+        _z_kpi1b = 1 if _z1b_avg >= 1.2 else 0
+        _z_kpi1c = 2 if _z1c_avg >= 90 else (1 if _z1c_avg >= 80 else 0)
+        _z_kpi1  = _z_kpi1a + _z_kpi1b + _z_kpi1c
+        st.markdown(_pt_bar(_z_kpi1, 5, "KPI 1 Total:") + f"&nbsp;&nbsp;<small style='color:#888;'>1a:{_z_kpi1a}/2 | 1b:{_z_kpi1b}/1 | 1c:{_z_kpi1c}/2</small>", unsafe_allow_html=True)
+
+        # ── KPI 2 — Delivery Time (4 pts) — AUTO ──
+        st.markdown('<div class="kpi-section-hdr">KPI 2 – Delivery Time Performance &nbsp;|&nbsp; 4 Points</div>', unsafe_allow_html=True)
+        _zm_dt_target = st.number_input("Zone delivery time target (minutes)", 25.0, 90.0, 45.0, 1.0, key="zm_dt_tgt")
+        _zm_adt = _auto.get('adt', 0)
+        _zm_dev = round(_zm_adt - _zm_dt_target, 1)
+        _dev_colour = "#28a745" if _zm_dev <= 0 else "#dc3545"
+        st.markdown(f'<div class="auto-chip">🟢 <b>Auto-filled:</b> Avg Delivery Time = <b>{_zm_adt:.1f} min</b> &nbsp;|&nbsp; Zone Target = {_zm_dt_target:.0f} min &nbsp;|&nbsp; Deviation = <b style="color:{_dev_colour};">{_zm_dev:+.1f} min</b> {"✅ faster than target" if _zm_dev<=0 else "⚠️ slower than target"}</div>', unsafe_allow_html=True)
+        _z_kpi2 = 4 if _zm_dev<=-5 else (3 if _zm_dev<=-2 else (2 if _zm_dev<=0 else (1 if _zm_dev<=3 else 0)))
+        st.markdown(_pt_bar(_z_kpi2, 4, "KPI 2 Score:") + "&nbsp;&nbsp;<small style='color:#888;'>≤−5min→4pts | ≤−2→3 | on target→2 | ≤+3→1 | >+3→0</small>", unsafe_allow_html=True)
+
+        # ── KPI 3 — Compliance (2 pts) — manual ──
+        st.markdown('<div class="kpi-section-hdr">KPI 3 – Driver Appearance & Compliance &nbsp;|&nbsp; 2 Points</div>', unsafe_allow_html=True)
+        st.markdown('<div class="manual-chip">🟡 <b>Manual:</b> Compliance rate % per week (uniform, grooming, in-app, customer relations)</div>', unsafe_allow_html=True)
+        _z3_cols = st.columns(4)
+        _z3 = [_z3_cols[i].number_input(f"W{i+1} %", 0.0, 100.0, 0.0, 0.5, key=f"z3_w{i}", format="%.1f") for i in range(4)]
+        _z3_avg = float(np.mean(_z3))
+        _z_kpi3 = 2 if _z3_avg >= 95 else (1 if _z3_avg >= 85 else 0)
+        st.markdown(_pt_bar(_z_kpi3, 2, "KPI 3 Score:") + f"&nbsp;&nbsp;<small style='color:#888;'>Avg: {_z3_avg:.1f}% — ≥95→2pts | 85–94→1 | &lt;85→0</small>", unsafe_allow_html=True)
+
+        # ── KPI 4 — Driver Retention (2 pts) — auto-assisted ──
+        st.markdown('<div class="kpi-section-hdr">KPI 4 – Driver Retention ≥80% active ≥10 days/month &nbsp;|&nbsp; 2 Points</div>', unsafe_allow_html=True)
+        _zm_ret_auto = _auto.get('driver_retention_pct', 0)
+        st.markdown(f'<div class="auto-chip">🟢 <b>Auto-reference:</b> Drivers with ≥10 active delivery days = <b>{_zm_ret_auto:.1f}%</b> ({_auto.get("active_drivers_10d",0)} of {_auto.get("total_drivers",0)} drivers)</div>', unsafe_allow_html=True)
+        st.markdown('<div class="manual-chip">🟡 Confirm or override per-week retention % below</div>', unsafe_allow_html=True)
+        _z4_cols = st.columns(4)
+        _z4 = [_z4_cols[i].number_input(f"W{i+1} Retention %", 0.0, 100.0, float(_zm_ret_auto), 0.5, key=f"z4_w{i}", format="%.1f") for i in range(4)]
+        _z4_avg = float(np.mean(_z4))
+        _z_kpi4 = 2 if _z4_avg >= 80 else (1 if _z4_avg >= 70 else 0)
+        st.markdown(_pt_bar(_z_kpi4, 2, "KPI 4 Score:") + f"&nbsp;&nbsp;<small style='color:#888;'>Avg: {_z4_avg:.1f}% — ≥80%→2pts | 70–79%→1 | &lt;70%→0</small>", unsafe_allow_html=True)
+
+        # ── KPI 5 — Performance Reviews (3 pts) — manual ──
+        st.markdown('<div class="kpi-section-hdr">KPI 5 – Delivery Performance Reviews &nbsp;|&nbsp; 3 Points</div>', unsafe_allow_html=True)
+        st.markdown('<div class="manual-chip">🟡 <b>Manual — 3 sub-components per week</b></div>', unsafe_allow_html=True)
+        _z5_a_col, _z5_b_col, _z5_c_col = st.columns(3)
+        with _z5_a_col:
+            st.markdown("**5a — % Drivers Reviewed**")
+            _z5a = [st.number_input(f"W{i+1} % reviewed", 0.0,100.0,0.0,0.5,key=f"z5a_w{i}",format="%.1f") for i in range(4)]
+        with _z5_b_col:
+            st.markdown("**5b — Follow-up within 2 days?** *(1=Yes / 0=No)*")
+            _z5b = [st.number_input(f"W{i+1}",0,1,0,1,key=f"z5b_w{i}") for i in range(4)]
+        with _z5_c_col:
+            st.markdown("**5c — Documented improvement actions?** *(1=Yes / 0=No)*")
+            _z5c = [st.number_input(f"W{i+1}",0,1,0,1,key=f"z5c_w{i}") for i in range(4)]
+        _z5a_avg=float(np.mean(_z5a)); _z5b_avg=float(np.mean(_z5b)); _z5c_avg=float(np.mean(_z5c))
+        _z_kpi5a = 1 if _z5a_avg>=80 else 0
+        _z_kpi5b = 1 if _z5b_avg>=0.75 else 0
+        _z_kpi5c = 1 if _z5c_avg>=0.75 else 0
+        _z_kpi5  = _z_kpi5a + _z_kpi5b + _z_kpi5c
+        st.markdown(_pt_bar(_z_kpi5, 3, "KPI 5 Score:") + f"&nbsp;&nbsp;<small style='color:#888;'>5a:{_z_kpi5a}/1 | 5b:{_z_kpi5b}/1 | 5c:{_z_kpi5c}/1</small>", unsafe_allow_html=True)
+
+        # ── KPI 6 — Reporting Accuracy (2 pts) — manual ──
+        st.markdown('<div class="kpi-section-hdr">KPI 6 – Reporting Accuracy &nbsp;|&nbsp; 2 Points</div>', unsafe_allow_html=True)
+        st.markdown('<div class="manual-chip">🟡 <b>Manual:</b> 2 = Full & on time | 1 = Minor issues | 0 = Failed/late</div>', unsafe_allow_html=True)
+        _z6_cols = st.columns(4)
+        _z6 = [_z6_cols[i].number_input(f"W{i+1} (0/1/2)", 0, 2, 2, 1, key=f"z6_w{i}") for i in range(4)]
+        _z6_avg = float(np.mean(_z6))
+        _z_kpi6 = 2 if _z6_avg >= 1.75 else (1 if _z6_avg >= 1.0 else 0)
+        st.markdown(_pt_bar(_z_kpi6, 2, "KPI 6 Score:") + f"&nbsp;&nbsp;<small style='color:#888;'>Avg: {_z6_avg:.2f} — ≥1.75→2pts | ≥1.0→1 | &lt;1→0</small>", unsafe_allow_html=True)
+
+        # ── KPI 7 — Issues Resolution (2 pts) — manual ──
+        st.markdown('<div class="kpi-section-hdr">KPI 7 – Issues Resolution &nbsp;|&nbsp; 2 Points</div>', unsafe_allow_html=True)
+        st.markdown('<div class="manual-chip">🟡 <b>Manual:</b> 2 = All resolved promptly | 1 = Most | 0 = Poor</div>', unsafe_allow_html=True)
+        _z7_cols = st.columns(4)
+        _z7 = [_z7_cols[i].number_input(f"W{i+1} (0/1/2)", 0, 2, 2, 1, key=f"z7_w{i}") for i in range(4)]
+        _z7_avg = float(np.mean(_z7))
+        _z_kpi7 = 2 if _z7_avg >= 1.75 else (1 if _z7_avg >= 1.0 else 0)
+        st.markdown(_pt_bar(_z_kpi7, 2, "KPI 7 Score:") + f"&nbsp;&nbsp;<small style='color:#888;'>Avg: {_z7_avg:.2f} — ≥1.75→2pts | ≥1.0→1 | &lt;1→0</small>", unsafe_allow_html=True)
+
+        # ── TOTAL SCORE + VERDICT ──
+        _zm_total = _z_kpi1 + _z_kpi2 + _z_kpi3 + _z_kpi4 + _z_kpi5 + _z_kpi6 + _z_kpi7
+        if _zm_total >= 18:   _zm_band = "🌟 Exceptional"; _zm_colour = "#FF6B00"; _zm_ok = True
+        elif _zm_total >= 16: _zm_band = "✅ Meets Expectations"; _zm_colour = "#28a745"; _zm_ok = True
+        elif _zm_total >= 14: _zm_band = "⚠️ Needs Improvement"; _zm_colour = "#f39c12"; _zm_ok = True
+        else:                  _zm_band = "❌ Below Threshold"; _zm_colour = "#dc3545"; _zm_ok = False
+        st.divider()
+        _vz_class = "verdict-approved" if _zm_ok else "verdict-rejected"
+        st.markdown(f"""
+        <div class="{_vz_class}">
+          <div style="font-size:26px;">{_zm_band}</div>
+          <div style="font-size:36px;font-weight:900;color:{_zm_colour};">{_zm_total} / 20</div>
+          <div style="font-size:14px;color:#555;">Manager: <b>{_zm_name or '—'}</b> &nbsp;|&nbsp; Zone: <b>{_zm_zone or '—'}</b></div>
+          <div style="font-size:13px;color:#555;margin-top:4px;">{'✅ BONUS ENTITLED — minimum threshold of 14/20 met' if _zm_ok else '❌ NO BONUS — score below minimum threshold of 14/20'}</div>
+        </div>""", unsafe_allow_html=True)
+
+        # ── Visualisation ──
+        st.markdown("#### 📊 Score Breakdown Visualisation")
+        _fig_zm, (_ax_zma, _ax_zmb) = plt.subplots(1, 2, figsize=(14, 5))
+        _zm_kpi_labels = ['KPI1\nAvailability\n(5pts)','KPI2\nDelivery\nTime (4)','KPI3\nCompliance\n(2)','KPI4\nRetention\n(2)','KPI5\nReviews\n(3)','KPI6\nReporting\n(2)','KPI7\nResolution\n(2)']
+        _zm_scores  = [_z_kpi1, _z_kpi2, _z_kpi3, _z_kpi4, _z_kpi5, _z_kpi6, _z_kpi7]
+        _zm_maxpts  = [5, 4, 2, 2, 3, 2, 2]
+        _zm_fill_c  = ['#FF6B00' if s==m else ('#FF8C3A' if s>0 else '#FFD9B3') for s,m in zip(_zm_scores,_zm_maxpts)]
+        _ax_zma.bar(range(7), _zm_maxpts, color='#FFD9B3', width=0.6, zorder=1)
+        _ax_zma.bar(range(7), _zm_scores, color=_zm_fill_c, width=0.6, zorder=2)
+        for i,(s,m) in enumerate(zip(_zm_scores, _zm_maxpts)):
+            _ax_zma.text(i, m+0.12, f"{m}pt", ha='center', fontsize=8, color='#aaa')
+            if s>0: _ax_zma.text(i, s/2, str(s), ha='center', fontsize=11, fontweight='bold', color='white')
+        _ax_zma.set_xticks(range(7)); _ax_zma.set_xticklabels(_zm_kpi_labels, fontsize=8.5)
+        _ax_zma.set_ylabel("Points"); _ax_zma.set_ylim(0, 6.5)
+        _ax_zma.set_title(f"Score Breakdown — {_zm_name or 'Zonal Manager'} ({_zm_zone or '?'})", fontweight='bold')
+        _ax_zma.axhline(0, color='#ddd', lw=0.5); _ax_zma.grid(True, axis='y', alpha=0.25)
+        # Gauge-style donut
+        _ax_zmb.pie([_zm_total, max(20-_zm_total,0)],
+                    labels=[f'Scored\n{_zm_total} pts', f'Remaining\n{max(20-_zm_total,0)} pts'],
+                    colors=[_zm_colour,'#FFD9B3'], startangle=90, wedgeprops={'width':0.55},
+                    autopct='%1.0f%%', pctdistance=0.75, textprops={'fontsize':11})
+        _ax_zmb.set_title(f"Total Score: {_zm_total}/20\n{_zm_band}", fontweight='bold')
+        # Threshold marker
+        _ax_zmb.text(0, 0, f"Min: 14\n{'✅ PASS' if _zm_ok else '❌ FAIL'}",
+                     ha='center', va='center', fontsize=12, fontweight='bold',
+                     color='#008000' if _zm_ok else '#CC0000')
+        plt.tight_layout(); st.pyplot(_fig_zm); plt.close()
+
+        def _build_zm_excel():
+            import openpyxl
+            from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+            wb3 = openpyxl.Workbook(); ws3 = wb3.active; ws3.title = "Zonal Manager"
+            _thin3 = Border(left=Side(style='thin'),right=Side(style='thin'),top=Side(style='thin'),bottom=Side(style='thin'))
+            _fo3 = PatternFill("solid",fgColor="FF6B00"); _fh3 = PatternFill("solid",fgColor="2D2D2D")
+            _fg3 = PatternFill("solid",fgColor="E8F5E9"); _fy3 = PatternFill("solid",fgColor="FFFDE7")
+            _ft3 = PatternFill("solid",fgColor="FFF4EC")
+            _fw3 = Font(color="FFFFFF",bold=True,size=11); _fb3 = Font(bold=True)
+            _fo3f = Font(color="FF6B00",bold=True,size=12)
+            _ctr3 = Alignment(horizontal='center',vertical='center',wrap_text=True)
+            _lft3 = Alignment(horizontal='left',vertical='center',wrap_text=True)
+            for col,w in [('A',32),('B',12),('C',12),('D',12),('E',12),('F',14),('G',12),('H',12)]:
+                ws3.column_dimensions[col].width = w
+            ws3.merge_cells("A1:H1"); _c3t = ws3["A1"]
+            _c3t.value = "ZONAL OPERATIONS MANAGER – MONTHLY BONUS TRACKER"
+            _c3t.fill = _fo3; _c3t.font = _fw3; _c3t.alignment = _ctr3; ws3.row_dimensions[1].height = 28
+            ws3["A2"]="Manager:"; ws3["B2"]=_zm_name; ws3["C2"]="Zone:"; ws3["D2"]=_zm_zone
+            ws3["E2"]="Period:"; ws3["F2"]=_b_period
+            for ci,hdr in enumerate(["KPI","W1","W2","W3","W4","Avg / Auto","Score","Max pts"],1):
+                _hc = ws3.cell(4,ci,hdr); _hc.fill=_fh3; _hc.font=_fw3; _hc.alignment=_ctr3; _hc.border=_thin3
+            _zm_rows = [
+                ("KPI 1a – Morning Driver:Order Ratio", *_z1a, f"{_z1a_avg:.2f} (auto ref)", _z_kpi1a, 2, True),
+                ("KPI 1b – Peak Driver:Order Ratio",    *_z1b, f"{_z1b_avg:.2f} (auto ref)", _z_kpi1b, 1, True),
+                ("KPI 1c – Availability %",             *_z1c, f"{_z1c_avg:.1f}%",           _z_kpi1c, 2, False),
+                ("KPI 2 – Delivery Time Deviation",     "AUTO","AUTO","AUTO","AUTO", f"{_zm_dev:+.1f} min (AUTO)", _z_kpi2, 4, True),
+                ("KPI 3 – Compliance %",                *_z3,  f"{_z3_avg:.1f}%",            _z_kpi3, 2, False),
+                ("KPI 4 – Driver Retention %",          *_z4,  f"{_z4_avg:.1f}% (auto ref)", _z_kpi4, 2, True),
+                ("KPI 5a – % Drivers Reviewed",         *_z5a, f"{_z5a_avg:.0f}%",           _z_kpi5a, 1, False),
+                ("KPI 5b – Follow-up (Yes/No)",         *_z5b, f"{_z5b_avg:.0%}",            _z_kpi5b, 1, False),
+                ("KPI 5c – Actions Documented",         *_z5c, f"{_z5c_avg:.0%}",            _z_kpi5c, 1, False),
+                ("KPI 6 – Reporting Accuracy",          *_z6,  f"{_z6_avg:.2f}",             _z_kpi6, 2, False),
+                ("KPI 7 – Issues Resolution",           *_z7,  f"{_z7_avg:.2f}",             _z_kpi7, 2, False),
+            ]
+            for ri, row_data in enumerate(_zm_rows, 5):
+                _desc, _w1, _w2, _w3, _w4, _avgv, _sc, _mx, _is_auto = row_data
+                ws3.row_dimensions[ri].height = 18
+                for ci, v in enumerate([_desc, _w1, _w2, _w3, _w4, str(_avgv), _sc, _mx], 1):
+                    _rc = ws3.cell(ri, ci, v); _rc.border = _thin3; _rc.alignment = _ctr3 if ci>1 else _lft3
+                    if ci in (2,3,4,5): _rc.fill = _fg3 if _is_auto else _fy3
+                    if ci == 7: _rc.font = _fo3f
+            _tr3 = len(_zm_rows)+5; ws3.row_dimensions[_tr3].height = 26
+            ws3.merge_cells(f"A{_tr3}:F{_tr3}")
+            ws3.cell(_tr3,1,"TOTAL SCORE").fill=_ft3; ws3.cell(_tr3,1).font=Font(bold=True,size=12); ws3.cell(_tr3,1).alignment=_ctr3; ws3.cell(_tr3,1).border=_thin3
+            ws3.cell(_tr3,7,f"{_zm_total}/20").font=Font(bold=True,color="FF6B00",size=14); ws3.cell(_tr3,7).border=_thin3; ws3.cell(_tr3,7).alignment=_ctr3
+            ws3.cell(_tr3,8,"20").border=_thin3; ws3.cell(_tr3,8).alignment=_ctr3
+            _vr3=_tr3+1
+            ws3.merge_cells(f"A{_vr3}:F{_vr3}"); ws3.cell(_vr3,1,_zm_band).fill=_ft3; ws3.cell(_vr3,1).font=Font(bold=True); ws3.cell(_vr3,1).alignment=_ctr3; ws3.cell(_vr3,1).border=_thin3
+            _vs3=ws3.cell(_vr3,7,"✅ ENTITLED" if _zm_ok else "❌ NO BONUS")
+            _vs3.font=Font(bold=True,color="008000" if _zm_ok else "CC0000"); _vs3.border=_thin3; _vs3.alignment=_ctr3
+            buf3=io.BytesIO(); wb3.save(buf3); buf3.seek(0); return buf3.read()
+
+        st.download_button("⬇️ Download Zonal Manager Bonus Sheet (Excel)",
+            data=_build_zm_excel(),
+            file_name=f"ZonalMgr_{(_zm_name or 'Manager').replace(' ','_')}_Bonus_{_b_period.replace(' ','_').replace('–','to')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_zm_bonus")
+
+    # ══════════════════════════════════════════════════════
+    # COMBINED ALL-STAFF SUMMARY
+    # ══════════════════════════════════════════════════════
+    st.divider()
+    st.markdown("### 📋 Combined Staff Bonus Summary — All Roles")
+    _sum_c1, _sum_c2, _sum_c3 = st.columns(3)
+    with _sum_c1:
+        _h1_pct_disp = _h1_total / 400000 * 100
+        st.markdown(f"""<div class="summary-card">
+          <div style="font-size:13px;font-weight:700;color:#FF6B00;">🏢 Head of Operations</div>
+          <div style="font-size:26px;font-weight:900;color:#333;margin:4px 0;">TSh {_h1_total:,}</div>
+          <div style="font-size:12px;color:#777;">{_h1_pct_disp:.1f}% of TSh 400,000</div>
+          <div style="margin-top:6px;">{"✅ <b>APPROVED</b>" if _h1_total>0 else "❌ <b>NO BONUS</b>"}</div>
+          <div style="background:#FF6B00;height:5px;border-radius:3px;width:{min(_h1_pct_disp,100):.0f}%;margin-top:8px;"></div>
+        </div>""", unsafe_allow_html=True)
+    with _sum_c2:
+        _h2_pct_disp = _h2_total / 400000 * 100
+        st.markdown(f"""<div class="summary-card">
+          <div style="font-size:13px;font-weight:700;color:#FF6B00;">📞 Head of Customer Service</div>
+          <div style="font-size:26px;font-weight:900;color:#333;margin:4px 0;">TSh {_h2_total:,}</div>
+          <div style="font-size:12px;color:#777;">{_h2_pct_disp:.1f}% of TSh 400,000</div>
+          <div style="margin-top:6px;">{"✅ <b>APPROVED</b>" if _h2_total>0 else "❌ <b>NO BONUS</b>"}</div>
+          <div style="background:#FF6B00;height:5px;border-radius:3px;width:{min(_h2_pct_disp,100):.0f}%;margin-top:8px;"></div>
+        </div>""", unsafe_allow_html=True)
+    with _sum_c3:
+        _zm_pct_disp = _zm_total / 20 * 100
+        st.markdown(f"""<div class="summary-card">
+          <div style="font-size:13px;font-weight:700;color:#FF6B00;">📍 Zonal Manager{' — '+_zm_name if _zm_name else ''}</div>
+          <div style="font-size:26px;font-weight:900;color:#333;margin:4px 0;">{_zm_total} / 20 pts</div>
+          <div style="font-size:12px;color:#777;">{_zm_pct_disp:.1f}% of max &nbsp;|&nbsp; {_zm_band}</div>
+          <div style="margin-top:6px;">{"✅ <b>ENTITLED</b>" if _zm_ok else "❌ <b>NOT ENTITLED</b>"}</div>
+          <div style="background:#FF6B00;height:5px;border-radius:3px;width:{min(_zm_pct_disp,100):.0f}%;margin-top:8px;"></div>
+        </div>""", unsafe_allow_html=True)
+
+    # Combined bar chart
+    st.markdown("#### 📊 Overall Achievement — All Roles")
+    _fig_all, _ax_all = plt.subplots(figsize=(10, 3.5))
+    _all_roles = ['Head of Operations', 'Head of CS', f'Zonal Manager\n({_zm_name or "—"})']
+    _all_pcts  = [_h1_total/400000*100, _h2_total/400000*100, _zm_total/20*100]
+    _all_cols  = ['#FF6B00' if p>=75 else ('#FF8C3A' if p>=50 else '#FFD9B3') for p in _all_pcts]
+    _hbars = _ax_all.barh(_all_roles, _all_pcts, color=_all_cols, height=0.45, zorder=2)
+    _ax_all.axvline(100, color='#28a745', linestyle='--', lw=1.5, alpha=0.8, label='100% (full bonus)')
+    _ax_all.axvline(75, color='#FF6B00',  linestyle=':', lw=1.2, alpha=0.7, label='75% (good performance)')
+    for _hb, _pv in zip(_hbars, _all_pcts):
+        _ax_all.text(min(_pv,99)+1, _hb.get_y()+_hb.get_height()/2,
+                     f'{_pv:.1f}%', va='center', fontsize=11, fontweight='bold', color='#333')
+    _ax_all.set_xlim(0, 115); _ax_all.set_xlabel("Achievement (% of maximum)")
+    _ax_all.set_title(f"Staff Bonus Achievement — {_b_period}", fontweight='bold', fontsize=13)
+    _ax_all.legend(fontsize=9, loc='lower right'); _ax_all.grid(True, axis='x', alpha=0.25)
+    plt.tight_layout(); st.pyplot(_fig_all); plt.close()
+
+    # Master download — all 3 roles in one Excel workbook
+    def _build_master_excel():
+        import openpyxl
+        from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+        _thin_m = Border(left=Side(style='thin'),right=Side(style='thin'),top=Side(style='thin'),bottom=Side(style='thin'))
+        wbm = openpyxl.Workbook()
+        # ── Summary sheet ──
+        wsm = wbm.active; wsm.title = "Summary"
+        _fo_m = PatternFill("solid",fgColor="FF6B00"); _fw_m = Font(color="FFFFFF",bold=True,size=11)
+        _fh_m = PatternFill("solid",fgColor="2D2D2D"); _ft_m = PatternFill("solid",fgColor="FFF4EC")
+        _ctr_m = Alignment(horizontal='center',vertical='center',wrap_text=True)
+        wsm.merge_cells("A1:F1"); wsm["A1"]="PIKI STAFF MONTHLY BONUS — COMBINED SUMMARY"
+        wsm["A1"].fill=_fo_m; wsm["A1"].font=_fw_m; wsm["A1"].alignment=_ctr_m; wsm.row_dimensions[1].height=28
+        wsm["A2"]=f"Period: {_b_period}"; wsm["A2"].font=Font(bold=True); wsm.merge_cells("A2:F2")
+        for ci,hdr in enumerate(["Role","Bonus Earned","Max Possible","Achievement %","Status","Band"],1):
+            _hc=wsm.cell(4,ci,hdr); _hc.fill=_fh_m; _hc.font=_fw_m; _hc.alignment=_ctr_m; _hc.border=_thin_m
+        for ci,w in [('A',28),('B',18),('C',18),('D',16),('E',18),('F',22)]: wsm.column_dimensions[ci].width=w
+        _summ_rows = [
+            ("Head of Operations",      f"TSh {_h1_total:,}", "TSh 400,000", f"{_h1_total/400000*100:.1f}%", "✅ Approved" if _h1_total>0 else "❌ No Bonus", "—"),
+            ("Head of Customer Service",f"TSh {_h2_total:,}", "TSh 400,000", f"{_h2_total/400000*100:.1f}%", "✅ Approved" if _h2_total>0 else "❌ No Bonus", "—"),
+            (f"Zonal Mgr – {_zm_name or '?'} ({_zm_zone or '?'})", f"{_zm_total}/20 pts", "20 pts", f"{_zm_total/20*100:.1f}%", "✅ Entitled" if _zm_ok else "❌ Not Entitled", _zm_band),
+        ]
+        for ri, row in enumerate(_summ_rows, 5):
+            wsm.row_dimensions[ri].height=20
+            for ci, v in enumerate(row,1):
+                _rc=wsm.cell(ri,ci,v); _rc.border=_thin_m; _rc.alignment=_ctr_m
+                if ci==5:
+                    _rc.font=Font(bold=True,color="008000" if "✅" in str(v) else "CC0000")
+        # ── individual sheets ──
+        for _ws_func, _ws_title in [(_build_h1_excel,"Head of Ops"), (_build_h2_excel,"Head of CS"), (_build_zm_excel,"Zonal Manager")]:
+            _wb_tmp = openpyxl.load_workbook(io.BytesIO(_ws_func()))
+            _ws_src = _wb_tmp.active
+            _ws_dst = wbm.create_sheet(title=_ws_title)
+            for row in _ws_src.iter_rows():
+                for cell in row:
+                    _nc = _ws_dst.cell(row=cell.row, column=cell.column, value=cell.value)
+                    if cell.has_style:
+                        try: _nc.font = cell.font.copy()
+                        except: pass
+                        try: _nc.fill = cell.fill.copy()
+                        except: pass
+                        try: _nc.alignment = cell.alignment.copy()
+                        except: pass
+                        try: _nc.border = cell.border.copy()
+                        except: pass
+            for col, dim in _ws_src.column_dimensions.items():
+                _ws_dst.column_dimensions[col].width = dim.width
+        buf_m = io.BytesIO(); wbm.save(buf_m); buf_m.seek(0); return buf_m.read()
+
+    st.download_button(
+        "⬇️ Download FULL Bonus Report — All 3 Roles (Excel)",
+        data=_build_master_excel(),
+        file_name=f"Piki_Staff_Bonus_All_Roles_{_b_period.replace(' ','_').replace('–','to')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="dl_master_bonus",
+        type="primary"
+    )
+
 
 # ─────────────────────────────────────────────────
 # FOOTER
