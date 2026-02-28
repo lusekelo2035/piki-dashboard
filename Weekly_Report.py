@@ -32,6 +32,18 @@ from streamlit_folium import st_folium
 from shapely.geometry import Point, Polygon
 import anthropic
 import os
+import json
+import requests as _requests
+from datetime import date as _date
+
+# ── Google API imports (Department KPI tab) ──
+try:
+    from google.oauth2 import service_account as _sa
+    from googleapiclient.discovery import build as _gbuild
+    import gspread as _gspread
+    _GOOGLE_LIBS_OK = True
+except ImportError:
+    _GOOGLE_LIBS_OK = False
 
 # ─────────────────────────────────────────────────
 # PIKI LOGO (embedded base64)
@@ -776,13 +788,14 @@ st.divider()
 # ─────────────────────────────────────────────────
 # MAIN TABS
 # ─────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "📈 Weekly Trends",
     "⏰ Delivery Times",
     "🚴 Rider Attendance",
     "📦 Products & Geo",
     "🎉 Piki Party Store",
     "🏆 Staff Bonus Tracker",
+    "🏢 Department KPIs",
 ])
 
 # ═══════════════════════════════════════════════════════════════
@@ -4484,6 +4497,581 @@ with tab6:
 
 
 # ─────────────────────────────────────────────────
+
+
+
+# ═══════════════════════════════════════════════════════════════
+# TAB 7 — DEPARTMENT KPIs
+# ═══════════════════════════════════════════════════════════════
+with tab7:
+    st.markdown('<div class="section-header">🏢 Department KPIs — Weekly Intelligence Hub</div>', unsafe_allow_html=True)
+
+    # ── CSS ──────────────────────────────────────────────────────
+    st.markdown("""
+    <style>
+    .dept-card {
+        background:#fff; border-radius:10px; border:1px solid #e0e0e0;
+        border-left:4px solid #FF6B00; padding:14px 18px; margin-bottom:10px;
+    }
+    .dept-card-title { font-size:14px; font-weight:700; color:#FF6B00; margin-bottom:6px; }
+    .slide-card {
+        background:#F8F9FF; border-radius:8px; border:1px solid #d0d8ff;
+        border-left:4px solid #4A6CF7; padding:14px 18px; margin:8px 0;
+    }
+    .slide-dept-badge {
+        display:inline-block; background:#4A6CF7; color:#fff;
+        font-size:10px; font-weight:700; padding:2px 8px;
+        border-radius:20px; margin-bottom:6px; letter-spacing:0.5px;
+    }
+    .slide-title { font-weight:700; color:#2c3e50; font-size:14px; margin-bottom:6px; }
+    .slide-body  { font-size:12.5px; color:#444; line-height:1.7; }
+    .slide-meta  { font-size:11px; color:#888; margin-top:6px; }
+    .tracker-status-done   { background:#E8F5E9; color:#28a745; padding:2px 8px; border-radius:10px; font-weight:700; font-size:11px; }
+    .tracker-status-prog   { background:#FFF3E0; color:#FF6B00; padding:2px 8px; border-radius:10px; font-weight:700; font-size:11px; }
+    .tracker-status-review { background:#E3F2FD; color:#1565C0; padding:2px 8px; border-radius:10px; font-weight:700; font-size:11px; }
+    .tracker-status-todo   { background:#F5F5F5; color:#666; padding:2px 8px; border-radius:10px; font-weight:700; font-size:11px; }
+    .erp-project-card {
+        background:#F8FFF9; border-radius:8px; border:1px solid #b2dfdb;
+        border-left:4px solid #00897b; padding:10px 16px; margin:5px 0;
+        display:flex; justify-content:space-between; align-items:center;
+    }
+    .erp-proj-name { font-weight:700; font-size:13px; color:#004d40; }
+    .erp-proj-status-open { color:#FF6B00; font-weight:700; font-size:12px; }
+    .erp-proj-status-done { color:#28a745; font-weight:700; font-size:12px; }
+    .erp-proj-pct { font-size:20px; font-weight:800; color:#00897b; }
+    </style>
+    """, unsafe_allow_html=True)
+
+    # ─── CONSTANTS ────────────────────────────────────────────────
+    SLIDES_PRES_ID = "1uHEeI-R2xyaKd9HyAcgPxqDc-3guMtRI7O9WmOPh6UY"
+    SHEETS_DOC_ID  = "1nk_a_aObBK7njLGKzz_Eghr2WXUwJRARw5m9Iiugqlo"
+    TRACKER_SHEET  = "Trackers"
+    ERP_BASE       = "http://erp.piki.co.tz"
+
+    # ── Service account JSON baked directly into the app ──────────
+    _SA_INFO = {
+        "type": "service_account",
+        "project_id": "weekly-report-488807",
+        "private_key_id": "fddd809eee878dd686d3c9a8c8b471c061bfb637",
+        "private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDP7JBCM0CXCXVH\n0O6kjWUTrngelrSUdC/egdewiWDcZ13XI83B5CjxzSolRdcmGr7fVY1P9lC1UIx3\nZTaPYuyRMn1gfJFniEiRZp9P4tErKSHo5G/JJAdS8kr/gWCfPprfZqaxL9eLMCHk\nAPS4g3WQ0WiQp9pjgYdIIs486f7KxfF4UbpBoOz6TC6muw3+Bj9xW/xPmDLiofKg\ntPD5Je6E8QiLWPqhv3IpegH8d6OUKeMEe650VKmuNBLjLH/9ZALUSa1BOADM1ktx\naWLi5krJoLW0E39Qt9mMK8CZ6wt7Br2kzAhABqBbhN8ddpacprftGZLowXg4E7vC\nFCVSmR/RAgMBAAECggEAGAzQaN/dxjqhVrO7jswOF3c0TLF45L0FtnKFXNWfHw9T\nwulQyO8Xr1RgXhxUdQNd9Z5DMK8Yicht3veVloNGQss4xlrSRMv2PN9GaSqesCPb\nWMFnjrf8ouMEusYfw3ut1U5d1JvojiB8ow9bPyZxiFU4h5bqw1y9paHlAhW8035Z\nPVUyvqOt/Sbk385Rp8tsb48l7zzByJoVEfvoCJW/Llkt0tJ9+RspOYW6cJugYY8N\n1DerNtZd1ASZ7W6oH17w90MbbES/SdAEguUTu7UXAF3+HnDBfpx3rnqe25pT3nLF\nb80lcaHyoHdu+rAYjDB00ylrjPnCgOt8MnVZYyg2owKBgQD+daOkOmZIvip8oq3A\nM3Pmumz3PxJbdg3uqIvLwO/kQQ4ppSstJiKwQ0+nhf+Q9HNybjjnzguu/DA7dwi9\nyZjr66kNQoNwK24IPHZ4lH/BwQhS66VObugVyTIUMOb91y8vFm9YWLwu6vqwCNSM\nbp99JSZ8zy/mZkbT+NRThpCg9wKBgQDRLs3Cr+8XgCIZiJzqbv/S6j7jWSP9XtaF\nendkUhqXoHT1J3KEMmAtnzbmiG7R5VEL7HpZJbd40QkyLjN6ImYwC1MUscCv0Nyk\nkjiUiRmqbzVNecyZfebapKfefB+2at2oCKS+8GD59hFWMzW+3HRgZdZBdxYnmqcp\nm4FOce3bdwKBgQCRsqAZR8sLOb+wD6G3HH7vjK0ZwMZtEiKWFXG+H+H76vgGBmm7\nd0uDa3cvb71OrXlw+wWgTM1Jy2J+mgCqUsU5yHzKd9w0nNlq49vd3QFt2m4+tGi5\niS1gVAxVnU6V5+E/b/QfPOe7YZZatyOkqS6vBFeOPT+rB8LkWmSQ0sr7LwKBgAKn\n1XTjRuXFeqlYUqWnQxgqYSIBv7M3wQFwzJM5d5z1LIbwOUP0X8Q0gT3r/XwsrRq5\npdP75phiDvvUGlMynJl/i0538zpILITqVk2McAb54nNZWH+aWZPtAzSP3tcyBB5d\n/blu08xYk1/ExqnlopSWtmGeYWmfTP/6OWoFiD+BAoGBAIJFWGljPhDoT0yY40xa\nQHGNH3XjL2lrW9MwCXhW5qk5TYy8z/4yJdCmRrAJNc7u6hd5pqkF1Fe2KmSjWj6z\n+WfdwTfhuZ79aN5BlyGAKCcQ3frWECLrs9eOydh1c7UiA5PzoNkOqlzNOUNOfMPb\nEWtF9LB78ae0WDelxbpCZ2sl\n-----END PRIVATE KEY-----\n",
+        "client_email": "weekly-report@weekly-report-488807.iam.gserviceaccount.com",
+        "client_id": "101726571385090204082",
+        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+        "token_uri": "https://oauth2.googleapis.com/token",
+        "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+        "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/weekly-report%40weekly-report-488807.iam.gserviceaccount.com",
+        "universe_domain": "googleapis.com"
+    }
+
+    _GOOGLE_SCOPES_DEPT = [
+        "https://www.googleapis.com/auth/presentations.readonly",
+        "https://www.googleapis.com/auth/spreadsheets.readonly",
+    ]
+
+    # ─── Build Google credentials (always works — no secrets.toml needed) ───
+    @st.cache_resource(ttl=7200)
+    def _get_dept_creds():
+        if not _GOOGLE_LIBS_OK:
+            return None
+        try:
+            return _sa.Credentials.from_service_account_info(_SA_INFO, scopes=_GOOGLE_SCOPES_DEPT)
+        except Exception as e:
+            return None
+
+    # ─── Fetch all slides, return structured list ─────────────────
+    @st.cache_data(ttl=600, show_spinner=False)
+    def _fetch_all_slides(_creds_dummy):
+        creds = _get_dept_creds()
+        if creds is None:
+            return None, "Google libraries not installed (pip install google-api-python-client google-auth)"
+        try:
+            svc = _gbuild("slides", "v1", credentials=creds, cache_discovery=False)
+            pres = svc.presentations().get(presentationId=SLIDES_PRES_ID).execute()
+            slides_raw = pres.get("slides", [])
+            results = []
+            for i, slide in enumerate(slides_raw):
+                title_text = ""
+                body_parts = []
+                for el in slide.get("pageElements", []):
+                    shape = el.get("shape", {})
+                    tf = shape.get("text", {})
+                    segs = []
+                    for te in tf.get("textElements", []):
+                        tr = te.get("textRun")
+                        if tr:
+                            s = tr.get("content", "").strip()
+                            if s:
+                                segs.append(s)
+                    full = " ".join(segs)
+                    if not full:
+                        continue
+                    ph_type = shape.get("placeholder", {}).get("type", "")
+                    if ph_type in ("TITLE", "CENTERED_TITLE"):
+                        title_text = full
+                    else:
+                        body_parts.append(full)
+                results.append({
+                    "slide_num": i + 1,
+                    "title": title_text or f"Slide {i+1}",
+                    "body": "\n".join(body_parts),
+                    "all_text": (title_text + " " + " ".join(body_parts)).lower(),
+                })
+            return results, None
+        except Exception as e:
+            return None, str(e)
+
+    # ─── Identify the last slide per department ───────────────────
+    def _get_last_dept_slides(all_slides):
+        """
+        For each department, find the LAST slide in the deck that matches
+        that department's keywords. Returns a dict: dept_name → slide_dict.
+        """
+        DEPT_KEYWORDS = {
+            "Operations":  ["operation", "ops", "order", "delivery", "rider", "driver", "logistics"],
+            "Content":     ["content", "creative", "post", "social media", "blog", "copy"],
+            "Marketing":   ["marketing", "campaign", "promo", "growth", "acquisition", "brand", "ads", "advert"],
+            "Design":      ["design", "ui", "ux", "graphic", "visual", "figma", "adobe"],
+            "Tech / IT":   ["tech", "it ", "app", "system", "bug", "feature", "dev", "engineer", "api", "server"],
+            "Finance":     ["finance", "revenue", "cost", "profit", "budget", "expense", "invoice", "payment"],
+            "HR":          ["hr", "human resource", "staff", "recruit", "hire", "training", "onboard", "payroll"],
+            "Management":  ["management", "ceo", "director", "strategy", "goal", "kpi", "okr", "board"],
+        }
+        last_per_dept = {}
+        for slide in all_slides:
+            text = slide["all_text"]
+            for dept, kws in DEPT_KEYWORDS.items():
+                if any(kw in text for kw in kws):
+                    last_per_dept[dept] = slide   # keep overwriting → last match wins
+        return last_per_dept
+
+    # ─── Fetch Google Sheets Tracker ─────────────────────────────
+    @st.cache_data(ttl=300, show_spinner=False)
+    def _fetch_tracker_data(_creds_dummy):
+        creds = _get_dept_creds()
+        if creds is None:
+            return None, "Google libraries not installed"
+        try:
+            gc = _gspread.authorize(creds)
+            sh = gc.open_by_key(SHEETS_DOC_ID)
+            ws = sh.worksheet(TRACKER_SHEET)
+            all_vals = ws.get_all_values()
+            if not all_vals:
+                return pd.DataFrame(), None
+            headers = all_vals[0]
+            rows = all_vals[1:]
+            df = pd.DataFrame(rows, columns=headers)
+            # Drop fully empty rows
+            df = df[df.apply(lambda r: r.str.strip().ne("").any(), axis=1)].reset_index(drop=True)
+            return df, None
+        except Exception as e:
+            return None, str(e)
+
+    # ─── ERP fetch with proper token auth ─────────────────────────
+    def _fetch_erp_data(api_key: str, api_secret: str):
+        headers = {
+            "Authorization": f"token {api_key}:{api_secret}",
+            "Content-Type": "application/json",
+        }
+        results = {}
+        # Try multiple doctype names ERPNext may use
+        endpoint_map = {
+            "📁 General Projects":    f"{ERP_BASE}/api/resource/Project",
+            "🎨 Design Projects":     f"{ERP_BASE}/api/resource/Design%20Project",
+            "📣 Content & Marketing": f"{ERP_BASE}/api/resource/Content%20and%20Marketing%20Project",
+        }
+        fields = ["name", "project_name", "status", "percent_complete", "expected_end_date", "project_type", "description"]
+        for label, base_url in endpoint_map.items():
+            url = f"{base_url}?fields={json.dumps(fields)}&limit_page_length=200&order_by=modified+desc"
+            try:
+                r = _requests.get(url, headers=headers, timeout=12)
+                if r.status_code == 200:
+                    results[label] = r.json().get("data", [])
+                elif r.status_code == 403:
+                    results[label] = {"_error": "403 Forbidden — check API permissions"}
+                elif r.status_code == 404:
+                    # Try Project with type filter
+                    short_label = label.split()[-1]
+                    url2 = (f"{ERP_BASE}/api/resource/Project"
+                            f"?fields={json.dumps(fields)}"
+                            f"&filters=[[\"project_type\",\"like\",\"%{short_label}%\"]]"
+                            f"&limit_page_length=200&order_by=modified+desc")
+                    r2 = _requests.get(url2, headers=headers, timeout=12)
+                    results[label] = r2.json().get("data", []) if r2.status_code == 200 else []
+                else:
+                    results[label] = []
+            except Exception as ex:
+                results[label] = {"_error": str(ex)}
+        return results
+
+    # ─── AI helper ───────────────────────────────────────────────
+    def _dept_ai(context: str, question: str) -> str:
+        try:
+            _cl = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+            msg = _cl.messages.create(
+                model="claude-opus-4-6",
+                max_tokens=600,
+                messages=[{"role": "user", "content": (
+                    "You are a business analyst for Piki, a food delivery startup in Tanzania. "
+                    "Be concise, professional, and use bullet points. "
+                    f"Data:\n\n{context}\n\nQuestion: {question}"
+                )}]
+            )
+            return msg.content[0].text
+        except Exception as e:
+            return f"_AI unavailable: {e}_"
+
+    # ════════════════════════════════════════════════════════════
+    # ERP credentials (visible section at top)
+    # ════════════════════════════════════════════════════════════
+    with st.expander("🔑 ERPNext API Credentials", expanded=("_dept_erp_key" not in st.session_state)):
+        st.caption(f"Login to [erp.piki.co.tz ↗]({ERP_BASE}) → My Profile → Generate API Key & Secret")
+        ec1, ec2 = st.columns(2)
+        with ec1:
+            _ek = st.text_input("API Key", key="erp_key_input",
+                                value=st.session_state.get("_dept_erp_key", ""),
+                                placeholder="528c89565c9d1c2...")
+            if _ek:
+                st.session_state["_dept_erp_key"] = _ek
+        with ec2:
+            _es = st.text_input("API Secret", key="erp_secret_input", type="password",
+                                value=st.session_state.get("_dept_erp_secret", ""),
+                                placeholder="paste your secret here")
+            if _es:
+                st.session_state["_dept_erp_secret"] = _es
+
+        if st.session_state.get("_dept_erp_key"):
+            st.success(f"✅ API Key set: `{st.session_state['_dept_erp_key'][:8]}…`")
+
+    st.divider()
+
+    # ════════════════════════════════════════════════════════════
+    # THREE SUB-TABS
+    # ════════════════════════════════════════════════════════════
+    d_sub1, d_sub2, d_sub3 = st.tabs([
+        "📋 Weekly Standup Slides",
+        "📝 Content Team Tracker",
+        "🏗️ ERP Projects",
+    ])
+
+    # ════════════════════════════════════════════════════════════
+    # SUB-TAB 1 — GOOGLE SLIDES (last slide per department)
+    # ════════════════════════════════════════════════════════════
+    with d_sub1:
+        st.markdown("### 📋 Latest Standup Update — Per Department")
+        st.caption(
+            f"Showing the **most recent slide** for each department from your weekly standup. "
+            f"[Open full presentation ↗](https://docs.google.com/presentation/d/{SLIDES_PRES_ID}/edit)"
+        )
+
+        _rb_col, _ = st.columns([1, 5])
+        with _rb_col:
+            if st.button("🔄 Refresh", key="refresh_slides"):
+                st.cache_data.clear()
+                st.rerun()
+
+        with st.spinner("Loading presentation…"):
+            _all_slides, _slides_err = _fetch_all_slides(id(SLIDES_PRES_ID))
+
+        if _slides_err:
+            st.error(f"⚠️ Slides error: {_slides_err}")
+            st.markdown("""
+            **Fix checklist:**
+            - Run: `pip install google-api-python-client google-auth gspread`
+            - Enable **Google Slides API** in [Google Cloud Console ↗](https://console.cloud.google.com/apis/library/slides.googleapis.com)
+            - Share the presentation with `weekly-report@weekly-report-488807.iam.gserviceaccount.com` (Viewer)
+            """)
+        elif not _all_slides:
+            st.warning("No slides found in the presentation.")
+        else:
+            _last_by_dept = _get_last_dept_slides(_all_slides)
+
+            if not _last_by_dept:
+                st.info(f"Loaded {len(_all_slides)} slides. No department keywords matched — showing the last 3 slides instead.")
+                _display_slides = _all_slides[-3:]
+                for sl in _display_slides:
+                    st.markdown(f"""
+                    <div class="slide-card">
+                        <div class="slide-title">Slide {sl['slide_num']}: {sl['title']}</div>
+                        <div class="slide-body">{sl['body'][:600].replace(chr(10), '<br>')}</div>
+                        <div class="slide-meta">Slide {sl['slide_num']} of {len(_all_slides)}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+            else:
+                st.success(f"✅ {len(_last_by_dept)} department(s) detected across {len(_all_slides)} slides")
+
+                # ── Department filter pills ──
+                dept_options = ["All Departments"] + sorted(_last_by_dept.keys())
+                _sel_dept = st.selectbox("Show department", dept_options, key="slide_dept_sel")
+
+                depts_to_show = (
+                    {k: v for k, v in _last_by_dept.items() if k == _sel_dept}
+                    if _sel_dept != "All Departments"
+                    else _last_by_dept
+                )
+
+                for dept_name, slide in depts_to_show.items():
+                    body_clean = slide["body"][:800].replace("<", "&lt;").replace(">", "&gt;")
+                    st.markdown(f"""
+                    <div class="slide-card">
+                        <span class="slide-dept-badge">{dept_name.upper()}</span>
+                        <div class="slide-title">Slide {slide['slide_num']}: {slide['title']}</div>
+                        <div class="slide-body">{body_clean.replace(chr(10), '<br>')}</div>
+                        <div class="slide-meta">📍 Last update found at Slide {slide['slide_num']} of {len(_all_slides)}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                # ── AI Summary ──
+                st.divider()
+                st.markdown("#### 🤖 AI Standup Summary")
+                if st.button("Generate AI Summary of All Departments", key="btn_slides_ai"):
+                    _ctx = "\n\n".join(
+                        f"{dept} (Slide {sl['slide_num']}):\n{sl['title']}\n{sl['body'][:400]}"
+                        for dept, sl in _last_by_dept.items()
+                    )
+                    with st.spinner("Claude is reading all department updates…"):
+                        _summary = _dept_ai(_ctx,
+                            "Summarize each department's latest update. Highlight wins, blockers, and top action items for this week.")
+                    st.markdown(f'<div class="ai-insight-card">{_summary}</div>', unsafe_allow_html=True)
+
+    # ════════════════════════════════════════════════════════════
+    # SUB-TAB 2 — CONTENT TRACKER (Google Sheets)
+    # ════════════════════════════════════════════════════════════
+    with d_sub2:
+        st.markdown("### 📝 Content Team Tracker")
+        st.caption(
+            f"Sheet: **'Trackers'** | "
+            f"[Open Google Sheet ↗](https://docs.google.com/spreadsheets/d/{SHEETS_DOC_ID}/edit)"
+        )
+
+        _rt_col, _ = st.columns([1, 5])
+        with _rt_col:
+            if st.button("🔄 Refresh", key="refresh_tracker"):
+                st.cache_data.clear()
+                st.rerun()
+
+        with st.spinner("Loading tracker…"):
+            _tdf, _terr = _fetch_tracker_data(id(SHEETS_DOC_ID))
+
+        if _terr:
+            st.error(f"⚠️ Tracker error: {_terr}")
+            st.markdown("""
+            **Fix checklist:**
+            - Run: `pip install gspread google-auth`
+            - Enable **Google Sheets API** in [Google Cloud Console ↗](https://console.cloud.google.com/apis/library/sheets.googleapis.com)
+            - Share the spreadsheet with `weekly-report@weekly-report-488807.iam.gserviceaccount.com` (Viewer)
+            - Make sure the sheet tab is named exactly **Trackers** (case-sensitive)
+            """)
+        elif _tdf is not None and not _tdf.empty:
+            st.success(f"✅ {len(_tdf)} rows · {len(_tdf.columns)} columns loaded")
+
+            # ── Show all column names for reference ──
+            with st.expander("📋 Available columns in your sheet", expanded=False):
+                st.write(list(_tdf.columns))
+
+            # ── Auto-detect status column ──
+            _status_col = None
+            for _c in _tdf.columns:
+                if "status" in _c.lower():
+                    _status_col = _c
+                    break
+
+            # ── Filters (up to 3 columns) ──
+            _filterable = [c for c in _tdf.columns if _tdf[c].nunique() < 40 and _tdf[c].nunique() > 1][:3]
+            if _filterable:
+                _fcols = st.columns(len(_filterable))
+                _active_f = {}
+                for _fi, _fc in enumerate(_filterable):
+                    with _fcols[_fi]:
+                        _uvals = ["All"] + sorted(_tdf[_fc].dropna().astype(str).unique().tolist())
+                        _chosen = st.selectbox(f"{_fc}", _uvals, key=f"tf_{_fi}")
+                        if _chosen != "All":
+                            _active_f[_fc] = _chosen
+
+                _fdf = _tdf.copy()
+                for _col, _val in _active_f.items():
+                    _fdf = _fdf[_fdf[_col].astype(str) == _val]
+            else:
+                _fdf = _tdf.copy()
+
+            # ── KPI metric cards ──
+            st.markdown("#### 📊 Summary")
+            _km1, _km2, _km3, _km4 = st.columns(4)
+            _km1.metric("Total Items", len(_fdf))
+
+            if _status_col:
+                _st_lower = _fdf[_status_col].astype(str).str.lower()
+                _done  = _st_lower.str.contains(r"done|complete|published|approved|finish", na=False).sum()
+                _prog  = _st_lower.str.contains(r"progress|ongoing|wip|review|in review", na=False).sum()
+                _todo  = _st_lower.str.contains(r"todo|to do|not started|pending|open", na=False).sum()
+                _km2.metric("✅ Done", int(_done))
+                _km3.metric("🔄 In Progress", int(_prog))
+                _km4.metric("📋 Pending", int(_todo))
+
+                if len(_fdf) > 0:
+                    _pct_done = _done / len(_fdf) * 100
+                    st.markdown(f"""
+                    <div style="margin:8px 0 16px 0;">
+                        <div style="font-size:12px;color:#555;margin-bottom:4px;">
+                            Completion: <strong style="color:#FF6B00;">{_pct_done:.0f}%</strong>
+                            &nbsp; ({int(_done)} of {len(_fdf)} items)
+                        </div>
+                        <div style="background:#e9ecef;border-radius:6px;height:14px;">
+                            <div style="background:linear-gradient(90deg,#FF6B00,#28a745);
+                                        width:{_pct_done:.0f}%;height:14px;border-radius:6px;"></div>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+            # ── Full data table ──
+            st.markdown("#### 📄 Full Tracker Data")
+            st.dataframe(_fdf, use_container_width=True, height=420)
+
+            # ── Download ──
+            _csv = _fdf.to_csv(index=False).encode("utf-8")
+            st.download_button("⬇️ Download CSV", _csv,
+                               file_name="piki_content_tracker.csv", mime="text/csv")
+
+            # ── AI Analysis ──
+            st.divider()
+            if st.button("🤖 AI Analysis of Content Performance", key="btn_tracker_ai"):
+                _t_ctx = f"Total: {len(_fdf)} items.\n"
+                if _status_col:
+                    _t_ctx += f"Done: {int(_done)}, In Progress: {int(_prog)}, Pending: {int(_todo)}.\n"
+                _t_ctx += f"\nSample data:\n{_fdf.head(25).to_string(index=False)}"
+                with st.spinner("Analysing…"):
+                    _t_ai = _dept_ai(_t_ctx,
+                        "What is the content team's completion rate? Any bottlenecks? What content types are most active? Key recommendations for this week.")
+                st.markdown(f'<div class="ai-insight-card">{_t_ai}</div>', unsafe_allow_html=True)
+        elif _tdf is not None and _tdf.empty:
+            st.warning("The 'Trackers' sheet appears to be empty. Add some rows and refresh.")
+        else:
+            st.info("Waiting for data…")
+
+    # ════════════════════════════════════════════════════════════
+    # SUB-TAB 3 — ERP PROJECTS
+    # ════════════════════════════════════════════════════════════
+    with d_sub3:
+        st.markdown("### 🏗️ ERP Project Dashboard")
+
+        _erp_links_row = st.columns(3)
+        with _erp_links_row[0]:
+            st.markdown(f"[📁 General Projects ↗]({ERP_BASE}/app/projects)")
+        with _erp_links_row[1]:
+            st.markdown(f"[🎨 Design Projects ↗]({ERP_BASE}/app/design-projects)")
+        with _erp_links_row[2]:
+            st.markdown(f"[📣 Content & Marketing ↗]({ERP_BASE}/app/content-and-marketing-projects/view/kanban/piki)")
+
+        _erp_key = st.session_state.get("_dept_erp_key", "")
+        _erp_sec = st.session_state.get("_dept_erp_secret", "")
+
+        if not _erp_key or not _erp_sec:
+            st.warning("⚠️ Enter your ERPNext API Key **and** Secret in the credentials section above, then come back here.")
+            st.markdown("""
+            **Where to find your ERP credentials:**
+            1. Go to [erp.piki.co.tz ↗](http://erp.piki.co.tz) and log in
+            2. Click your **profile icon** (top right) → **My Settings**
+            3. Scroll to **API Access** section
+            4. Click **Generate Keys** — copy both the API Key and API Secret
+            5. Paste them in the credentials box above ↑
+            """)
+        else:
+            _re_col, _ = st.columns([1, 5])
+            with _re_col:
+                _do_erp_refresh = st.button("🔄 Refresh ERP", key="refresh_erp")
+
+            with st.spinner("Connecting to ERPNext…"):
+                _erp_data = _fetch_erp_data(_erp_key, _erp_sec)
+
+            _total_erp = sum(len(v) if isinstance(v, list) else 0 for v in _erp_data.values())
+
+            if _total_erp == 0:
+                st.error("❌ No projects loaded. Check your API credentials or ERP server connection.")
+                for _lbl, _items in _erp_data.items():
+                    if isinstance(_items, dict) and "_error" in _items:
+                        st.caption(f"{_lbl}: {_items['_error']}")
+            else:
+                st.success(f"✅ {_total_erp} project(s) loaded from ERPNext")
+
+                # ── Overall metrics ──
+                _all_p = []
+                for _grp, _ps in _erp_data.items():
+                    if isinstance(_ps, list):
+                        for _p in _ps:
+                            _p["_group"] = _grp
+                            _all_p.append(_p)
+                _all_pdf = pd.DataFrame(_all_p)
+
+                if not _all_pdf.empty:
+                    _ov1, _ov2, _ov3, _ov4 = st.columns(4)
+                    _ov1.metric("Total Projects", len(_all_pdf))
+                    if "status" in _all_pdf:
+                        _sc = _all_pdf["status"].value_counts()
+                        _ov2.metric("🟠 Open", int(_sc.get("Open", 0)))
+                        _ov3.metric("✅ Completed", int(_sc.get("Completed", 0)))
+                        _ov4.metric("⏸️ On Hold", int(_sc.get("Hold", 0) + _sc.get("On Hold", 0)))
+
+                # ── Per-group expanders ──
+                for _grp_name, _projs in _erp_data.items():
+                    if not isinstance(_projs, list) or not _projs:
+                        continue
+                    with st.expander(f"{_grp_name} — {len(_projs)} project(s)", expanded=True):
+                        _g_df = pd.DataFrame(_projs)
+
+                        # Metrics
+                        _gc1, _gc2, _gc3 = st.columns(3)
+                        _gc1.metric("Total", len(_g_df))
+                        if "status" in _g_df:
+                            _gc2.metric("Open", int((_g_df["status"] == "Open").sum()))
+                            _gc3.metric("Done", int((_g_df["status"] == "Completed").sum()))
+
+                        # Avg progress bar
+                        if "percent_complete" in _g_df.columns:
+                            _avg_p = pd.to_numeric(_g_df["percent_complete"], errors="coerce").mean()
+                            if pd.notna(_avg_p):
+                                st.markdown(f"""
+                                <div style="margin:8px 0 12px 0;">
+                                    <div style="font-size:11px;color:#555;">Avg Progress: <strong>{_avg_p:.0f}%</strong></div>
+                                    <div style="background:#e9ecef;border-radius:4px;height:10px;margin-top:3px;">
+                                        <div style="background:#00897b;width:{min(_avg_p,100):.0f}%;height:10px;border-radius:4px;"></div>
+                                    </div>
+                                </div>
+                                """, unsafe_allow_html=True)
+
+                        # Table
+                        _show_cols = [c for c in ["project_name","status","percent_complete",
+                                                   "expected_end_date","project_type"] if c in _g_df.columns]
+                        _g_show = _g_df[_show_cols].copy() if _show_cols else _g_df
+                        if "percent_complete" in _g_show:
+                            _g_show["percent_complete"] = pd.to_numeric(
+                                _g_show["percent_complete"], errors="coerce"
+                            ).apply(lambda x: f"{x:.0f}%" if pd.notna(x) else "—")
+                        st.dataframe(_g_show.rename(columns={
+                            "project_name": "Project", "status": "Status",
+                            "percent_complete": "Progress", "expected_end_date": "Due Date",
+                            "project_type": "Type"
+                        }), use_container_width=True)
+
+                # ── AI Summary ──
+                st.divider()
+                if st.button("🤖 AI Project Portfolio Summary", key="btn_erp_ai"):
+                    _erp_ctx = ""
+                    for _gn, _ps in _erp_data.items():
+                        if isinstance(_ps, list) and _ps:
+                            _erp_ctx += f"\n{_gn} ({len(_ps)} projects):\n"
+                            for _p in _ps[:20]:
+                                _erp_ctx += (
+                                    f"  • {_p.get('project_name',_p.get('name',''))} | "
+                                    f"Status: {_p.get('status','')} | "
+                                    f"Progress: {_p.get('percent_complete','')}% | "
+                                    f"Due: {_p.get('expected_end_date','')}\n"
+                                )
+                    with st.spinner("Analysing project portfolio…"):
+                        _erp_ai = _dept_ai(_erp_ctx,
+                            "Assess the project portfolio health. Which projects are at risk? "
+                            "What are this week's top priorities? Any patterns across design vs content vs general projects?")
+                    st.markdown(f'<div class="ai-insight-card">{_erp_ai}</div>', unsafe_allow_html=True)
+
+
 # FOOTER
 # ─────────────────────────────────────────────────
 st.divider()
