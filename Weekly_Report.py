@@ -167,8 +167,65 @@ def standardize_product(name):
     m = process.extractOne(name, PRODUCT_MAPPING.keys(), scorer=fuzz.token_sort_ratio)
     return PRODUCT_MAPPING[m[0]] if m and m[1] >= 80 else name
 
+
+# ─────────────────────────────────────────────────────────────
+# DELIVERY STAGE TARGETS (from Piki operations standard)
+# ─────────────────────────────────────────────────────────────
+# Stage targets (minutes):
+#   Accept by Business   = 2 min   (restaurant accepts the order)
+#   Assign Time          = 2 min   (system assigns a driver)
+#   Accept by Driver     = 1.5 min (driver accepts the assignment)
+#   Driver to Business   = 8 min   (driver rides to restaurant; distance-based for individual orders)
+#   Driver in Business   = 12 min  (restaurant prep + handover time)
+#   Pickup to Customer   = CUSTOM  (distance-based, see below)
+#
+# Pickup-to-Customer breakdown (per order):
+#   Driving time         = (distance_km × 1.6) / 30 km/h × 60  (road dist at 30 km/h)
+#   Check address/direction = 1 min
+#   Park/walk/security   = 2 min
+#   Take payment         = 3 min
+#   Total overhead       = 6 min + driving time
+#
+# Total target = AcceptB + Assign + AcceptD + D2B + AtB + P2C
+# For a 3 km straight-line order:  road dist = 3×1.4 = 4.2 km
+#   driving = 4.2/40×60 = 6.3 min  → P2C target = 6.3+6 = 12.3 min  → Total ≈ 37.8 min
+#
+# The "custom Total Target" per order is therefore distance-dependent.
+# ─────────────────────────────────────────────────────────────
+
+STAGE_TARGETS_FIXED = {
+    "Accepted by Business": 2,
+    "Assigned Time":        2,
+    "Accepted by Driver":   1.5,
+    "Driver to Business":   8,
+    "Driver in Business":   12,
+}
+STAGE_DRIVING_SPEED_KMH = 30   # city driving speed (Dar es Salaam realistic avg)
+STAGE_P2C_OVERHEAD_MIN  = 6    # 1 check address + 2 park/walk + 3 payment
+DIST_ROAD_FACTOR        = 1.6  # straight-line → road distance (city roads)
+
+def round1(x):
+    """Round numeric value to 1 decimal place; pass through non-numeric."""
+    try: return round(float(x), 1)
+    except: return x
+
+def p2c_target(dist_straight_km: float) -> float:
+    """Compute Pickup-to-Customer target in minutes for a given straight-line distance."""
+    road_km = dist_straight_km * DIST_ROAD_FACTOR
+    drive_min = (road_km / STAGE_DRIVING_SPEED_KMH) * 60
+    return round(drive_min + STAGE_P2C_OVERHEAD_MIN, 1)
+
+def total_target(dist_straight_km: float) -> float:
+    """Full order target = sum of fixed stages + P2C target."""
+    fixed = sum(STAGE_TARGETS_FIXED.values())   # 2+2+1.5+8+12 = 25.5
+    return round(fixed + p2c_target(dist_straight_km), 1)
+
+
 def compute_delivery_stages(df):
-    """Add all delivery stage columns to df (in-place-safe via copy)."""
+    """
+    Add all delivery stage columns to df (in-place-safe via copy).
+    Also adds distance-based targets per order.
+    """
     df = df.copy()
     for col in ['DELIVERY TIME','ACCEPTED BUSINESS HOUR','ASSIGNED HOUR',
                 'ACCEPTED DRIVER HOUR','IN BUSINESS HOUR','PICKUP HOUR','DELIVERY HOUR']:
@@ -179,26 +236,56 @@ def compute_delivery_stages(df):
         s = (df[b] - df[a]).dt.total_seconds() / 60
         return s.mask(s < 0, default)
 
-    df['Accepted by Business'] = stage('DELIVERY TIME',        'ACCEPTED BUSINESS HOUR', 0).clip(lower=0)
-    df['Assigned Time']        = stage('ACCEPTED BUSINESS HOUR','ASSIGNED HOUR',          3)
-    df['Accepted by Driver']   = stage('ASSIGNED HOUR',         'ACCEPTED DRIVER HOUR',   3)
-    df['Driver to Business']   = stage('ACCEPTED DRIVER HOUR',  'IN BUSINESS HOUR',       7)
-    df['Driver in Business']   = stage('IN BUSINESS HOUR',      'PICKUP HOUR',           15)
-    df['Pickup to Customer']   = stage('PICKUP HOUR',           'DELIVERY HOUR',         15)
+    # Measured stages
+    df['Accepted by Business'] = stage('DELIVERY TIME',         'ACCEPTED BUSINESS HOUR', 0).clip(lower=0)
+    df['Assigned Time']        = stage('ACCEPTED BUSINESS HOUR','ASSIGNED HOUR',           2)
+    df['Accepted by Driver']   = stage('ASSIGNED HOUR',         'ACCEPTED DRIVER HOUR',    1.5)
+    df['Driver to Business']   = stage('ACCEPTED DRIVER HOUR',  'IN BUSINESS HOUR',        8)
+    df['Driver in Business']   = stage('IN BUSINESS HOUR',      'PICKUP HOUR',            12)
+    df['Pickup to Customer']   = stage('PICKUP HOUR',           'DELIVERY HOUR',          10)
 
-    adt = (df['DELIVERY HOUR'] - df['DELIVERY TIME']).dt.total_seconds() / 60
+    # Average Delivery Time: prefer full window; fall back to acceptance→delivery
+    adt  = (df['DELIVERY HOUR'] - df['DELIVERY TIME']).dt.total_seconds() / 60
     adt2 = (df['DELIVERY HOUR'] - df['ACCEPTED BUSINESS HOUR']).dt.total_seconds() / 60
     df['Average Delivery Time'] = adt.mask(adt < 0, adt2).mask(adt2 < 0, 40)
+
+    # ── Distance-based P2C target per order ──────────────────────
+    # Requires DISTANCE (km) already present; if not, we add straight-line now
+    _has_dist = 'DISTANCE (km)' in df.columns and df['DISTANCE (km)'].notna().any()
+    if not _has_dist:
+        if all(c in df.columns for c in ['CUSTOMER LATITUDE','CUSTOMER LONGITUDE',
+                                          'BUSINESS LATITUDE','BUSINESS LONGITUDE']):
+            df['DISTANCE (km)'] = df.apply(
+                lambda r: round(haversine(r['CUSTOMER LATITUDE'],r['CUSTOMER LONGITUDE'],
+                                          r['BUSINESS LATITUDE'],r['BUSINESS LONGITUDE']) * DIST_ROAD_FACTOR, 2), axis=1)
+        else:
+            df['DISTANCE (km)'] = np.nan
+
+    if 'DISTANCE (km)' in df.columns:
+        _road_km = pd.to_numeric(df['DISTANCE (km)'], errors='coerce')
+        # For orders that already have road factor applied (from add_distance), use directly
+        # add_distance already applies ×1.4, so we use the stored value as road_km
+        _drive_min = (_road_km / STAGE_DRIVING_SPEED_KMH) * 60
+        df['P2C Target (min)']    = (_drive_min + STAGE_P2C_OVERHEAD_MIN).round(1)
+        df['Total Target (min)']  = (sum(STAGE_TARGETS_FIXED.values()) + df['P2C Target (min)']).round(1)
+        # Performance vs target per order  (positive = faster than target = good)
+        df['vs Target (min)']     = (df['Total Target (min)'] - df['Average Delivery Time']).round(1)
+        df['vs Target (%)']       = ((df['vs Target (min)'] / df['Total Target (min)'].replace(0,np.nan)) * 100).round(1)
     return df
+
+
 
 def categorize_delay(row):
     if row.get('Average Delivery Time', 0) <= 100:
         return ""
     issues = []
     checks = [
-        ('Accepted by Business', 30), ('Assigned Time', 30),
-        ('Accepted by Driver', 30),   ('Driver to Business', 30),
-        ('Driver in Business', 60),   ('Pickup to Customer', 45),
+        ('Accepted by Business',  5),   # target 2 min, alert at 5
+        ('Assigned Time',         5),   # target 2 min, alert at 5
+        ('Accepted by Driver',    5),   # target 1.5 min, alert at 5
+        ('Driver to Business',   20),   # target 8 min, alert at 20
+        ('Driver in Business',   25),   # target 12 min, alert at 25
+        ('Pickup to Customer',   30),   # target varies; alert at 30
     ]
     for col, limit in checks:
         v = row.get(col, 0)
@@ -233,9 +320,10 @@ def add_distance(df):
                                           'BUSINESS LATITUDE','BUSINESS LONGITUDE']):
         return df
     df = df.copy()
+    # Haversine gives straight-line distance; multiply by DIST_ROAD_FACTOR (1.6) for real road distance
     df['DISTANCE (km)'] = df.apply(
-        lambda r: haversine(r['CUSTOMER LATITUDE'],r['CUSTOMER LONGITUDE'],
-                            r['BUSINESS LATITUDE'],r['BUSINESS LONGITUDE']), axis=1)
+        lambda r: round(haversine(r['CUSTOMER LATITUDE'],r['CUSTOMER LONGITUDE'],
+                                  r['BUSINESS LATITUDE'],r['BUSINESS LONGITUDE']) * DIST_ROAD_FACTOR, 2), axis=1)
     bins   = [0, 2, 3, 4, 5, 7, float('inf')]
     labels = ['0-2 km','2-3 km','3-4 km','4-5 km','5-7 km','7+ km']
     df['Distance Category'] = pd.cut(df['DISTANCE (km)'], bins=bins, labels=labels)
@@ -462,27 +550,29 @@ def build_trend_insight(weekly, full_df):
                f"{contrib}"
                f"{city_ctx}")
 
-    prompt = f"""You are a senior BI analyst for Piki, a Tanzanian food delivery company.
+    prompt = f"""You are a senior business analyst writing a narrative intelligence report for Piki's leadership team. You have full access to the numbers — your job is NOT to list them again. Instead, write the story BEHIND the numbers.
+
+Raw data for your analysis:
 {context}
 
-Write a comprehensive weekly executive report. Structure it exactly as:
+Write a narrative executive report. The leadership team has already seen the charts and tables. They want to understand WHY things happened, WHAT changed, and WHAT to do about it. Do NOT repeat numbers they already see. Instead:
 
-**1. Overall Performance**
-Is the business growing, flat or declining? Compare this week to both last week AND the 7-week rolling average — are we above or below the trend? Mention exact numbers.
+**1. The Story This Week**
+What is the single most important thing that happened this week? Was there an unusual event — a promotion, a competitor move, a supply issue, a city that suddenly dropped or spiked? What pattern breaks from the previous trend and why might that be? Hypothesize based on the data.
 
-**2. KPI Scorecard — Cities**
-For EACH city in the data: orders this week vs last week (WoW%), whether they beat or missed the 1.2% growth KPI, how they compare to their own 7-week average, and a one-line recommendation. Cities significantly below the 7-week average need urgent attention.
+**2. Who Drove the Change?**
+Name the specific restaurants or cities that moved the needle most — but explain WHY they likely moved. Did a big restaurant drop off? Did a new restaurant gain traction? Is a city growing because of expansion or losing because of a service issue? Look at the business movers data and tell the story of what changed in the restaurant mix.
 
-**3. Top Business Movers**
-Which businesses drove the biggest gains? Which had the biggest drops? Use exact numbers.
+**3. Where Is the Business Healthy vs At Risk?**
+Don't list cities — instead group them: which cities are genuinely gaining momentum (consecutive growth weeks), which are stagnating, and which are in decline? What is the pattern — is it one city dragging the whole company, or is the issue widespread? Is the overall business trajectory improving or deteriorating based on the multi-week trend?
 
-**4. Sales vs Orders (Order Value)**
-Is average order value (sales ÷ orders) shifting? Compare this week vs last week trend.
+**4. The Revenue Quality Story**
+Is Piki making more money per order or just doing more orders? If sales grew faster than orders, that is positive — customers are spending more. If orders grew but sales didn't keep up, that suggests cheaper orders or more discounts. Tell this story.
 
-**5. Priority Actions**
-3 specific, numbered actions for the operations team — each tied to a specific city or business with real numbers. Prioritize cities that are both missing KPI AND below 7-week average.
+**5. Three Things Leadership Should Do NOW**
+Be direct and operational. Each action must be tied to a specific observation from the data — not generic advice. For example: "Reach out to [restaurant type] in [city] because they dropped X orders and that is unusual for them" or "Investigate why [city] has been below its 7-week average for 3 consecutive weeks."
 
-Be specific. Use exact numbers. Write like a real analyst report, not a bullet dump."""
+Write in clear, flowing paragraphs. Be direct. Be a trusted advisor, not a data reporter."""
     return claude_insight(prompt, 1400), context
 
 
@@ -726,6 +816,39 @@ with st.sidebar:
     st.divider()
     st.caption(f"Data spans {min_date.date()} → {max_date.date()}")
 
+    st.divider()
+    st.markdown("#### 🌤️ Weather Forecast")
+    st.caption("AI weather outlook for Tanzania cities")
+    if st.button("Generate Forecast", key="btn_weather_sidebar", use_container_width=True):
+        st.session_state["show_weather_sidebar"] = True
+    if st.session_state.get("show_weather_sidebar"):
+        from datetime import date as _dt2, timedelta as _td2
+        _today2 = _dt2.today()
+        _days_ahead2 = [(_today2 + _td2(days=i)).strftime("%a %d %b") for i in range(1, 8)]
+        _days_str2 = ", ".join(_days_ahead2)
+        _wp2 = f"""Generate a 7-day weather summary for Tanzania food delivery operations ({_days_str2}).
+Cities: Dar es Salaam, Arusha, Dodoma, Zanzibar, Mwanza.
+Return ONLY a JSON array like:
+[{{"Date":"Mon 03 Mar","City":"Dar es Salaam","Condition":"Partly Cloudy","Temp_C":31,"Rain_Risk_Pct":25,"Delivery_Impact":"Normal"}}]
+Rules: Rain_Risk_Pct 0-100, Delivery_Impact: Normal/Moderate/High Impact."""
+        with st.spinner("Generating forecast…"):
+            try:
+                _cl2 = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY",""))
+                _wr2 = _cl2.messages.create(model="claude-opus-4-6", max_tokens=1200,
+                    messages=[{"role":"user","content":_wp2}])
+                _wt2 = _wr2.content[0].text.strip()
+                import json as _json2
+                _wj2 = _json2.loads(_wt2.replace("```json","").replace("```","").strip())
+                _wdf2 = pd.DataFrame(_wj2)
+                for _wd_row in _wdf2.itertuples():
+                    _rain = getattr(_wd_row,"Rain_Risk_Pct",0)
+                    _color = "🔴" if _rain >= 70 else ("🟡" if _rain >= 40 else "🟢")
+                    st.markdown(f"**{getattr(_wd_row,'Date','')} — {getattr(_wd_row,'City','')}**  \n"
+                                f"{_color} {getattr(_wd_row,'Condition','')} · {getattr(_wd_row,'Temp_C','')}°C · "
+                                f"Rain {_rain}% · {getattr(_wd_row,'Delivery_Impact','')}")
+            except Exception as _we2:
+                st.error(f"Forecast error: {_we2}")
+
 # ─────────────────────────────────────────────────
 # APPLY GLOBAL FILTERS → produce `df`
 # ─────────────────────────────────────────────────
@@ -788,14 +911,13 @@ st.divider()
 # ─────────────────────────────────────────────────
 # MAIN TABS
 # ─────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "📈 Weekly Trends",
     "⏰ Delivery Times",
     "🚴 Rider Attendance",
     "📦 Products & Geo",
     "🎉 Piki Party Store",
-    "🏆 Staff Bonus Tracker",
-    "🏢 Department KPIs",
+    "🔗 Quick Access & Tools",
 ])
 
 # ═══════════════════════════════════════════════════════════════
@@ -804,9 +926,20 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
 with tab1:
     st.markdown('<div class="section-header">📈 Orders & Sales KPI Trend</div>', unsafe_allow_html=True)
 
+    # ── Per-chart city filter ──
+    _t1_cities_all = sorted(df['BUSINESS CITY'].dropna().unique().tolist())
+    _t1_city_f = st.multiselect(
+        "🏙️ Filter by City", _t1_cities_all,
+        placeholder="All cities (or select one/more)",
+        key="t1_orders_city"
+    )
+    _df_t1 = df[df['BUSINESS CITY'].isin(_t1_city_f)] if _t1_city_f else df.copy()
+    if _t1_city_f:
+        st.caption(f"Showing: **{', '.join(_t1_city_f)}**")
+
     # ── Weekly aggregation ──
     weekly = (
-        df.groupby(df['DELIVERY DATE'].dt.to_period('W-SUN'))
+        _df_t1.groupby(_df_t1['DELIVERY DATE'].dt.to_period('W-SUN'))
         .agg(Total_Orders=('ID','count'), Total_Sales=('SUBTOTAL','sum'))
         .reset_index()
     )
@@ -831,7 +964,8 @@ with tab1:
     lines1, labels1 = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax1.legend(lines1+lines2, labels1+labels2, loc='upper left', fontsize=9)
-    plt.title("Weekly Orders vs Sales vs KPI"); plt.xticks(rotation=30, ha='right')
+    _city_title = f" — {', '.join(_t1_city_f)}" if _t1_city_f else " — All Cities"
+    plt.title(f"Weekly Orders vs Sales vs KPI{_city_title}"); plt.xticks(rotation=30, ha='right')
     plt.tight_layout(); st.pyplot(fig); plt.close()
 
     st.dataframe(
@@ -1142,260 +1276,6 @@ with tab1:
         st.session_state[_tr_ins_key] = None
         st.rerun()
 
-    st.divider()
-
-    # ── Predictive Forecast — Claude AI ──
-    st.markdown('<div class="section-header">🔮 AI Predictive Forecast (Next 4 Weeks)</div>', unsafe_allow_html=True)
-
-    if len(weekly) >= 4:
-        _wr = weekly.copy().reset_index(drop=True)
-        _wr['g'] = _wr['Total_Orders'].pct_change()
-        avg_g  = _wr['g'].tail(3).mean()
-        last_o = int(_wr.iloc[-1]['Total_Orders'])
-        last_k = _wr.iloc[-1]['Growth KPI Orders']
-        last_w = _wr.iloc[-1]['Week']
-
-        # Build numeric forecast for chart
-        preds, po, pk = [], last_o, last_k
-        for i in range(1, 5):
-            po = po * (1 + avg_g); pk = pk * (1 + GROWTH_RATE)
-            preds.append({"Week_Label": f"Forecast W+{i}",
-                          "Predicted Orders": int(po), "KPI Target": int(pk),
-                          "Week": last_w + pd.Timedelta(days=7*i)})
-        fcast = pd.DataFrame(preds)
-
-        risk = ("🔴 HIGH RISK – Declining" if avg_g < 0
-                else "🟡 MODERATE – Below KPI" if avg_g < GROWTH_RATE
-                else "🟢 STABLE GROWTH")
-
-        # Chart: actual + forecast
-        fig2, ax2 = plt.subplots(figsize=(13, 5))
-        ax2.plot(weekly['Week_Label'], weekly['Total_Orders'],
-                 marker='o', color='#FF6B00', lw=2, label='Actual Orders')
-        if 'Growth KPI Orders' in weekly.columns:
-            ax2.plot(weekly['Week_Label'], weekly['Growth KPI Orders'],
-                     linestyle='--', color='green', lw=1.5, label='KPI Trajectory')
-        ax2.plot(fcast['Week_Label'], fcast['Predicted Orders'],
-                 marker='o', linestyle='--', color='purple', lw=2, label='AI Predicted')
-        ax2.plot(fcast['Week_Label'], fcast['KPI Target'],
-                 linestyle=':', color='orange', lw=1.5, label='Future KPI Target')
-        ax2.axvline(x=len(weekly)-0.5, color='gray', linestyle=':', alpha=0.4)
-        ax2.set_xlabel("Week"); ax2.set_ylabel("Orders")
-        ax2.legend(); ax2.grid(True, alpha=0.3)
-        plt.title("AI Forecast: Actual vs KPI vs Predicted")
-        plt.xticks(rotation=30, ha='right'); plt.tight_layout()
-        st.pyplot(fig2); plt.close()
-
-        st.dataframe(fcast[['Week_Label','Predicted Orders','KPI Target']],
-                     use_container_width=True)
-
-        # Claude AI forecast analysis
-        hist_str  = weekly[['Week_Label','Total_Orders']].to_string(index=False)
-        fcast_str = fcast[['Week_Label','Predicted Orders','KPI Target']].to_string(index=False)
-        _avg_g_pct = round(avg_g * 100, 2)
-        _forecast_prompt = (
-            "You are a senior BI analyst for a Tanzanian food delivery company.\n\n"
-            "HISTORICAL WEEKLY ORDERS:\n" + hist_str + "\n\n"
-            "STATISTICAL FORECAST (next 4 weeks, avg 3-week growth = " + str(_avg_g_pct) + "%):\n"
-            + fcast_str + "\n\nRisk level: " + risk + "\nKPI target: 1.2% weekly growth\n\n"
-            "Provide a forward-looking AI forecast analysis:\n"
-            "1. **Growth Trajectory** - Is the forecast realistic given the trend?\n"
-            "2. **Risk Assessment** - What could cause actual orders to fall below forecast?\n"
-            "3. **Upside Scenarios** - What operational changes could beat the forecast?\n"
-            "4. **KPI Gap Analysis** - Will the business likely meet 1.2% growth KPI?\n"
-            "5. **Strategic Actions** - 2-3 specific steps to take NOW for the next 4 weeks.\n\n"
-            "Be specific, use real numbers, write as a strategic advisor."
-        )
-
-        _fc_ctx = "FORECAST:\n" + fcast_str + "\n\nHISTORY:\n" + hist_str + "\nRisk: " + risk
-        def _run_forecast_insight():
-            return claude_insight(_forecast_prompt, max_tokens=900), _fc_ctx
-        ai_insight_button("forecast", "4-Week Forecast", _run_forecast_insight)
-    else:
-        st.info("Need 4+ weeks of data to generate a forecast.")
-
-    st.divider()
-
-    # ── AI Weather Forecast for Coming Week ──
-    st.markdown('<div class="section-header">🌤️ Weather Forecast — Coming Week (Tanzania)</div>', unsafe_allow_html=True)
-    st.caption("AI-predicted weather for key cities. Rain >70% = 🔴 high impact on operations. Download the forecast for regional planning.")
-
-    _wf_btn_key  = "show_weather_forecast"
-    _wf_data_key = "weather_forecast_df"
-    # Always initialize both keys independently
-    if _wf_btn_key  not in st.session_state: st.session_state[_wf_btn_key]  = None
-    if _wf_data_key not in st.session_state: st.session_state[_wf_data_key] = None
-
-    _wf_c1, _wf_c2 = st.columns([3, 1])
-    with _wf_c1:
-        if st.button("🌤️ Generate Weekly Weather Forecast", key="btn_weather", type="primary", use_container_width=True):
-            from datetime import date, timedelta
-            _today_date = date.today()
-            _days_ahead = [(_today_date + timedelta(days=i)).strftime("%a %d %b") for i in range(1, 8)]
-            _days_str   = ", ".join(_days_ahead)
-
-            _weather_prompt = f"""You are a meteorological analyst for Tanzania food delivery operations.
-
-Generate a 7-day weather forecast for the coming week ({_days_str}) for these cities:
-Dar es Salaam, Arusha, Dodoma, Zanzibar, Mwanza
-
-Return ONLY a JSON array (no markdown, no explanation) like this:
-[
-  {{
-    "Date": "Mon 24 Feb",
-    "City": "Dar es Salaam",
-    "Condition": "Partly Cloudy",
-    "Temp_C": 31,
-    "Rain_Risk_Pct": 25,
-    "Rain_Start_Time": "N/A",
-    "Delivery_Impact": "Normal",
-    "Notes": "Hot afternoon may boost orders"
-  }},
-  ...
-]
-
-Rules:
-- Rain_Risk_Pct: integer 0–100 representing % probability of rain
-- Rain_Start_Time: estimated time rain starts if risk > 40%, else "N/A" (e.g. "14:00")
-- Delivery_Impact: one of "Boost", "Normal", "Risk"
-  * Boost = rainy/very hot conditions drive more food orders
-  * Risk = severe storms, flooding risk, extreme conditions that could disrupt riders
-  * Normal = standard conditions
-- Use February seasonal patterns for East Africa (end of short dry, start of long rains approaching)
-- Produce exactly 35 rows (5 cities × 7 days)"""
-
-            with st.spinner("🌦️ Generating forecast…"):
-                _raw_weather = claude_insight(_weather_prompt, max_tokens=1400)
-
-            # Parse JSON — use regex to strip markdown fences robustly
-            try:
-                import json as _json, re as _re
-                # Remove ```json ... ``` or ``` ... ``` wrappers
-                _clean = _re.sub(r'^```(?:json)?\s*', '', _raw_weather.strip(), flags=_re.MULTILINE)
-                _clean = _re.sub(r'\s*```$', '', _clean.strip(), flags=_re.MULTILINE).strip()
-                # Find first '[' in case there's preamble text
-                _bracket_start = _clean.find('[')
-                if _bracket_start > 0:
-                    _clean = _clean[_bracket_start:]
-                _weather_rows = _json.loads(_clean)
-                _wf_df = pd.DataFrame(_weather_rows)
-                _wf_df['Rain_Risk_Pct'] = pd.to_numeric(_wf_df.get('Rain_Risk_Pct', 0), errors='coerce').fillna(0).astype(int)
-                _wf_df['Temp_C']        = pd.to_numeric(_wf_df.get('Temp_C', 28),       errors='coerce').fillna(28).astype(int)
-                st.session_state[_wf_btn_key]  = True
-                st.session_state[_wf_data_key] = _wf_df
-            except Exception:
-                # Store raw text — display will handle gracefully
-                st.session_state[_wf_btn_key]  = True
-                st.session_state[_wf_data_key] = _raw_weather
-
-    if st.session_state.get(_wf_btn_key):
-        _wf_df = st.session_state.get(_wf_data_key)
-        if isinstance(_wf_df, pd.DataFrame) and not _wf_df.empty:
-            # ── Display: DAY-BY-DAY layout — each day is a row of city cards ──
-            _wf_cities = sorted(_wf_df['City'].unique().tolist()) if 'City' in _wf_df.columns else []
-            _wf_dates  = _wf_df['Date'].unique().tolist() if 'Date' in _wf_df.columns else []
-
-            for _di, _wdate in enumerate(_wf_dates):
-                # Day header with separator
-                if _di > 0:
-                    st.markdown("<hr style='margin:14px 0 8px 0;border:none;border-top:2px solid #e0e0e0;'>", unsafe_allow_html=True)
-                st.markdown(
-                    f'<div style="background:#1a1a2e;color:#fff;padding:6px 14px;border-radius:6px;'
-                    f'font-size:13px;font-weight:700;letter-spacing:1px;margin-bottom:6px;">'
-                    f'📅 {_wdate}</div>',
-                    unsafe_allow_html=True
-                )
-                _day_cols = st.columns(len(_wf_cities)) if _wf_cities else [st]
-                for _ci, _wcity in enumerate(_wf_cities):
-                    _city_day = _wf_df[(_wf_df['City'] == _wcity) & (_wf_df['Date'] == _wdate)]
-                    with _day_cols[_ci]:
-                        st.markdown(f"<div style='font-size:11px;font-weight:700;color:#555;margin-bottom:3px;'>{_wcity}</div>", unsafe_allow_html=True)
-                        if _city_day.empty:
-                            st.markdown("<small style='color:#aaa;'>No data</small>", unsafe_allow_html=True)
-                            continue
-                        _wr = _city_day.iloc[0]
-                        _risk     = int(_wr.get('Rain_Risk_Pct', 0))
-                        _impact   = str(_wr.get('Delivery_Impact', 'Normal'))
-                        _rain_t   = str(_wr.get('Rain_Start_Time', 'N/A'))
-                        _cond     = str(_wr.get('Condition', ''))
-                        _temp     = _wr.get('Temp_C', '')
-                        _notes    = str(_wr.get('Notes', ''))
-
-                        if _risk >= 70:
-                            _flag, _border, _bg = "🔴", "#dc3545", "#fff5f5"
-                            _time_note = f"<br><small style='color:#888;'>⏰ ~{_rain_t}</small>" if _rain_t != 'N/A' else ""
-                        elif _risk >= 40:
-                            _flag, _border, _bg = "🟡", "#ffc107", "#fffbee"
-                            _time_note = f"<br><small style='color:#888;'>⏰ ~{_rain_t}</small>" if _rain_t != 'N/A' else ""
-                        else:
-                            _flag, _border, _bg = "🟢", "#28a745", "#f5fff5"
-                            _time_note = ""
-
-                        _imp_icon = {"Boost": "📈", "Normal": "➡️", "Risk": "⚠️"}.get(_impact, "➡️")
-
-                        st.markdown(
-                            f'<div style="border-left:4px solid {_border};background:{_bg};'
-                            f'padding:8px 10px;border-radius:6px;font-size:11.5px;line-height:1.55;">'
-                            f'<b>{_flag} {_risk}% rain</b><br>'
-                            f'🌡️ {_temp}°C &nbsp; {_cond}<br>'
-                            f'{_imp_icon} <em>{_impact}</em>{_time_note}'
-                            f'</div>',
-                            unsafe_allow_html=True
-                        )
-
-            st.markdown("<br>", unsafe_allow_html=True)
-            st.markdown(
-                '<small>🔴 ≥70% rain — high disruption risk &nbsp;|&nbsp; '
-                '🟡 40–69% — moderate &nbsp;|&nbsp; 🟢 &lt;40% — normal &nbsp;|&nbsp; '
-                '📈 Demand Boost &nbsp;|&nbsp; ⚠️ Operational Risk</small>',
-                unsafe_allow_html=True
-            )
-
-            with st.expander("📋 Full forecast table", expanded=False):
-                _disp_wf = _wf_df.copy()
-                _disp_wf['Rain Alert'] = _disp_wf['Rain_Risk_Pct'].apply(
-                    lambda x: "🔴 HIGH RISK" if x >= 70 else ("🟡 Moderate" if x >= 40 else "🟢 Clear")
-                )
-                st.dataframe(_disp_wf, use_container_width=True)
-
-            _wf_excel_buf = io.BytesIO()
-            with pd.ExcelWriter(_wf_excel_buf, engine='xlsxwriter') as _wf_writer:
-                _wf_df.to_excel(_wf_writer, sheet_name='7-Day Forecast', index=False)
-                _wf_ws = _wf_writer.sheets['7-Day Forecast']
-                _wf_wb2 = _wf_writer.book
-                _hdr_fmt = _wf_wb2.add_format({'bold': True, 'bg_color': '#FF6B00', 'font_color': 'white', 'border': 1})
-                _red_fmt = _wf_wb2.add_format({'bg_color': '#ffcccc', 'bold': True})
-                _yel_fmt = _wf_wb2.add_format({'bg_color': '#fff3cd'})
-                for _col_i, _col_name in enumerate(_wf_df.columns):
-                    _wf_ws.write(0, _col_i, _col_name, _hdr_fmt)
-                    _wf_ws.set_column(_col_i, _col_i, 18)
-                for _ri, _row in _wf_df.iterrows():
-                    _row_risk = int(_row.get('Rain_Risk_Pct', 0))
-                    if _row_risk >= 70:
-                        for _ci2 in range(len(_wf_df.columns)):
-                            _wf_ws.write(_ri + 1, _ci2, _row.iloc[_ci2], _red_fmt)
-                    elif _row_risk >= 40:
-                        for _ci2 in range(len(_wf_df.columns)):
-                            _wf_ws.write(_ri + 1, _ci2, _row.iloc[_ci2], _yel_fmt)
-            st.download_button(
-                "⬇️ Download Weather Forecast (Excel)",
-                data=_wf_excel_buf.getvalue(),
-                file_name=f"Tanzania_Weather_Forecast_{pd.Timestamp.today().strftime('%d_%b_%Y')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="dl_weather_excel"
-            )
-        else:
-            _raw_text = st.session_state.get(_wf_data_key, "")
-            if isinstance(_raw_text, str) and _raw_text:
-                st.markdown(
-                    f'<div class="ai-insight-card"><span class="ai-insight-label">🌤️ AI Weather Intelligence</span>'
-                    f'{_raw_text}</div>',
-                    unsafe_allow_html=True
-                )
-            else:
-                st.info("Weather forecast could not be parsed. Please try generating again.")
-
-        st.divider()
 
     # ── Failed & Rejected Orders ──
     st.markdown('<div class="section-header">❌ Failed & Rejected Orders Analysis</div>', unsafe_allow_html=True)
@@ -1478,42 +1358,106 @@ Rules:
                 fig_r, rej_weekly = result_r
                 st.pyplot(fig_r); plt.close()
 
-                # ── City breakdown ──
-                _rej_city = (rejected_df.groupby('BUSINESS CITY')
-                             .agg(Count=('ID','count'), Revenue_Lost=('SUBTOTAL','sum'))
-                             .reset_index().sort_values('Count', ascending=False))
-                _rej_city['Revenue_Lost'] = _rej_city['Revenue_Lost'].apply(lambda x: f"{int(x):,} TZS")
-                _rej_city['% of Total'] = (_rej_city['Count'] / max(len(rejected_df),1) * 100).round(1)
+                # ── Total orders per city (for % calculation) ──
+                _total_orders_by_city = df.groupby('BUSINESS CITY')['ID'].count()
+                _total_orders_by_biz  = df.groupby('BUSINESS NAME')['ID'].count()
+                _grand_total_orders   = len(df)
 
-                # ── Top restaurants with repeated cancellations ──
+                # ── City breakdown with % of total orders ──
+                _rej_city = (rejected_df.groupby('BUSINESS CITY')
+                             .agg(Rejections=('ID','count'), Revenue_Lost=('SUBTOTAL','sum'))
+                             .reset_index())
+                _rej_city['Total Orders'] = _rej_city['BUSINESS CITY'].map(_total_orders_by_city).fillna(0).astype(int)
+                _rej_city['% of City Orders'] = (
+                    _rej_city['Rejections'] / _rej_city['Total Orders'].replace(0, 1) * 100
+                ).round(1)
+                _rej_city['% of All Rejected'] = (
+                    _rej_city['Rejections'] / max(len(rejected_df), 1) * 100
+                ).round(1)
+                _rej_city = _rej_city.sort_values('Rejections', ascending=False)
+                # Total row
+                _rej_city_total = pd.DataFrame([{
+                    'BUSINESS CITY': 'TOTAL',
+                    'Rejections': _rej_city['Rejections'].sum(),
+                    'Revenue_Lost': _rej_city['Revenue_Lost'].sum(),
+                    'Total Orders': _grand_total_orders,
+                    '% of City Orders': round(_rej_city['Rejections'].sum() / max(_grand_total_orders,1) * 100, 1),
+                    '% of All Rejected': 100.0,
+                }])
+                _rej_city_disp = pd.concat([_rej_city, _rej_city_total], ignore_index=True)
+                _rej_city_disp['Revenue_Lost'] = _rej_city_disp['Revenue_Lost'].apply(lambda x: f"{int(x):,} TZS")
+                _rej_city_disp = _rej_city_disp.rename(columns={'BUSINESS CITY': 'City', 'Revenue_Lost': 'Revenue Lost'})
+
+                # ── Restaurant breakdown with % of restaurant's total orders ──
                 _rej_biz = (rejected_df.groupby('BUSINESS NAME')
                             .agg(Rejections=('ID','count'), Revenue_Lost=('SUBTOTAL','sum'))
-                            .reset_index().sort_values('Rejections', ascending=False).head(15))
+                            .reset_index())
+                _rej_biz['Total Orders'] = _rej_biz['BUSINESS NAME'].map(_total_orders_by_biz).fillna(0).astype(int)
+                _rej_biz['Rejection %'] = (
+                    _rej_biz['Rejections'] / _rej_biz['Total Orders'].replace(0, 1) * 100
+                ).round(1)
+                # Total row for restaurants
+                _rej_biz_total = pd.DataFrame([{
+                    'BUSINESS NAME': 'TOTAL',
+                    'Rejections': _rej_biz['Rejections'].sum(),
+                    'Revenue_Lost': _rej_biz['Revenue_Lost'].sum(),
+                    'Total Orders': _grand_total_orders,
+                    'Rejection %': round(_rej_biz['Rejections'].sum() / max(_grand_total_orders,1) * 100, 1),
+                }])
                 _total_lost = rejected_df['SUBTOTAL'].sum()
 
-                # ── Time of day pattern ──
-                _rej_hour = (rejected_df.groupby('HOUR').size().reset_index(name='Rejections')
-                             if 'HOUR' in rejected_df.columns else pd.DataFrame())
+                # ── Sort control ──
+                _sort_col, _sort_info = st.columns([2, 3])
+                with _sort_col:
+                    _rej_sort = st.radio(
+                        "Sort restaurants by",
+                        ["# Rejections (most first)", "Rejection % (highest first)"],
+                        horizontal=True, key="rej_sort"
+                    )
+                with _sort_info:
+                    st.caption("**Rejection %** = rejections ÷ restaurant's total completed orders. "
+                               "High % on a restaurant with many orders = serious operational issue.")
+
+                if _rej_sort == "Rejection % (highest first)":
+                    _rej_biz = _rej_biz.sort_values('Rejection %', ascending=False).head(15)
+                else:
+                    _rej_biz = _rej_biz.sort_values('Rejections', ascending=False).head(15)
+
+                _rej_biz_disp = pd.concat([_rej_biz, _rej_biz_total], ignore_index=True)
+                _rej_biz_disp['Revenue_Lost'] = _rej_biz_disp['Revenue_Lost'].apply(lambda x: f"{int(x):,} TZS")
+                _rej_biz_disp = _rej_biz_disp.rename(columns={
+                    'BUSINESS NAME': 'Restaurant', 'Revenue_Lost': 'Revenue Lost'})
 
                 _rj1, _rj2 = st.columns(2)
                 with _rj1:
                     st.markdown("##### 🏙️ Rejected Orders by City")
-                    st.dataframe(_rej_city, use_container_width=True)
+                    st.dataframe(_rej_city_disp, use_container_width=True)
                 with _rj2:
                     st.markdown("##### 🍽️ Top Restaurants with Rejections")
-                    _rej_biz_disp = _rej_biz.copy()
-                    _rej_biz_disp['Revenue_Lost'] = _rej_biz_disp['Revenue_Lost'].apply(lambda x: f"{int(x):,} TZS")
                     st.dataframe(_rej_biz_disp, use_container_width=True)
 
                 st.metric("💸 Total Revenue Lost to Rejections",
                           f"{_total_lost/1e6:.2f}M TZS",
                           delta=f"{len(rejected_df)} orders lost", delta_color="inverse")
 
+                # ── Rejected by Hour — with city filter ──
+                st.markdown("##### 🕐 Rejected Orders by Hour of Day")
+                _rh_cities = sorted(rejected_df['BUSINESS CITY'].dropna().unique().tolist())
+                _rh_city_f = st.multiselect(
+                    "🏙️ Filter by City (Hour chart)", _rh_cities,
+                    placeholder="All cities", key="rej_hour_city"
+                )
+                _rej_hour_df = (rejected_df[rejected_df['BUSINESS CITY'].isin(_rh_city_f)]
+                                if _rh_city_f else rejected_df.copy())
+                _rej_hour = (pd.DataFrame() if 'HOUR' not in _rej_hour_df.columns
+                             else _rej_hour_df.groupby('HOUR').size().reset_index(name='Rejections'))
+
                 if not _rej_hour.empty:
                     fig_rh, ax_rh = plt.subplots(figsize=(12,4))
+                    _rh_title = f"Rejected Orders by Hour{' — ' + ', '.join(_rh_city_f) if _rh_city_f else ' — All Cities'}"
                     ax_rh.bar(_rej_hour['HOUR'].astype(str).apply(lambda h: f"{int(h):02d}:00"),
                               _rej_hour['Rejections'], color='#9467bd', alpha=0.8)
-                    ax_rh.set_title("Rejected Orders by Hour of Day")
+                    ax_rh.set_title(_rh_title)
                     ax_rh.set_xlabel("Hour"); ax_rh.set_ylabel("Rejections")
                     ax_rh.grid(True, alpha=0.3, axis='y')
                     plt.xticks(rotation=45); plt.tight_layout()
@@ -1524,8 +1468,8 @@ Rules:
                     f"REJECTED ORDERS ANALYSIS\n"
                     f"Total rejected: {len(rejected_df):,} | Revenue lost: {_total_lost/1e6:.2f}M TZS\n"
                     f"Rejection rate: {len(rejected_df)/max(len(df),1)*100:.1f}% of all orders\n\n"
-                    f"BY CITY:\n{_rej_city.to_string(index=False)}\n\n"
-                    f"TOP BUSINESSES BY REJECTIONS:\n{_rej_biz.head(10).to_string(index=False)}\n\n"
+                    f"BY CITY (with % of that city's total orders):\n{_rej_city_disp.to_string(index=False)}\n\n"
+                    f"TOP BUSINESSES BY REJECTIONS (with rejection % of their orders):\n{_rej_biz_disp.head(10).to_string(index=False)}\n\n"
                     f"WEEKLY TREND:\n{rej_weekly[['Week_Label','Rejected Orders']].to_string(index=False)}"
                 )
                 _rej_prompt = (
@@ -1594,6 +1538,214 @@ Rules:
 
 
 # ═══════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════
+# RESTAURANT WEEKLY TREND MONITOR  (still inside tab1)
+# ═══════════════════════════════════════════════════════════════
+    st.divider()
+    st.markdown('<div class="section-header">🍽️ Restaurant Weekly Trend Monitor</div>', unsafe_allow_html=True)
+    st.caption("Track each restaurant's order volume over 8 weeks — spot closures, system errors, growth & decline")
+
+    # ── Filters ──────────────────────────────────────────────
+    _rv_col1, _rv_col2, _rv_col3 = st.columns([2, 2, 1])
+    _rv_all_cities = sorted(df['BUSINESS CITY'].dropna().unique())
+    with _rv_col1:
+        _rv_city_sel = st.multiselect(
+            "🏙️ Filter by City", _rv_all_cities,
+            placeholder="All cities", key="rv_city_filter")
+    with _rv_col2:
+        _rv_sort_map = {
+            "🔴 Zero orders in latest week (closures first)": "zero_latest",
+            "📉 Biggest week-on-week decline": "wow_decline",
+            "📈 Biggest week-on-week growth": "wow_growth",
+            "📊 Highest total orders": "total_desc",
+            "🔤 Restaurant name A–Z": "name_az",
+        }
+        _rv_sort_lbl = st.selectbox(
+            "🔽 Sort by", list(_rv_sort_map.keys()), index=0, key="rv_sort_mode")
+        _rv_sort_key = _rv_sort_map[_rv_sort_lbl]
+    with _rv_col3:
+        _rv_top_n = st.slider("Show top N", 10, 100, 40, step=10, key="rv_top_n")
+
+    # ── Build weekly pivot ────────────────────────────────────
+    _rv_df = df.copy()
+    if _rv_city_sel:
+        _rv_df = _rv_df[_rv_df['BUSINESS CITY'].isin(_rv_city_sel)]
+
+    _rv_df = _rv_df.copy()
+    _rv_df['DELIVERY DATE'] = pd.to_datetime(_rv_df['DELIVERY DATE'], errors='coerce')
+    _rv_df['_rv_wk'] = _rv_df['DELIVERY DATE'].dt.to_period('W-SUN')
+    _rv_all_wks = sorted(_rv_df['_rv_wk'].dropna().unique(), reverse=True)
+    _rv_weeks = _rv_all_wks[:8]
+    _rv_weeks_chron = list(sorted(_rv_weeks))  # chronological
+
+    _rv_pivot = (
+        _rv_df[_rv_df['_rv_wk'].isin(_rv_weeks)]
+        .groupby(['BUSINESS NAME', '_rv_wk'])['ID']
+        .count()
+        .unstack(fill_value=0)
+    )
+    for _w in _rv_weeks_chron:
+        if _w not in _rv_pivot.columns:
+            _rv_pivot[_w] = 0
+    _rv_pivot = _rv_pivot[_rv_weeks_chron]
+    _rv_wk_labels = [f"W{p.week} {p.start_time.strftime('%d %b')}" for p in _rv_weeks_chron]
+    _rv_pivot.columns = _rv_wk_labels
+    _rv_pivot = _rv_pivot.reset_index()
+
+    _rv_wk_cols = _rv_wk_labels   # column names in order
+    _rv_latest  = _rv_wk_cols[-1] if _rv_wk_cols else None
+    _rv_prev    = _rv_wk_cols[-2] if len(_rv_wk_cols) >= 2 else None
+
+    _rv_pivot['Total'] = _rv_pivot[_rv_wk_cols].sum(axis=1)
+    _rv_pivot['WoW Change'] = (
+        _rv_pivot[_rv_latest] - _rv_pivot[_rv_prev]
+        if _rv_latest and _rv_prev else 0
+    )
+
+    # Trend label
+    def _rv_trend(row):
+        vals = [row[c] for c in _rv_wk_cols if c in row.index]
+        if not vals: return '—'
+        last = vals[-1]
+        prev_avg = sum(vals[:-1]) / max(len(vals)-1, 1) if len(vals) > 1 else last
+        if last == 0 and prev_avg > 2:  return '🔴 Inactive'
+        if last == 0 and prev_avg <= 2: return '⚪ No history'
+        if last >= prev_avg * 1.2:      return '📈 Growing'
+        if last <= prev_avg * 0.8:      return '📉 Declining'
+        return '→ Stable'
+
+    _rv_pivot['Trend'] = _rv_pivot.apply(_rv_trend, axis=1)
+
+    # City mapping
+    _rv_city_map = df.groupby('BUSINESS NAME')['BUSINESS CITY'].agg(
+        lambda x: x.mode().iloc[0] if not x.mode().empty else 'Unknown')
+    _rv_pivot['City'] = _rv_pivot['BUSINESS NAME'].map(_rv_city_map).fillna('Unknown')
+
+    # ── Sort ──────────────────────────────────────────────────
+    if   _rv_sort_key == 'zero_latest' and _rv_latest:
+        _rv_pivot = _rv_pivot.sort_values([_rv_latest, 'Total'], ascending=[True, False])
+    elif _rv_sort_key == 'wow_decline':
+        _rv_pivot = _rv_pivot.sort_values('WoW Change', ascending=True)
+    elif _rv_sort_key == 'wow_growth':
+        _rv_pivot = _rv_pivot.sort_values('WoW Change', ascending=False)
+    elif _rv_sort_key == 'total_desc':
+        _rv_pivot = _rv_pivot.sort_values('Total', ascending=False)
+    elif _rv_sort_key == 'name_az':
+        _rv_pivot = _rv_pivot.sort_values('BUSINESS NAME')
+
+    # ── Summary metrics ───────────────────────────────────────
+    _rv_total_biz  = len(_rv_pivot)
+    _rv_inactive_n = int((_rv_pivot[_rv_latest] == 0).sum()) if _rv_latest else 0
+    _rv_growing_n  = int((_rv_pivot['Trend'] == '📈 Growing').sum())
+    _rv_declining_n= int((_rv_pivot['Trend'] == '📉 Declining').sum())
+    _rv_stable_n   = int((_rv_pivot['Trend'] == '→ Stable').sum())
+
+    _rvm1, _rvm2, _rvm3, _rvm4, _rvm5 = st.columns(5)
+    _rvm1.metric("🍽️ Restaurants", _rv_total_biz)
+    _rvm2.metric("🔴 Inactive (latest wk)", _rv_inactive_n)
+    _rvm3.metric("📈 Growing", _rv_growing_n)
+    _rvm4.metric("📉 Declining", _rv_declining_n)
+    _rvm5.metric("→ Stable", _rv_stable_n)
+
+    # ── Table ─────────────────────────────────────────────────
+    _rv_disp = _rv_pivot.head(_rv_top_n).copy()
+    _rv_col_order = ['City', 'BUSINESS NAME'] + _rv_wk_cols + ['Total', 'WoW Change', 'Trend']
+    _rv_show = _rv_disp[[c for c in _rv_col_order if c in _rv_disp.columns]]
+
+    def _style_rv(df_in):
+        sty = pd.DataFrame('', index=df_in.index, columns=df_in.columns)
+        for idx, row in df_in.iterrows():
+            if _rv_latest and _rv_latest in df_in.columns:
+                _all = [float(row.get(c, 0) or 0) for c in _rv_wk_cols if c in df_in.columns]
+                _lv  = float(row.get(_rv_latest, 0) or 0)
+                _pavg = sum(_all[:-1]) / max(len(_all)-1, 1) if len(_all) > 1 else _lv
+                if _lv == 0 and _pavg > 2:
+                    sty.at[idx, _rv_latest] = 'background-color:#ffcdd2;color:#b71c1c;font-weight:700'
+                elif _lv >= _pavg * 1.2 and _lv > 0:
+                    sty.at[idx, _rv_latest] = 'background-color:#c8e6c9;color:#1b5e20;font-weight:700'
+                elif _lv <= _pavg * 0.8 and _pavg > 2:
+                    sty.at[idx, _rv_latest] = 'background-color:#fff9c4;color:#f57f17'
+            if 'WoW Change' in df_in.columns:
+                try:
+                    _dv = float(row.get('WoW Change', 0) or 0)
+                    if   _dv > 0: sty.at[idx,'WoW Change'] = 'background-color:#c8e6c9;color:#1b5e20;font-weight:700'
+                    elif _dv < 0: sty.at[idx,'WoW Change'] = 'background-color:#ffcdd2;color:#b71c1c;font-weight:700'
+                except: pass
+            if 'Trend' in df_in.columns:
+                tv = str(row.get('Trend',''))
+                if   '🔴' in tv: sty.at[idx,'Trend'] = 'background-color:#ffcdd2;color:#b71c1c;font-weight:700'
+                elif '📈' in tv: sty.at[idx,'Trend'] = 'background-color:#c8e6c9;color:#1b5e20'
+                elif '📉' in tv: sty.at[idx,'Trend'] = 'background-color:#fff9c4;color:#f57f17'
+        return sty
+
+    _rv_sort_name = _rv_sort_lbl.split(' ', 1)[1] if ' ' in _rv_sort_lbl else _rv_sort_lbl
+    st.markdown(f"**📋 Top {min(_rv_top_n, _rv_total_biz)} restaurants — sorted by: {_rv_sort_name}**")
+    st.dataframe(
+        _rv_show.style.apply(_style_rv, axis=None),
+        use_container_width=True,
+        height=min(80 + len(_rv_show) * 36, 720)
+    )
+    st.caption("🔴 Latest week = 0 (possible closure or system error) · 📈 Growing >20% above avg · "
+               "📉 Declining >20% below avg · → Stable  |  WoW Change = latest minus previous week")
+
+    # ── Inactive alert ────────────────────────────────────────
+    if _rv_latest and _rv_inactive_n > 0:
+        _rv_zero = _rv_pivot[_rv_pivot[_rv_latest] == 0][['City','BUSINESS NAME','Total','WoW Change']].copy()
+        _rv_zero = _rv_zero[_rv_zero['Total'] > 0].sort_values('Total', ascending=False)
+        if not _rv_zero.empty:
+            with st.expander(f"🔴 {len(_rv_zero)} restaurants had orders before but ZERO in latest week"):
+                st.dataframe(_rv_zero.reset_index(drop=True), use_container_width=True)
+                st.caption("Investigate: closed, delisted, or data error?")
+
+    # ── Top 15 chart: latest week vs 8-week average ───────────
+    if _rv_latest and len(_rv_wk_cols) >= 2:
+        _rv_chart = _rv_pivot.copy()
+        _rv_chart['_prev_avg'] = _rv_chart[_rv_wk_cols[:-1]].mean(axis=1).round(1)
+        _rv_chart['_latest']   = _rv_chart[_rv_latest]
+        _top15 = _rv_chart.nlargest(15, 'Total').sort_values('_latest', ascending=True)
+
+        _fig_rv, _ax_rv = plt.subplots(figsize=(12, max(5, len(_top15) * 0.58)))
+        _yi = list(range(len(_top15)))
+
+        # Bars = 8-week average
+        _ax_rv.barh(_yi, _top15['_prev_avg'], height=0.5, color='#90caf9', alpha=0.85,
+                    label='8-Week Avg / Week', zorder=2)
+        # Dots = latest week
+        _ax_rv.scatter(_top15['_latest'], _yi, s=100, zorder=5,
+                       color=[('#1b5e20' if l >= a else '#b71c1c')
+                              for l, a in zip(_top15['_latest'], _top15['_prev_avg'])],
+                       label='Latest Week', edgecolors='white', linewidth=0.8)
+        # Connector lines
+        for _y, _lt, _av in zip(_yi, _top15['_latest'], _top15['_prev_avg']):
+            _ax_rv.plot([_av, _lt], [_y, _y],
+                        color=('#2e7d32' if _lt >= _av else '#c62828'),
+                        lw=1.6, linestyle='--', alpha=0.6, zorder=3)
+            _ax_rv.text(max(_lt, _av) + 0.3, _y, str(int(_lt)),
+                        va='center', fontsize=8, fontweight='bold',
+                        color='#1b5e20' if _lt >= _av else '#b71c1c')
+
+        _ax_rv.set_yticks(_yi)
+        _ax_rv.set_yticklabels(_top15['BUSINESS NAME'].str[:32].tolist(), fontsize=9)
+        _ax_rv.set_xlabel("Orders per Week", fontsize=10)
+        _ax_rv.set_title(
+            "Top 15 Restaurants — Latest Week vs 8-Week Average\n"
+            "🟢 Dot above bar = growing  ·  🔴 Dot below bar = declining",
+            fontweight='bold', fontsize=11)
+        _ax_rv.legend(fontsize=9, loc='lower right')
+        _ax_rv.grid(axis='x', alpha=0.2)
+        plt.tight_layout()
+        st.pyplot(_fig_rv); plt.close()
+
+    # ── Download ──────────────────────────────────────────────
+    _rv_dl = _rv_pivot[_rv_col_order].copy() if all(
+        c in _rv_pivot.columns for c in _rv_col_order) else _rv_pivot.copy()
+    st.download_button(
+        "⬇️ Download Restaurant Trend Report (Excel)",
+        data=excel_bytes(_rv_dl.reset_index(drop=True), "Restaurant Trend"),
+        file_name="Restaurant_Weekly_Trend.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
 # TAB 2 — DELIVERY TIMES
 # ═══════════════════════════════════════════════════════════════
 with tab2:
@@ -1623,13 +1775,13 @@ with tab2:
         _fc = (frame[frame["STATE"].isin(["Delivery Completed By Driver","Completed"])].copy()
                if "STATE" in frame.columns else frame.copy())
         _stage_limits = {
-            "Accepted by Business": (0, 30),
-            "Assigned Time":        (0, 30),
-            "Accepted by Driver":   (0, 45),
-            "Driver to Business":   (0, 45),
-            "Driver in Business":   (0, 90),
-            "Pickup to Customer":   (0, 45),
-            "Average Delivery Time":(0,100),
+            "Accepted by Business": (0, 15),   # target 2, allow up to 15 before flagging
+            "Assigned Time":        (0, 15),
+            "Accepted by Driver":   (0, 15),
+            "Driver to Business":   (0, 30),   # target 8, allow up to 30
+            "Driver in Business":   (0, 45),   # target 12, allow up to 45
+            "Pickup to Customer":   (0, 45),   # target varies ~6-18, allow up to 45
+            "Average Delivery Time":(0, 120),  # exclude extreme outliers only
         }
         for _fcol, (_lo, _hi) in _stage_limits.items():
             if _fcol in _fc.columns:
@@ -1637,41 +1789,312 @@ with tab2:
         return _fc
 
     _comp = _filter_clean_completed(df2_week)
-    avg_adt = _comp["Average Delivery Time"].mean() if not _comp.empty else 0
-    avg_dib = _comp["Driver in Business"].mean()    if not _comp.empty else 0
-    avg_p2c = _comp["Pickup to Customer"].mean()    if not _comp.empty else 0
-    avg_abb = _comp["Accepted by Business"].mean()  if not _comp.empty else 0
+
+    # Avg Delivery Time — use the masked column computed by compute_delivery_stages
+    if not _comp.empty and 'Average Delivery Time' in _comp.columns:
+        _adt_s = pd.to_numeric(_comp['Average Delivery Time'], errors='coerce')
+        _adt_s = _adt_s.mask(_adt_s < 0, np.nan)  # same mask as source
+        avg_adt = round(_adt_s.dropna().mean(), 1)
+    else:
+        avg_adt = 0.0
+
+    avg_dib = round(_comp["Driver in Business"].mean(), 1) if not _comp.empty else 0.0
+    avg_p2c = round(_comp["Pickup to Customer"].mean(), 1) if not _comp.empty else 0.0
+    avg_abb = round(_comp["Accepted by Business"].mean(), 1) if not _comp.empty else 0.0
+
+    # Distance-based target for this week's data
+    if not _comp.empty and 'DISTANCE (km)' in _comp.columns:
+        _wk_avg_dist = round(_comp['DISTANCE (km)'].mean(), 1)
+        _wk_p2c_tgt  = round((_wk_avg_dist / STAGE_DRIVING_SPEED_KMH * 60) + STAGE_P2C_OVERHEAD_MIN, 1)
+    else:
+        _wk_avg_dist = 0.0; _wk_p2c_tgt = 16.0
+    _wk_total_tgt = round(sum(STAGE_TARGETS_FIXED.values()) + _wk_p2c_tgt, 1)
 
     mc1, mc2, mc3, mc4 = st.columns(4)
-    mc1.metric("⏱ Avg Delivery Time",    f"{avg_adt:.1f} min",
-               delta="Target < 45 min",  delta_color=("normal" if avg_adt < 45 else "inverse"))
+    mc1.metric("⏱ Avg Delivery Time",
+               f"{avg_adt:.1f} min",
+               delta=f"Target {_wk_total_tgt:.1f} min",
+               delta_color=("normal" if avg_adt <= _wk_total_tgt else "inverse"),
+               help=f"Sum of all 6 stages incl. overhead. Target=25.5+P2C({_wk_p2c_tgt:.1f}) for avg {_wk_avg_dist:.1f} km")
     mc2.metric("🍳 Vendor Prep Time",    f"{avg_dib:.1f} min",
-               delta="Target < 20 min",  delta_color=("normal" if avg_dib < 20 else "inverse"))
-    mc3.metric("🛵 Pickup→Customer",     f"{avg_p2c:.1f} min")
-    mc4.metric("✅ Business Acceptance", f"{avg_abb:.1f} min")
+               delta="Target 12 min",  delta_color=("normal" if avg_dib <= 12 else "inverse"))
+    mc3.metric("🛵 Pickup→Customer",     f"{avg_p2c:.1f} min",
+               delta=f"Target {_wk_p2c_tgt:.1f} min",
+               delta_color=("normal" if avg_p2c <= _wk_p2c_tgt else "inverse"),
+               help=f"Drive time + 6 min overhead. Avg dist = {_wk_avg_dist:.1f} km")
+    mc4.metric("✅ Business Acceptance", f"{avg_abb:.1f} min",
+               delta="Target 2 min", delta_color=("normal" if avg_abb <= 2 else "inverse"))
+
+    # ── Stage methodology note ──
+    st.info(
+        "**📐 Delivery Time Model** — Fixed stage targets: Accept Biz **2 min** · Assign **2 min** · "
+        "Accept Driver **1.5 min** · Driver→Restaurant **8 min** · Prep Time **12 min** · "
+        "Pickup→Customer = road dist ÷ **30 km/h** × 60 + **6 min overhead**. "
+        "Road distance = straight-line × 1.6."
+    )
+    st.markdown("""<div style="background:#fff8e1;border:1px solid #f9a825;padding:12px 16px;
+    border-radius:8px;font-size:13px;margin-bottom:12px;line-height:1.7">
+    <b>🎨 Colour Guide — How to Read the Tables:</b><br>
+    🟢 <b>Green</b> = At or below the target time — <i>performing well</i><br>
+    🟡 <b>Yellow</b> = Between 1× and 1.5× the target — <i>slightly slow, monitor closely</i><br>
+    🔴 <b>Red</b> = More than 1.5× the target — <i>significantly delayed, action needed</i><br>
+    <small><b>Example:</b> Vendor Prep target = 12 min → 🟢 if ≤12 min · 🟡 if 12–18 min · 🔴 if &gt;18 min<br>
+    <b>vs Target column:</b> A <b>negative</b> number means the city/rider is <b>faster</b> than target ✅ · A <b>positive</b> number means <b>slower</b> than target ❌</small>
+    </div>""", unsafe_allow_html=True)
 
     # ── Stage table — selected week only ──
     st.subheader(f"📊 Delivery Stage Avg by City — {sel_del_week}")
     stage_cols = ['Accepted by Business','Assigned Time','Accepted by Driver',
                   'Driver to Business','Driver in Business','Pickup to Customer',
                   'Average Delivery Time']
-    # City stage averages from clean completed orders only
-    city_stage = (_comp.groupby("BUSINESS CITY")[stage_cols]
-                  .mean().round(1).reset_index()
-                  .sort_values("Average Delivery Time", ascending=True))
 
-    # ── TABLE first, then download ──
-    st.dataframe(city_stage, use_container_width=True)
+    # City stage averages from clean completed orders only
+    _city_grp = _comp.groupby("BUSINESS CITY")
+    city_stage = (_city_grp[stage_cols].mean().round(1).reset_index())
+    city_stage['Orders'] = _city_grp['ID'].count().values
+
+    # Add avg distance and compute per-city P2C target
+    if 'DISTANCE (km)' in _comp.columns:
+        city_stage['Avg Dist (km)'] = _city_grp['DISTANCE (km)'].mean().round(2).values
+        city_stage['P2C Target'] = city_stage['Avg Dist (km)'].apply(
+            lambda d: round((d / STAGE_DRIVING_SPEED_KMH * 60) + STAGE_P2C_OVERHEAD_MIN, 1)
+        )
+    else:
+        city_stage['Avg Dist (km)'] = np.nan
+        city_stage['P2C Target'] = 16.0
+
+    city_stage['Total Target'] = (sum(STAGE_TARGETS_FIXED.values()) + city_stage['P2C Target']).round(1)
+    city_stage['vs Target'] = (city_stage['Average Delivery Time'] - city_stage['Total Target']).round(1)
+    city_stage = city_stage.sort_values("Average Delivery Time", ascending=True)
+
+    # ── TOTAL row ──
+    _total_vals = {'BUSINESS CITY': 'ALL CITIES', 'Orders': int(city_stage['Orders'].sum())}
+    for _sc in stage_cols:
+        _total_vals[_sc] = round(city_stage[_sc].mean(), 1)
+    _avg_dist_total = city_stage['Avg Dist (km)'].mean() if 'Avg Dist (km)' in city_stage else 4.0
+    _avg_dist_total = _avg_dist_total if pd.notna(_avg_dist_total) else 4.0
+    _total_vals['Avg Dist (km)'] = round(_avg_dist_total, 2)
+    _total_vals['P2C Target'] = round((_avg_dist_total / STAGE_DRIVING_SPEED_KMH * 60) + STAGE_P2C_OVERHEAD_MIN, 1)
+    _total_vals['Total Target'] = round(sum(STAGE_TARGETS_FIXED.values()) + _total_vals['P2C Target'], 1)
+    _total_vals['vs Target'] = round(_total_vals['Average Delivery Time'] - _total_vals['Total Target'], 1)
+    city_stage_disp = pd.concat([city_stage, pd.DataFrame([_total_vals])], ignore_index=True)
+
+    # ── Target reference row (shown at top) ──
+    _target_row = {
+        'BUSINESS CITY': '⎯ TARGET ⎯', 'Orders': '—', 'Avg Dist (km)': '—',
+        'Accepted by Business': STAGE_TARGETS_FIXED['Accepted by Business'],
+        'Assigned Time':        STAGE_TARGETS_FIXED['Assigned Time'],
+        'Accepted by Driver':   STAGE_TARGETS_FIXED['Accepted by Driver'],
+        'Driver to Business':   STAGE_TARGETS_FIXED['Driver to Business'],
+        'Driver in Business':   STAGE_TARGETS_FIXED['Driver in Business'],
+        'Pickup to Customer': f'{STAGE_P2C_OVERHEAD_MIN}+drive',
+        'Average Delivery Time': f'{sum(STAGE_TARGETS_FIXED.values())} + P2C',
+        'P2C Target': 'dist-based', 'Total Target': 'dist-based', 'vs Target': '—',
+    }
+    city_stage_disp = pd.concat([pd.DataFrame([_target_row]), city_stage_disp], ignore_index=True)
+
+    # ── Colour styling ──
+    def _style_stage_table(df_in):
+        styles = pd.DataFrame('', index=df_in.index, columns=df_in.columns)
+        _fixed_tgts = {
+            'Accepted by Business': STAGE_TARGETS_FIXED['Accepted by Business'],
+            'Assigned Time':        STAGE_TARGETS_FIXED['Assigned Time'],
+            'Accepted by Driver':   STAGE_TARGETS_FIXED['Accepted by Driver'],
+            'Driver to Business':   STAGE_TARGETS_FIXED['Driver to Business'],
+            'Driver in Business':   STAGE_TARGETS_FIXED['Driver in Business'],
+        }
+        for _i, row in df_in.iterrows():
+            city_name = str(row.get('BUSINESS CITY',''))
+            if city_name == '⎯ TARGET ⎯':
+                for _c in df_in.columns:
+                    styles.at[_i,_c] = 'background-color:#e3f2fd;color:#0d47a1;font-weight:700;font-style:italic'
+                continue
+            if city_name == 'ALL CITIES':
+                for _c in df_in.columns:
+                    styles.at[_i,_c] = 'background-color:#212121;color:#fff;font-weight:800'
+                continue
+            for _col, _tgt in _fixed_tgts.items():
+                if _col in df_in.columns:
+                    try:
+                        v = float(row[_col])
+                        if v <= _tgt:
+                            styles.at[_i,_col] = 'background-color:#c8e6c9;color:#1b5e20;font-weight:600'
+                        elif v <= _tgt * 1.5:
+                            styles.at[_i,_col] = 'background-color:#fff9c4;color:#f57f17;font-weight:600'
+                        else:
+                            styles.at[_i,_col] = 'background-color:#ffcdd2;color:#b71c1c;font-weight:600'
+                    except (ValueError, TypeError): pass
+            # vs Target: negative = beat target (good=green), positive = over (bad=red)
+            if 'vs Target' in df_in.columns:
+                try:
+                    vt = float(row['vs Target'])
+                    if vt <= 0:
+                        styles.at[_i,'vs Target'] = 'background-color:#c8e6c9;color:#1b5e20;font-weight:700'
+                    elif vt <= 5:
+                        styles.at[_i,'vs Target'] = 'background-color:#fff9c4;color:#f57f17;font-weight:700'
+                    else:
+                        styles.at[_i,'vs Target'] = 'background-color:#ffcdd2;color:#b71c1c;font-weight:700'
+                except (ValueError, TypeError): pass
+            # Total delivery time vs its own target
+            if 'Average Delivery Time' in df_in.columns and 'Total Target' in df_in.columns:
+                try:
+                    adt_v = float(row['Average Delivery Time']); tgt_v = float(row['Total Target'])
+                    if adt_v <= tgt_v:
+                        styles.at[_i,'Average Delivery Time'] = 'background-color:#c8e6c9;color:#1b5e20;font-weight:700'
+                    elif adt_v <= tgt_v * 1.2:
+                        styles.at[_i,'Average Delivery Time'] = 'background-color:#fff9c4;color:#f57f17;font-weight:700'
+                    else:
+                        styles.at[_i,'Average Delivery Time'] = 'background-color:#ffcdd2;color:#b71c1c;font-weight:700'
+                except (ValueError, TypeError): pass
+        return styles
+
+    st.dataframe(
+        city_stage_disp.style.apply(_style_stage_table, axis=None),
+        use_container_width=True,
+        height=min(60 + len(city_stage_disp) * 38, 620)
+    )
+    st.caption("🟢 At/below target (good)  🟡 1–1.5× target (slightly slow)  🔴 Over 1.5× target (action needed)  |  **vs Target**: negative = faster than target ✅ · positive = slower ❌")
+
     st.download_button("⬇️ Download Delivery Table",
-                       data=city_stage.to_csv(index=False).encode(),
+                       data=city_stage_disp.to_csv(index=False).encode(),
                        file_name=f"delivery_{sel_del_week}.csv", mime="text/csv")
+
+    # ── Distance Summary + Per-City ADT Targets ──────────────
+    st.subheader("📏 Distance Summary & Delivery Time Targets by City")
+    st.caption("Road distance = straight-line × 1.6 | P2C Target = road dist ÷ 30 km/h × 60 + 6 min overhead | Total Target = 25.5 min (fixed) + P2C Target")
+
+    if 'DISTANCE (km)' in _comp.columns and 'BUSINESS CITY' in _comp.columns:
+        _dist_summ = (_comp.groupby('BUSINESS CITY').agg(
+            Orders=('ID','count'),
+            Avg_SL_Dist=('DISTANCE (km)', lambda x: round(x.mean() / DIST_ROAD_FACTOR, 1)),
+            Avg_Road_Dist=('DISTANCE (km)', 'mean'),
+            Min_Dist=('DISTANCE (km)', 'min'),
+            Max_Dist=('DISTANCE (km)', 'max'),
+        ).round(1).reset_index())
+        _dist_summ.columns = ['City','Orders','Avg Straight-line (km)','Avg Road Dist (km)','Min Road (km)','Max Road (km)']
+
+        # Per-city P2C target & total target
+        _dist_summ['P2C Target (min)'] = (_dist_summ['Avg Road Dist (km)'] / STAGE_DRIVING_SPEED_KMH * 60 + STAGE_P2C_OVERHEAD_MIN).round(1)
+        _dist_summ['Total ADT Target (min)'] = (sum(STAGE_TARGETS_FIXED.values()) + _dist_summ['P2C Target (min)']).round(1)
+
+        # Sort by total target ascending
+        _dist_summ = _dist_summ.sort_values('Total ADT Target (min)')
+
+        # OVERALL row
+        _ds_overall = {
+            'City': 'ALL CITIES',
+            'Orders': int(_dist_summ['Orders'].sum()),
+            'Avg Straight-line (km)': round(_dist_summ['Avg Straight-line (km)'].mean(), 1),
+            'Avg Road Dist (km)': round(_dist_summ['Avg Road Dist (km)'].mean(), 1),
+            'Min Road (km)': round(_dist_summ['Min Road (km)'].min(), 1),
+            'Max Road (km)': round(_dist_summ['Max Road (km)'].max(), 1),
+            'P2C Target (min)': round(_dist_summ['P2C Target (min)'].mean(), 1),
+            'Total ADT Target (min)': round(_dist_summ['Total ADT Target (min)'].mean(), 1),
+        }
+        _dist_summ_disp = pd.concat([_dist_summ, pd.DataFrame([_ds_overall])], ignore_index=True)
+
+        def _style_dist_summ(df_in):
+            sty = pd.DataFrame('', index=df_in.index, columns=df_in.columns)
+            for _i, row in df_in.iterrows():
+                if str(row.get('City','')) == 'ALL CITIES':
+                    for _c in df_in.columns: sty.at[_i,_c] = 'background-color:#212121;color:#fff;font-weight:800'
+                elif 'Total ADT Target (min)' in df_in.columns:
+                    try:
+                        t = float(row['Total ADT Target (min)'])
+                        sty.at[_i,'Total ADT Target (min)'] = (
+                            'background-color:#c8e6c9;color:#1b5e20;font-weight:700' if t <= 40
+                            else 'background-color:#fff9c4;color:#f57f17;font-weight:700' if t <= 45
+                            else 'background-color:#ffcdd2;color:#b71c1c;font-weight:700')
+                    except: pass
+            return sty
+
+        st.dataframe(_dist_summ_disp.style.apply(_style_dist_summ, axis=None),
+                     use_container_width=True,
+                     height=min(80 + len(_dist_summ_disp) * 38, 500))
+        st.caption("🟢 Target ≤ 40 min  🟡 40–45 min  🔴 > 45 min  |  Cities with longer avg distances have higher but realistic targets.")
+
+        # ── Professional per-city target visualisation ──────
+        _fig_tgt, (_ax_main, _ax_dist) = plt.subplots(1, 2, figsize=(14, max(4, len(_dist_summ) * 0.65)),
+                                                        gridspec_kw={'width_ratios':[2,1]})
+        _cities_plot  = _dist_summ['City'].tolist()
+        _targets_plot = _dist_summ['Total ADT Target (min)'].tolist()
+        _fixed_total  = sum(STAGE_TARGETS_FIXED.values())   # 25.5 min
+        _p2c_vals     = _dist_summ['P2C Target (min)'].tolist()
+        _road_dists   = _dist_summ['Avg Road Dist (km)'].tolist()
+
+        # Left: stacked bar — fixed vs P2C component
+        _bar_fixed = [_fixed_total] * len(_cities_plot)
+        _bars_f = _ax_main.barh(_cities_plot, _bar_fixed, color='#5c6bc0', alpha=0.85,
+                                label=f'Fixed stages ({_fixed_total} min)', height=0.65)
+        _bars_p = _ax_main.barh(_cities_plot, _p2c_vals, left=_bar_fixed, color='#ef5350', alpha=0.85,
+                                label='P2C (distance-based)', height=0.65)
+
+        # Label total on right
+        for _ci, (_city, _tgt, _p2c) in enumerate(zip(_cities_plot, _targets_plot, _p2c_vals)):
+            _ax_main.text(_tgt + 0.4, _ci, f'  {_tgt:.1f} min', va='center', fontsize=9, fontweight='bold',
+                          color='#1a1a2e')
+            if _p2c >= 5:
+                _ax_main.text(_fixed_total + _p2c/2, _ci, f'+{_p2c:.1f}',
+                              va='center', ha='center', fontsize=8, color='white', fontweight='bold')
+
+        # Reference line — overall average target
+        _avg_tgt = np.mean(_targets_plot)
+        _ax_main.axvline(_avg_tgt, color='#212121', lw=1.5, linestyle='--',
+                         label=f'Avg target: {_avg_tgt:.1f} min', alpha=0.6)
+
+        _ax_main.set_xlabel("Delivery Time Target (minutes)", fontsize=10)
+        _ax_main.set_title(
+            f"Per-City ADT Targets \u2014 {sel_del_week}\nBlue = fixed stages  |  Red = drive time (30 km/h + 6 min overhead)",
+            fontsize=10, fontweight='bold')
+        _ax_main.invert_yaxis()
+        _ax_main.legend(fontsize=8, loc='lower right')
+        _ax_main.grid(axis='x', alpha=0.2)
+        _ax_main.set_xlim(0, max(_targets_plot) * 1.25)
+
+        # Right: avg road distance as horizontal lollipop
+        _ax_dist.scatter(_road_dists, range(len(_cities_plot)), color='#0288d1', s=80, zorder=3)
+        for _ci, _d in enumerate(_road_dists):
+            _ax_dist.plot([0, _d], [_ci, _ci], color='#0288d1', lw=1.8, alpha=0.6)
+            _ax_dist.text(_d + 0.1, _ci, f'{_d:.1f}km', va='center', fontsize=8, color='#01579b')
+        _ax_dist.set_yticks(range(len(_cities_plot)))
+        _ax_dist.set_yticklabels([])
+        _ax_dist.invert_yaxis()
+        _ax_dist.set_xlabel("Avg Road Distance (km)", fontsize=10)
+        _ax_dist.set_title("Avg Road Dist (straight-line x 1.4)", fontsize=10, fontweight='bold')
+        _ax_dist.grid(axis='x', alpha=0.2)
+        _ax_dist.set_xlim(0, max(_road_dists) * 1.45 if _road_dists else 10)
+
+        plt.tight_layout()
+        st.pyplot(_fig_tgt); plt.close()
+    else:
+        st.info("Distance data not available for this week.")
 
     # ── Weekly Average Delivery Time trend ──
     st.subheader("📈 Weekly Average Delivery Time Trend")
-    _wk_adt_raw = _filter_clean_completed(df2)
+
+    # Per-chart city filter
+    _t2_cities_all = sorted(df2['BUSINESS CITY'].dropna().unique().tolist()) if 'BUSINESS CITY' in df2.columns else []
+    _t2_city_f = st.multiselect(
+        "🏙️ Filter by City", _t2_cities_all,
+        placeholder="All cities (or select one/more)",
+        key="t2_adt_city"
+    )
+    _df2_adt = df2[df2['BUSINESS CITY'].isin(_t2_city_f)] if _t2_city_f else df2.copy()
+    if _t2_city_f:
+        st.caption(f"Showing: **{', '.join(_t2_city_f)}**")
+
+    _wk_adt_raw = _filter_clean_completed(_df2_adt).copy()
+    # Use the masked Average Delivery Time column — same as table values
+    if 'Average Delivery Time' in _wk_adt_raw.columns:
+        _wk_adt_raw = _wk_adt_raw.copy()
+        _wk_adt_raw['_adt_clean'] = pd.to_numeric(
+            _wk_adt_raw['Average Delivery Time'], errors='coerce').mask(
+            _wk_adt_raw['Average Delivery Time'] < 0, np.nan)
+    else:
+        _wk_adt_raw['_adt_clean'] = np.nan
     _wk_adt = (_wk_adt_raw
-               .groupby(df2.loc[_wk_adt_raw.index, 'DELIVERY DATE'].dt.to_period('W-SUN'))
-               .agg(Avg_DT=('Average Delivery Time', 'mean'))
+               .groupby(_df2_adt.loc[_wk_adt_raw.index, 'DELIVERY DATE'].dt.to_period('W-SUN'))
+               .agg(Avg_DT=('_adt_clean', 'mean'))
                .reset_index())
     _wk_adt.columns = ['Week_Period', 'Avg_DT']
     _wk_adt['Avg_DT'] = _wk_adt['Avg_DT'].round(1)
@@ -1737,7 +2160,8 @@ with tab2:
         _ax_adt.set_xticklabels(_adt_labels, fontsize=9)
         _ax_adt.set_ylabel("Avg Delivery Time (min)")
         _ax_adt.set_xlabel("Week")
-        _ax_adt.set_title("Weekly Avg Delivery Time Trend — Clean Completed Orders (Outliers Excluded)")
+        _adt_city_title = f" — {', '.join(_t2_city_f)}" if _t2_city_f else " — All Cities"
+        _ax_adt.set_title(f"Weekly Avg Delivery Time Trend{_adt_city_title} (Clean Completed Orders)")
         _ax_adt.grid(True, alpha=0.25, axis='y')
         _ax_adt.legend(fontsize=9)
         plt.tight_layout()
@@ -1754,9 +2178,8 @@ with tab2:
 
     # ── Hourly chart ──
     st.subheader("📈 Hourly Delivery Time vs Volume")
-    df2['HOUR'] = df2['DELIVERY TIME'].dt.hour
-    # Hourly: use clean completed orders only
-    _df2_clean = _filter_clean_completed(df2)
+    st.caption("Using the same city filter as the Weekly Delivery Time Trend above ↑")
+    _df2_clean = _filter_clean_completed(_df2_adt)  # same filtered df as trend chart
     hourly = (_df2_clean[_df2_clean['HOUR'].isin(OPERATING_HOURS)]
               .groupby('HOUR')
               .agg(avg_dt=('Average Delivery Time','mean'), orders=('ID','count'))
@@ -1765,15 +2188,26 @@ with tab2:
     hourly = hourly.sort_values('order_idx')
     hourly['Label'] = hourly['HOUR'].apply(lambda h: f"{h:02d}:00")
 
+    hourly['pct'] = (hourly['orders'] / hourly['orders'].sum() * 100).round(1)
+
     fig_h, ax_h1 = plt.subplots(figsize=(13, 5))
     ax_h2 = ax_h1.twinx()
-    ax_h2.bar(hourly['Label'], hourly['orders'], alpha=0.25, color='steelblue', label='Orders')
-    ax_h1.plot(hourly['Label'], hourly['avg_dt'], marker='o', color='red', lw=2, label='Avg Delivery Time')
-    ax_h1.set_ylabel("Avg Delivery Time (min)"); ax_h2.set_ylabel("Order Volume")
-    ax_h1.set_xlabel("Hour"); ax_h1.grid(True, alpha=0.3)
-    h1l, h1lb = ax_h1.get_legend_handles_labels(); h2l, h2lb = ax_h2.get_legend_handles_labels()
-    ax_h1.legend(h1l+h2l, h1lb+h2lb, loc='upper right')
-    plt.title("Hourly Delivery Time vs Volume"); plt.xticks(rotation=90); plt.tight_layout()
+    _hbars = ax_h2.bar(hourly['Label'], hourly['pct'], alpha=0.28, color='#5c6bc0',
+                       label='% of Daily Orders', width=0.65)
+    ax_h1.plot(hourly['Label'], hourly['avg_dt'], marker='o', color='#e53935',
+               lw=2.2, label='Avg Delivery Time (min)', zorder=3)
+    ax_h1.set_ylabel("Avg Delivery Time (min)", color='#e53935', fontsize=10)
+    ax_h1.tick_params(axis='y', labelcolor='#e53935')
+    ax_h2.set_ylabel("% of Daily Orders", color='#3949ab', fontsize=10)
+    ax_h2.tick_params(axis='y', labelcolor='#3949ab')
+    ax_h2.set_ylim(0, hourly['pct'].max() * 2.8)   # keep bars short so line is prominent
+    ax_h1.set_xlabel("Hour of Day"); ax_h1.grid(True, alpha=0.2, axis='y')
+    h1l, h1lb = ax_h1.get_legend_handles_labels()
+    h2l, h2lb = ax_h2.get_legend_handles_labels()
+    ax_h1.legend(h1l + h2l, h1lb + h2lb, loc='upper right', fontsize=9)
+    _h_city_lbl = ' — ' + ', '.join(_t2_city_f) if _t2_city_f else ' — All Cities'
+    plt.title(f"Hourly Delivery Time & Order Share{_h_city_lbl}", fontweight='bold')
+    plt.xticks(rotation=90); plt.tight_layout()
     st.pyplot(fig_h); plt.close()
 
     # ── Area charts (Dar vs Regional) ──
@@ -1812,12 +2246,24 @@ with tab2:
     st.subheader("🗺️ Customer & Business Location Heatmap")
     req_geo = ['CUSTOMER LATITUDE','CUSTOMER LONGITUDE','BUSINESS LATITUDE','BUSINESS LONGITUDE']
     if all(c in df2.columns for c in req_geo):
-        geo = df2.dropna(subset=req_geo)
-        if not geo.empty:
-            map_type = st.radio("Map View",
-                ["Both","Customer Only","Business Only"], horizontal=True, key="del_map")
+        geo_all = df2.dropna(subset=req_geo)
+        if not geo_all.empty:
+            # ── City filter for heatmap ──
+            _hm_cities = sorted(geo_all['BUSINESS CITY'].dropna().unique().tolist())
+            _hm_col1, _hm_col2 = st.columns([2, 2])
+            with _hm_col1:
+                _hm_city_f = st.multiselect(
+                    "🏙️ Filter by City (map)", _hm_cities,
+                    placeholder="All cities", key="hm_city_filter"
+                )
+            with _hm_col2:
+                map_type = st.radio("Map View",
+                    ["Both","Customer Only","Business Only"], horizontal=True, key="del_map")
+
+            geo = geo_all[geo_all['BUSINESS CITY'].isin(_hm_city_f)] if _hm_city_f else geo_all.copy()
+
             center = ([geo['CUSTOMER LATITUDE'].mean(), geo['CUSTOMER LONGITUDE'].mean()]
-                      if city_sel else [-6.8018, 39.2801])
+                      if not geo.empty else [-6.8018, 39.2801])
             m = folium.Map(location=center, zoom_start=13)
             if map_type != "Business Only":
                 HeatMap(geo[['CUSTOMER LATITUDE','CUSTOMER LONGITUDE']].values.tolist(),
@@ -1840,8 +2286,153 @@ with tab2:
                           f"Avg DT: {r['AvgDT']:.1f} min"
                 ).add_to(m)
             st.components.v1.html(m._repr_html_(), height=500)
-    else:
-        st.info("Geo columns not found.")
+
+            # ── Post-map analysis — city + week filterable ──
+            st.markdown("#### 📊 Location-Based Analysis")
+            _ma_col1, _ma_col2 = st.columns(2)
+            with _ma_col1:
+                _ma_city_f = st.multiselect(
+                    "Filter by City", _hm_cities,
+                    default=_hm_city_f,
+                    placeholder="All cities", key="map_analysis_city"
+                )
+            with _ma_col2:
+                _all_weeks_ma = sorted(geo_all['DELIVERY DATE'].dt.to_period('W-SUN').dropna().unique(), reverse=True)
+                _week_opts_ma = ["All Weeks"] + [f"W{p.week} ({p.start_time.strftime('%d %b')})" for p in _all_weeks_ma]
+                _sel_week_ma = st.selectbox("Filter by Week", _week_opts_ma, key="map_analysis_week")
+
+            _ma_df = geo_all.copy()
+            if _ma_city_f:
+                _ma_df = _ma_df[_ma_df['BUSINESS CITY'].isin(_ma_city_f)]
+            if _sel_week_ma != "All Weeks":
+                _ma_wk_idx = _week_opts_ma.index(_sel_week_ma) - 1
+                _ma_period = _all_weeks_ma[_ma_wk_idx]
+                _ma_start = _ma_period.start_time
+                _ma_end   = _ma_period.end_time
+                _ma_df = _ma_df[(_ma_df['DELIVERY DATE'] >= _ma_start) & (_ma_df['DELIVERY DATE'] <= _ma_end)]
+
+            if not _ma_df.empty:
+                _city_label_ma = ', '.join(_ma_city_f) if _ma_city_f else 'All Cities'
+                _wk_label_ma   = _sel_week_ma if _sel_week_ma != 'All Weeks' else 'All Weeks'
+                st.caption(f"Showing: **{_city_label_ma}** | **{_wk_label_ma}** — {len(_ma_df):,} orders")
+
+                # Distance distribution
+                _ma_dist_col, _ma_city_col = st.columns(2)
+                with _ma_dist_col:
+                    if 'Distance Category' in _ma_df.columns:
+                        st.markdown("**Orders by Distance Category**")
+                        _dist_grp = (_ma_df.groupby('Distance Category', observed=True)
+                                     .agg(Orders=('ID','count'), Avg_DT=('Average Delivery Time','mean'))
+                                     .reset_index())
+                        _dist_grp['Avg_DT'] = _dist_grp['Avg_DT'].round(1)
+                        _dist_grp = _dist_grp.rename(columns={'Distance Category':'Distance','Avg_DT':'Avg DT (min)'})
+                        st.dataframe(_dist_grp, use_container_width=True)
+
+                with _ma_city_col:
+                    if 'BUSINESS CITY' in _ma_df.columns:
+                        st.markdown("**Orders by City**")
+                        _city_grp = (_ma_df.groupby('BUSINESS CITY')
+                                     .agg(Orders=('ID','count'),
+                                          Avg_DT=('Average Delivery Time','mean'),
+                                          Avg_Dist=('DISTANCE (km)','mean'))
+                                     .reset_index().sort_values('Orders', ascending=False))
+                        _city_grp['Avg_DT'] = _city_grp['Avg_DT'].round(1)
+                        _city_grp['Avg_Dist'] = _city_grp['Avg_Dist'].round(1)
+                        _city_grp = _city_grp.rename(columns={
+                            'BUSINESS CITY':'City','Avg_DT':'Avg DT (min)','Avg_Dist':'Avg Dist (km)'})
+                        st.dataframe(_city_grp, use_container_width=True)
+
+                # Delivery time breakdown by category — percentages only
+                st.markdown("**Delivery Time Categorization — % of Orders by City**")
+                st.caption("Shows share of orders in each delivery time band. 🟢 = on time. Goal: maximise green column.")
+                _bins_ma = [0, 40, 50, 60, 90, float('inf')]
+                _labels_ma = ['✅ ≤40 min','🟡 41–50','🟠 51–60','🔴 61–90','⛔ 91+']
+                _ma_df2 = _ma_df.copy()
+                _ma_df2['DT Cat'] = pd.cut(_ma_df2['Average Delivery Time'], bins=_bins_ma, labels=_labels_ma)
+                _dt_counts = (_ma_df2.pivot_table(
+                    index='BUSINESS CITY', columns='DT Cat', values='ID',
+                    aggfunc='count', fill_value=0, observed=True))
+                _dt_totals = _dt_counts.sum(axis=1)
+                _dt_pct = (_dt_counts.div(_dt_totals, axis=0) * 100).round(1)
+                _dt_pct = _dt_pct.reset_index().rename(columns={'BUSINESS CITY':'City'})
+
+                # Overall row
+                _tot_counts = _dt_counts.sum()
+                _tot_pct_row = (_tot_counts / _tot_counts.sum() * 100).round(1).to_dict()
+                _tot_pct_row['City'] = 'ALL CITIES'
+                _dt_pct_disp = pd.concat([_dt_pct, pd.DataFrame([_tot_pct_row])], ignore_index=True)
+
+                # Sort by on-time % descending
+                _on_time_col = '✅ ≤40 min'
+                if _on_time_col in _dt_pct_disp.columns:
+                    _data_rows = _dt_pct_disp[_dt_pct_disp['City'] != 'ALL CITIES'].sort_values(_on_time_col, ascending=False)
+                    _total_row_disp = _dt_pct_disp[_dt_pct_disp['City'] == 'ALL CITIES']
+                    _dt_pct_disp = pd.concat([_data_rows, _total_row_disp], ignore_index=True)
+
+                # Add % symbol for display
+                _cat_cols = [c for c in _dt_pct_disp.columns if c != 'City']
+                _dt_pct_str = _dt_pct_disp.copy()
+                for _cc in _cat_cols:
+                    _dt_pct_str[_cc] = _dt_pct_str[_cc].apply(lambda x: f"{x:.1f}%" if pd.notna(x) else "—")
+
+                def _style_dt_pct(df_in):
+                    sty = pd.DataFrame('', index=df_in.index, columns=df_in.columns)
+                    _col_colors = {
+                        '✅ ≤40 min':  ('#1b5e20','#c8e6c9'),
+                        '🟡 41–50':    ('#f57f17','#fff9c4'),
+                        '🟠 51–60':    ('#e65100','#ffe0b2'),
+                        '🔴 61–90':    ('#b71c1c','#ffcdd2'),
+                        '⛔ 91+':      ('#4a148c','#e1bee7'),
+                    }
+                    for _i, row in df_in.iterrows():
+                        if str(row.get('City','')) == 'ALL CITIES':
+                            for _c in df_in.columns: sty.at[_i,_c] = 'background-color:#212121;color:#fff;font-weight:800'
+                            continue
+                        for _cc, (_tc, _bg) in _col_colors.items():
+                            if _cc in df_in.columns:
+                                try:
+                                    v = float(str(row[_cc]).replace('%',''))
+                                    intensity = min(v / 100, 1.0)
+                                    sty.at[_i,_cc] = f'background-color:{_bg};color:{_tc};font-weight:{"700" if v > 50 else "500"}'
+                                except: pass
+                    return sty
+
+                st.dataframe(_dt_pct_str.style.apply(_style_dt_pct, axis=None), use_container_width=True)
+
+                # Horizontal stacked bar chart
+                _cat_order = ['✅ ≤40 min','🟡 41–50','🟠 51–60','🔴 61–90','⛔ 91+']
+                _plot_cols = [c for c in _cat_order if c in _dt_pct.columns]
+                _plot_cities = _dt_pct['City'].tolist()
+                _bar_colors = ['#2e7d32','#f9a825','#e65100','#c62828','#6a1b9a']
+
+                if _plot_cols:
+                    _fig_dtcat, _ax_dtcat = plt.subplots(figsize=(11, max(3, len(_plot_cities)*0.55 + 1)))
+                    _left = np.zeros(len(_plot_cities))
+                    for _ci, (_col, _clr) in enumerate(zip(_plot_cols, _bar_colors[:len(_plot_cols)])):
+                        _vals = _dt_pct[_col].fillna(0).values
+                        _bars = _ax_dtcat.barh(_plot_cities, _vals, left=_left, color=_clr,
+                                               label=_col, height=0.7)
+                        for _bi, (_bar, _v) in enumerate(zip(_bars, _vals)):
+                            if _v >= 8:
+                                _ax_dtcat.text(_left[_bi] + _v/2, _bar.get_y() + _bar.get_height()/2,
+                                              f"{_v:.0f}%", ha='center', va='center',
+                                              fontsize=8, color='white', fontweight='bold')
+                        _left += _vals
+                    _ax_dtcat.set_xlabel("% of Orders")
+                    _ax_dtcat.set_title("Delivery Time Distribution by City (%)", fontweight='bold')
+                    _ax_dtcat.axvline(100, color='#555', lw=0.8, linestyle='--')
+                    _ax_dtcat.invert_yaxis()
+                    _ax_dtcat.legend(loc='lower right', fontsize=8, ncol=len(_plot_cols))
+                    _ax_dtcat.set_xlim(0, 105)
+                    plt.tight_layout()
+                    st.pyplot(_fig_dtcat); plt.close()
+
+                st.download_button("⬇️ Download Analysis",
+                    data=excel_bytes(_dt_pct_disp.round(1), "Location Analysis"),
+                    file_name="Location_Analysis.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            else:
+                st.info("No data for the selected city/week combination.")
 
     # PDF report
     st.divider()
@@ -1873,7 +2464,6 @@ with tab2:
                            mime="application/pdf")
 
 
-# ═══════════════════════════════════════════════════════════════
 # TAB 3 — RIDER ATTENDANCE
 # ═══════════════════════════════════════════════════════════════
 with tab3:
@@ -2027,14 +2617,43 @@ with tab3:
     _dr_zone = (_dr_df.groupby('DRIVER NAME')['BUSINESS CITY']
                 .agg(lambda x: x.mode().iloc[0] if not x.mode().empty else "Unknown"))
 
+    # ─── UNIFIED FILTER — applies to all 4 sections ──────────
+    st.markdown("---")
+    _uf_col1, _uf_col2 = st.columns(2)
+    _all_dr_weeks = sorted(_dr_df['Week'].dropna().unique(), reverse=True)
+    _dr_week_opts = ["All 8 Weeks"] + [f"W{int(w.isocalendar()[1])} ({w.strftime('%d %b')})" for w in _all_dr_weeks[:8]]
+
+    with _uf_col1:
+        _perf_zones_raw = sorted(_dr_df['BUSINESS CITY'].dropna().unique())
+        _unified_zone = st.multiselect(
+            "🏙️ Filter by Working Zone", _perf_zones_raw,
+            placeholder="All zones — affects all sections below", key="unified_zone_filter"
+        )
+    with _uf_col2:
+        _unified_week = st.selectbox(
+            "📅 Filter by Week (attendance view)", _dr_week_opts, key="unified_week_filter"
+        )
+
+    st.caption("💡 These filters apply to: Weekly Attendance, Driver KPI, Top/Bottom Performers, and Trend Chart")
+    st.markdown("---")
+
+    # Apply unified filters to _dr_df
+    _dr_df_f = _dr_df.copy()
+    if _unified_zone:
+        _dr_df_f = _dr_df_f[_dr_df_f['BUSINESS CITY'].isin(_unified_zone)]
+    if _unified_week != "All 8 Weeks":
+        _uw_idx = _dr_week_opts.index(_unified_week) - 1
+        _uw_period = _all_dr_weeks[_uw_idx]
+        _dr_df_f = _dr_df_f[_dr_df_f['Week'] == _uw_period]
+
     # ─── Section A: Attendance — last 8 weeks ───────────────
     st.markdown("### 📅 A. Weekly Attendance (Last 8 Weeks)")
     _weekdays_order = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday']
-    _recent_8_weeks = _dr_df['Week'].drop_duplicates().sort_values(ascending=False).head(8)
+    _recent_8_weeks = _dr_df_f['Week'].drop_duplicates().sort_values(ascending=False).head(8)
 
     _all_att = []
     for _wk in _recent_8_weeks:
-        _wk_data = _dr_df[_dr_df['Week'] == _wk]
+        _wk_data = _dr_df_f[_dr_df_f['Week'] == _wk]
         _iso_w = int(_wk.isocalendar()[1])
         _wk_label = f"W{_iso_w}"
         _pivot = pd.pivot_table(_wk_data, values='ID', index='DRIVER NAME',
@@ -2053,21 +2672,26 @@ with tab3:
         _att_all['Working Zone'] = _att_all['DRIVER NAME'].map(_dr_zone)
         _att_cols = ['Week','DRIVER NAME','Working Zone'] + _weekdays_order + ['Days','Orders']
         _att_all = _att_all[[c for c in _att_cols if c in _att_all.columns]]
-
-        # Filter by zone
         _perf_zones = sorted(_att_all['Working Zone'].dropna().unique())
-        _zone_filter = st.multiselect("Filter by Working Zone", _perf_zones,
-                                      placeholder="All zones", key="dr_zone_filter")
-        _att_show = _att_all[_att_all['Working Zone'].isin(_zone_filter)] if _zone_filter else _att_all
+        _att_show = _att_all.copy()
 
-        # Color-code rows: many days = green, few days = red
+        # Total row
+        _att_numeric = _att_show[['Days','Orders']].sum()
+        _att_total_row = pd.DataFrame([{
+            'Week': '—', 'DRIVER NAME': 'TOTAL', 'Working Zone': f"{_att_show['DRIVER NAME'].nunique()} drivers",
+            **{d: '' for d in _weekdays_order},
+            'Days': _att_numeric['Days'], 'Orders': int(_att_numeric['Orders'])
+        }])
+        _att_display = pd.concat([_att_show, _att_total_row], ignore_index=True)
+
+        # Color-code rows
         def _style_att(v):
             if v == '✔': return 'background-color:#d4edda;color:#155724'
             if v == '—':  return 'background-color:#fff3cd;color:#856404'
             return ''
 
-        st.dataframe(_att_show.style.applymap(_style_att,
-                     subset=[c for c in _weekdays_order if c in _att_show.columns]),
+        st.dataframe(_att_display.style.applymap(_style_att,
+                     subset=[c for c in _weekdays_order if c in _att_display.columns]),
                      use_container_width=True, height=400)
         st.download_button("⬇️ Download Attendance (8 weeks)",
                            data=excel_bytes(_att_all, "Attendance"),
@@ -2110,9 +2734,11 @@ with tab3:
 
     # ─── Section B: KPI Performance — last 8 weeks ──────────
     st.markdown("### 📊 B. Driver KPI Performance (Last 8 Weeks)")
-    st.caption("Only clean completed deliveries used for time KPIs (outliers excluded).")
+    st.caption("Only clean completed deliveries used for time KPIs (outliers excluded). Distance = road estimate (haversine × 1.4)")
 
-    _dr_comp = _dr_df[_dr_df['STATE'].isin(['Delivery Completed By Driver','Completed'])].copy()
+    # Apply distance to the filtered df
+    _dr_df_dist = add_distance(_dr_df_f)
+    _dr_comp = _dr_df_dist[_dr_df_dist['STATE'].isin(['Delivery Completed By Driver','Completed'])].copy()
 
     def _cat_issues(row):
         checks = [('Accepted by Business',30),('Assigned Time',30),('Accepted by Driver',45),
@@ -2133,7 +2759,10 @@ with tab3:
 
     for _wk in _recent_8_kpi:
         _wk_data = _dr_comp_clean[_dr_comp_clean['Week'] == _wk].copy()
-        if 'DISTANCE (km)' not in _wk_data.columns: _wk_data['DISTANCE (km)'] = 0.0
+        # Distance already applied via add_distance above; fill missing with 0
+        if 'DISTANCE (km)' not in _wk_data.columns:
+            _wk_data = add_distance(_wk_data)
+        _wk_data['DISTANCE (km)'] = pd.to_numeric(_wk_data['DISTANCE (km)'], errors='coerce').fillna(0)
         _kpi = _wk_data.groupby('DRIVER NAME').agg(
             Avg_DT=('Average Delivery Time','mean'),
             Accepted_Biz=('Accepted by Business','mean'),
@@ -2163,21 +2792,99 @@ with tab3:
         _kpi_all['_wn'] = _kpi_all['Week'].str.extract(r'(\d+)').astype(int)
         _kpi_all = _kpi_all.sort_values(['DRIVER NAME','_wn'], ascending=[True,False]).drop(columns='_wn')
 
-        _kpi_zone_f = st.multiselect("Filter by Working Zone (KPI table)", _perf_zones,
-                                      placeholder="All zones", key="kpi_zone_filter")
-        _kpi_show = _kpi_all[_kpi_all['Working Zone'].isin(_kpi_zone_f)] if _kpi_zone_f else _kpi_all
+        _kpi_show = _kpi_all.copy()  # unified filter already applied via _dr_df_f
 
-        # Color-code DT column
-        def _color_dt(v):
+        # Total row
+        _kpi_numeric_cols = ['Total Orders','Avg DT (min)','Accepted by Biz','Assigned Time',
+                             'Accepted by Driver','Driver→Business','Driver in Biz','Pickup→Customer',
+                             'Total KM','Avg KM/Order']
+        _kpi_total_vals = {'Week': '—', 'DRIVER NAME': f'TOTAL ({_kpi_show["DRIVER NAME"].nunique()} drivers)',
+                           'Working Zone': '—'}
+        for _nc in _kpi_numeric_cols:
+            if _nc in _kpi_show.columns:
+                if _nc in ('Total Orders','Total KM'):
+                    _kpi_total_vals[_nc] = round(_kpi_show[_nc].sum(), 1)
+                else:
+                    _kpi_total_vals[_nc] = round(_kpi_show[_nc].mean(), 1)
+        _kpi_show_disp = pd.concat([_kpi_show, pd.DataFrame([_kpi_total_vals])], ignore_index=True)
+
+        # Per-row distance-based target for KPI table
+        # Avg KM/Order is already road distance (×1.4 applied); use for per-row target
+        def _kpi_row_target(avg_km):
             try:
-                f = float(v)
-                if f <= 40: return 'background-color:#d4edda;color:#155724'
-                if f <= 55: return 'background-color:#fff3cd;color:#856404'
-                return 'background-color:#f8d7da;color:#721c24'
-            except: return ''
+                km = float(avg_km)
+                if km <= 0: return 44.0
+                p2c = round((km / STAGE_DRIVING_SPEED_KMH * 60) + STAGE_P2C_OVERHEAD_MIN, 1)
+                return round(sum(STAGE_TARGETS_FIXED.values()) + p2c, 1)
+            except: return 44.0
 
-        st.dataframe(_kpi_show.style.applymap(_color_dt, subset=['Avg DT (min)']),
+        if 'Avg KM/Order' in _kpi_show_disp.columns:
+            _kpi_show_disp = _kpi_show_disp.copy()
+            _kpi_show_disp['ADT Target'] = _kpi_show_disp['Avg KM/Order'].apply(_kpi_row_target)
+            _kpi_show_disp['vs Target'] = (_kpi_show_disp['Avg DT (min)'].apply(
+                lambda x: round(float(x) - _kpi_row_target(0), 1) if str(x) == '—' else x) - 
+                _kpi_show_disp['ADT Target']).round(1)
+
+        # Professional full-row styling for KPI table
+        def _style_kpi_table(df_in):
+            sty = pd.DataFrame('', index=df_in.index, columns=df_in.columns)
+            for _i, row in df_in.iterrows():
+                driver = str(row.get('DRIVER NAME',''))
+                # Total row — dark
+                if 'TOTAL' in driver:
+                    for _c in df_in.columns: sty.at[_i,_c] = 'background-color:#1a1a2e;color:#fff;font-weight:800'
+                    continue
+                # Avg DT vs distance-based target
+                try:
+                    adt_v = float(row.get('Avg DT (min)', 0))
+                    tgt_v = float(row.get('ADT Target', 44.0)) if 'ADT Target' in df_in.columns else 44.0
+                    if adt_v <= tgt_v:
+                        sty.at[_i,'Avg DT (min)'] = 'background-color:#c8e6c9;color:#1b5e20;font-weight:700'
+                    elif adt_v <= tgt_v * 1.15:
+                        sty.at[_i,'Avg DT (min)'] = 'background-color:#fff9c4;color:#f57f17;font-weight:700'
+                    else:
+                        sty.at[_i,'Avg DT (min)'] = 'background-color:#ffcdd2;color:#b71c1c;font-weight:700'
+                except: pass
+                # vs Target column
+                if 'vs Target' in df_in.columns:
+                    try:
+                        vt = float(row.get('vs Target', 0))
+                        sty.at[_i,'vs Target'] = ('background-color:#c8e6c9;color:#1b5e20;font-weight:700' if vt <= 0
+                                                   else 'background-color:#fff9c4;color:#f57f17;font-weight:700' if vt <= 5
+                                                   else 'background-color:#ffcdd2;color:#b71c1c;font-weight:700')
+                    except: pass
+                # Fixed stage targets
+                for _col, _tgt in STAGE_TARGETS_FIXED.items():
+                    _alias = {'Accepted by Business':'Accepted by Biz',
+                              'Assigned Time':'Assigned Time',
+                              'Accepted by Driver':'Accepted by Driver',
+                              'Driver to Business':'Driver→Business',
+                              'Driver in Business':'Driver in Biz'}.get(_col, _col)
+                    if _alias in df_in.columns:
+                        try:
+                            v = float(row.get(_alias, 0))
+                            sty.at[_i,_alias] = ('background-color:#e8f5e9;color:#1b5e20' if v <= _tgt
+                                                  else 'background-color:#fffde7;color:#f57f17' if v <= _tgt*1.5
+                                                  else 'background-color:#ffebee;color:#b71c1c')
+                        except: pass
+                # High orders = highlight
+                if 'Total Orders' in df_in.columns:
+                    try:
+                        if float(row['Total Orders']) >= 40:
+                            sty.at[_i,'Total Orders'] = 'background-color:#e3f2fd;color:#0d47a1;font-weight:700'
+                    except: pass
+            return sty
+
+        # Reorder columns to put ADT Target and vs Target right after Avg DT
+        _col_order = ['Week','DRIVER NAME','Working Zone','Total Orders','Avg DT (min)']
+        if 'ADT Target' in _kpi_show_disp.columns: _col_order.append('ADT Target')
+        if 'vs Target' in _kpi_show_disp.columns:  _col_order.append('vs Target')
+        _col_order += [c for c in _kpi_show_disp.columns if c not in _col_order]
+        _kpi_show_disp = _kpi_show_disp[[c for c in _col_order if c in _kpi_show_disp.columns]]
+
+        st.dataframe(_kpi_show_disp.style.apply(_style_kpi_table, axis=None),
                      use_container_width=True, height=440)
+        st.caption("🟢 At/below target  🟡 Within 15% over  🔴 More than 15% over  |  **ADT Target** = 25.5 min fixed + P2C (road dist ÷ 30 km/h × 60 + 6 min overhead)")
         st.download_button("⬇️ Download Driver KPIs (8 weeks)",
                            data=excel_bytes(_kpi_all, "Driver KPIs"),
                            file_name="Driver_KPIs_8W.xlsx",
@@ -2215,22 +2922,592 @@ with tab3:
             st.dataframe(_bot10[['DRIVER NAME','Working Zone','8W Avg DT (min)']],
                          use_container_width=True)
 
-        # ── Weekly trend: top 10 by volume ──
-        st.markdown("#### 📈 Delivery Time Trend — Top 10 Riders by Volume")
-        _top_vol = _kpi_all.groupby('DRIVER NAME')['Total Orders'].sum().nlargest(10).index.tolist()
-        _td = _kpi_all[_kpi_all['DRIVER NAME'].isin(_top_vol)]
+        # ── Weekly trend chart — 3 views ──
+        st.markdown("#### 📈 Delivery Time Trend")
+        _trend_view = st.radio(
+            "Chart view",
+            ["By Volume — Top 10 Riders", "Delivery Time: Best (fastest first)", "Delivery Time: Worst (slowest first)"],
+            horizontal=True, key="trend_view_radio"
+        )
+
+        _perf_sum_chart = (_kpi_all.groupby('DRIVER NAME')
+                           .agg(**{'8W Avg DT': ('Avg DT (min)','mean'), 'Total Orders': ('Total Orders','sum')})
+                           .round(1).reset_index())
+
+        if _trend_view == "By Volume — Top 10 Riders":
+            _chart_riders = _perf_sum_chart.sort_values('Total Orders', ascending=False).head(10)['DRIVER NAME'].tolist()
+            _chart_title = "Weekly Delivery Time Trend — Top 10 by Volume"
+        elif _trend_view == "Delivery Time: Best (fastest first)":
+            _chart_riders = _perf_sum_chart.sort_values('8W Avg DT').head(10)['DRIVER NAME'].tolist()
+            _chart_title = "Delivery Time Trend — Top 10 Fastest Riders"
+        else:
+            _chart_riders = _perf_sum_chart.sort_values('8W Avg DT', ascending=False).head(10)['DRIVER NAME'].tolist()
+            _chart_title = "Delivery Time Trend — Top 10 Slowest Riders (Needs Coaching)"
+
+        _td = _kpi_all[_kpi_all['DRIVER NAME'].isin(_chart_riders)]
         _fig_tr, _ax_tr = plt.subplots(figsize=(13,5))
-        for _rn in _top_vol:
+        for _rn in _chart_riders:
             _rd = _td[_td['DRIVER NAME']==_rn].sort_values('Week')
             if _rd.empty: continue
             _ax_tr.plot(_rd['Week'], _rd['Avg DT (min)'], marker='o', lw=1.5, label=_rn)
         _ax_tr.axhline(45, color='green', lw=2, linestyle='--', label='Target (45 min)')
         _ax_tr.axhline(55, color='red', lw=1.5, linestyle=':', label='Alert (55 min)')
-        _ax_tr.fill_between(range(len(_kpi_all['Week'].unique())), 0, 45, alpha=0.05, color='green')
         _ax_tr.set_xlabel("Week"); _ax_tr.set_ylabel("Avg DT (min)")
-        _ax_tr.set_title("Weekly Delivery Time Trend — Top 10 by Volume")
+        _ax_tr.set_title(_chart_title)
         _ax_tr.legend(fontsize=7, ncol=4); _ax_tr.grid(True, alpha=0.3)
         plt.tight_layout(); st.pyplot(_fig_tr); plt.close()
+
+    # ─── Section E: Individual Rider Deep Dive ───────────────
+    st.markdown("### 🔍 E. Individual Rider Search")
+    st.caption("Default shows the top rider by order volume. Search by name or select from the dropdown.")
+
+    _all_drivers_list = sorted(_dr_df['DRIVER NAME'].dropna().unique().tolist())
+
+    # Default = top rider by total order volume
+    _vol_rank = (_dr_df.groupby('DRIVER NAME')['ID'].count()
+                 .sort_values(ascending=False).reset_index())
+    _default_rider = _vol_rank['DRIVER NAME'].iloc[0] if not _vol_rank.empty else (_all_drivers_list[0] if _all_drivers_list else None)
+
+    _e_col1, _e_col2 = st.columns([2, 3])
+    with _e_col1:
+        _rider_search = st.text_input("🔎 Filter list by name", placeholder="Type to narrow…", key="rider_search_input")
+    with _e_col2:
+        if _rider_search:
+            _matched = [d for d in _all_drivers_list if _rider_search.lower() in d.lower()]
+            if not _matched:
+                st.warning(f"No driver matching '{_rider_search}'")
+                _matched = _all_drivers_list
+        else:
+            _matched = _all_drivers_list
+
+        _default_idx = _matched.index(_default_rider) if _default_rider in _matched else 0
+        _sel_driver = st.selectbox(
+            "Select Driver (default = top by volume)",
+            _matched, index=_default_idx, key="rider_select_box"
+        )
+
+    if _sel_driver:
+        # Full data for this driver (all weeks, all states)
+        _ind_df = _dr_df[_dr_df['DRIVER NAME'] == _sel_driver].copy()
+        _ind_df = add_distance(_ind_df)
+        _ind_comp = _ind_df[_ind_df['STATE'].isin(['Delivery Completed By Driver','Completed'])].copy()
+
+        # Per-order targets using new model
+        if 'DISTANCE (km)' in _ind_comp.columns and not _ind_comp.empty:
+            _ind_comp = _ind_comp.copy()
+            _ind_comp['P2C Target'] = (_ind_comp['DISTANCE (km)'] / STAGE_DRIVING_SPEED_KMH * 60 + STAGE_P2C_OVERHEAD_MIN).round(1)
+            _ind_comp['Total Target'] = (sum(STAGE_TARGETS_FIXED.values()) + _ind_comp['P2C Target']).round(1)
+            _ind_comp['vs Target'] = (_ind_comp['Average Delivery Time'] - _ind_comp['Total Target']).round(1)
+
+        _zone_name = _dr_zone.get(_sel_driver, "Unknown")
+        _avg_dt   = round(_ind_comp['Average Delivery Time'].mean(), 1) if not _ind_comp.empty else None
+        _avg_dist = round(_ind_comp['DISTANCE (km)'].mean(), 1) if ('DISTANCE (km)' in _ind_comp.columns and not _ind_comp.empty) else None
+        _avg_tgt  = round(_ind_comp['Total Target'].mean(), 1) if ('Total Target' in _ind_comp.columns and not _ind_comp.empty) else None
+        _vs_tgt   = round(_avg_dt - _avg_tgt, 1) if (_avg_dt and _avg_tgt) else None
+        _rnk_row  = _vol_rank[_vol_rank['DRIVER NAME'] == _sel_driver]
+        _vol_rank_pos = int(_rnk_row.index[0]) + 1 if not _rnk_row.empty else '—'
+
+        # Header banner
+        st.markdown(f"""
+<div style="background:linear-gradient(135deg,#1a237e,#283593);color:#fff;border-radius:12px;padding:18px 24px;margin-bottom:16px;">
+  <div style="font-size:1.4rem;font-weight:800;margin-bottom:4px;">🚴 {_sel_driver}</div>
+  <div style="font-size:0.95rem;opacity:0.85;">Zone: {_zone_name}&nbsp;&nbsp;|&nbsp;&nbsp;Volume Rank: #{_vol_rank_pos} of {len(_all_drivers_list)} riders</div>
+</div>""", unsafe_allow_html=True)
+
+        # KPI scorecard
+        _sc1, _sc2, _sc3, _sc4, _sc5 = st.columns(5)
+        _sc1.metric("📦 Total Orders", f"{len(_ind_df):,}")
+        _sc2.metric("✅ Completed", f"{len(_ind_comp):,}")
+        _sc3.metric("⏱ Avg Delivery Time",
+                    f"{_avg_dt:.1f} min" if _avg_dt else "—",
+                    delta=f"Target {_avg_tgt:.1f} min" if _avg_tgt else None,
+                    delta_color="normal" if (_avg_dt and _avg_tgt and _avg_dt <= _avg_tgt) else "inverse")
+        _sc4.metric("📏 Avg Road Dist",
+                    f"{_avg_dist:.1f} km" if _avg_dist else "—",
+                    help="Straight-line × 1.6 road factor")
+        _sc5.metric("🎯 vs Target",
+                    f"{_vs_tgt:+.1f} min" if _vs_tgt is not None else "—",
+                    delta_color="normal" if (_vs_tgt is not None and _vs_tgt <= 0) else "inverse")
+
+        # Inner tabs
+        _rt1, _rt2, _rt3 = st.tabs(["📅 Weekly Breakdown", "📐 Stage Analysis", "📍 Delivery Map"])
+
+        with _rt1:
+            if not _ind_comp.empty:
+                if 'Total Target' in _ind_comp.columns:
+                    _ind_wk = (_ind_comp.groupby('Week').agg(
+                        Orders=('ID','count'),
+                        Avg_DT=('Average Delivery Time','mean'),
+                        Avg_Dist=('DISTANCE (km)','mean'),
+                        Avg_Target=('Total Target','mean'),
+                    ).round(1).reset_index())
+                    _ind_wk['vs Target'] = (_ind_wk['Avg_DT'] - _ind_wk['Avg_Target']).round(1)
+                    _ind_wk['Status'] = _ind_wk['vs Target'].apply(
+                        lambda x: '✅ On Target' if x <= 0 else ('⚠️ Near' if x <= 5 else '❌ Over'))
+                else:
+                    _ind_wk = (_ind_comp.groupby('Week').agg(
+                        Orders=('ID','count'), Avg_DT=('Average Delivery Time','mean'),
+                        Avg_Dist=('DISTANCE (km)','mean')).round(1).reset_index())
+
+                _ind_wk['Week'] = _ind_wk['Week'].apply(
+                    lambda w: f"W{int(w.isocalendar()[1])} ({w.strftime('%d %b')})")
+
+                # OVERALL row
+                _ovr = {'Week': 'OVERALL', 'Orders': int(_ind_wk['Orders'].sum())}
+                for _nc in [c for c in _ind_wk.columns if c not in ('Week','Status','Orders')]:
+                    try: _ovr[_nc] = round(float(_ind_wk[_nc].mean()), 1)
+                    except: pass
+                if 'vs Target' in _ind_wk.columns:
+                    _ovr_vt = float(_ovr.get('vs Target', 0))
+                    _ovr['Status'] = '✅ On Target' if _ovr_vt <= 0 else ('⚠️ Near' if _ovr_vt <= 5 else '❌ Over')
+                _ind_wk_disp = pd.concat([_ind_wk, pd.DataFrame([_ovr])], ignore_index=True)
+
+                def _style_rdr_wk(df_in):
+                    sty = pd.DataFrame('', index=df_in.index, columns=df_in.columns)
+                    for _i, row in df_in.iterrows():
+                        if str(row.get('Week','')) == 'OVERALL':
+                            for _c in df_in.columns: sty.at[_i,_c] = 'background-color:#212121;color:#fff;font-weight:800'
+                            continue
+                        if 'vs Target' in df_in.columns:
+                            try:
+                                vt = float(row['vs Target'])
+                                _cs = ('background-color:#c8e6c9;color:#1b5e20;font-weight:700' if vt <= 0
+                                       else 'background-color:#fff9c4;color:#f57f17;font-weight:700' if vt <= 5
+                                       else 'background-color:#ffcdd2;color:#b71c1c;font-weight:700')
+                                for _c in ('vs Target','Status','Avg_DT'): 
+                                    if _c in df_in.columns: sty.at[_i,_c] = _cs
+                            except: pass
+                    return sty
+
+                st.dataframe(_ind_wk_disp.style.apply(_style_rdr_wk, axis=None), use_container_width=True)
+                st.caption("🟢 On/under target  🟡 Within 5 min  🔴 Over target  |  vs Target: -ve = faster than target ✅")
+
+                if len(_ind_wk) > 1 and 'Avg_DT' in _ind_wk.columns:
+                    _fig_rw, _ax_rw = plt.subplots(figsize=(10, 3))
+                    _wl = _ind_wk['Week'].tolist()
+                    _ax_rw.plot(_wl, _ind_wk['Avg_DT'], marker='o', color='#e53935', lw=2, label='Avg DT')
+                    if 'Avg_Target' in _ind_wk.columns:
+                        _ax_rw.plot(_wl, _ind_wk['Avg_Target'], marker='s', color='#43a047',
+                                    lw=1.5, linestyle='--', label='Target (dist-based)')
+                        _ax_rw.fill_between(range(len(_wl)), 0, _ind_wk['Avg_Target'].values,
+                                            alpha=0.07, color='green')
+                    _ax_rw.set_title(f"Weekly DT vs Target — {_sel_driver}")
+                    _ax_rw.set_ylabel("Minutes"); _ax_rw.grid(True, alpha=0.3); _ax_rw.legend(fontsize=8)
+                    plt.xticks(rotation=30, ha='right'); plt.tight_layout()
+                    st.pyplot(_fig_rw); plt.close()
+            else:
+                st.info("No completed orders found for this rider.")
+
+        with _rt2:
+            if not _ind_comp.empty and 'Distance Category' in _ind_comp.columns:
+                st.markdown("**Performance by Distance Category**")
+                st.caption(f"P2C Target = road dist ÷ {STAGE_DRIVING_SPEED_KMH} km/h × 60 + {STAGE_P2C_OVERHEAD_MIN} min overhead")
+                _agg_d = {c: 'mean' for c in ['Average Delivery Time','Accepted by Business','Assigned Time',
+                           'Accepted by Driver','Driver to Business','Driver in Business','Pickup to Customer','DISTANCE (km)']
+                           if c in _ind_comp.columns}
+                _agg_d['ID'] = 'count'
+                _rn_map = {'ID':'Orders','Average Delivery Time':'Avg DT','DISTANCE (km)':'Avg Dist (km)'}
+                _ind_dist = (_ind_comp.groupby('Distance Category', observed=True).agg(**{
+                    (_rn_map.get(k,k)): (k,v) for k,v in _agg_d.items()}).round(1).reset_index())
+                if 'Avg Dist (km)' in _ind_dist.columns:
+                    _ind_dist['P2C Target'] = (_ind_dist['Avg Dist (km)'] / STAGE_DRIVING_SPEED_KMH * 60 + STAGE_P2C_OVERHEAD_MIN).round(1)
+                    _ind_dist['Total Target'] = (sum(STAGE_TARGETS_FIXED.values()) + _ind_dist['P2C Target']).round(1)
+                    _ind_dist['vs Target'] = (_ind_dist['Avg DT'] - _ind_dist['Total Target']).round(1)
+                # TOTAL row
+                _dt_tot = {'Distance Category': 'ALL'}
+                for _nc in _ind_dist.columns:
+                    if _nc == 'Distance Category': continue
+                    try: _dt_tot[_nc] = round(float(_ind_dist[_nc].mean()), 1)
+                    except: pass
+                if 'Orders' in _ind_dist.columns:
+                    _dt_tot['Orders'] = int(_ind_dist['Orders'].sum())
+                _ind_dist_disp = pd.concat([_ind_dist, pd.DataFrame([_dt_tot])], ignore_index=True)
+
+                def _style_dist_tbl(df_in):
+                    sty = pd.DataFrame('', index=df_in.index, columns=df_in.columns)
+                    for _i, row in df_in.iterrows():
+                        if str(row.get('Distance Category','')) == 'ALL':
+                            for _c in df_in.columns: sty.at[_i,_c] = 'background-color:#212121;color:#fff;font-weight:800'
+                            continue
+                        for _col, _tgt in STAGE_TARGETS_FIXED.items():
+                            if _col in df_in.columns:
+                                try:
+                                    v = float(row[_col])
+                                    sty.at[_i,_col] = ('background-color:#c8e6c9;color:#1b5e20;font-weight:600' if v <= _tgt
+                                                        else 'background-color:#fff9c4;color:#f57f17;font-weight:600' if v <= _tgt*1.5
+                                                        else 'background-color:#ffcdd2;color:#b71c1c;font-weight:600')
+                                except: pass
+                        if 'vs Target' in df_in.columns:
+                            try:
+                                vt = float(row['vs Target'])
+                                sty.at[_i,'vs Target'] = ('background-color:#c8e6c9;color:#1b5e20;font-weight:700' if vt <= 0
+                                                           else 'background-color:#fff9c4;color:#f57f17;font-weight:700' if vt <= 5
+                                                           else 'background-color:#ffcdd2;color:#b71c1c;font-weight:700')
+                            except: pass
+                    return sty
+
+                st.dataframe(_ind_dist_disp.style.apply(_style_dist_tbl, axis=None), use_container_width=True)
+                st.caption("🟢 At/below target (good)  🟡 1–1.5× target (slightly slow)  🔴 Over 1.5× target (action needed)  |  vs Target: -ve = faster ✅  +ve = slower ❌")
+            else:
+                st.info("Distance data not available.")
+
+        with _rt3:
+            if all(c in _ind_comp.columns for c in ['CUSTOMER LATITUDE','CUSTOMER LONGITUDE']):
+                _heat_data = _ind_comp[['CUSTOMER LATITUDE','CUSTOMER LONGITUDE']].dropna().values.tolist()
+                if _heat_data:
+                    st.caption(f"{len(_heat_data)} delivery locations")
+                    _m_ind = folium.Map(location=[-6.8018, 39.2801], zoom_start=13)
+                    HeatMap(_heat_data, radius=15, blur=10, max_zoom=1).add_to(_m_ind)
+                    st.components.v1.html(_m_ind._repr_html_(), height=450)
+                else:
+                    st.info("No GPS coordinates.")
+            else:
+                st.info("GPS data not available.")
+
+        _show_cols = [c for c in ['ID','BUSINESS NAME','DELIVERY DATE','DISTANCE (km)','Distance Category',
+                                   'Accepted by Business','Assigned Time','Accepted by Driver',
+                                   'Driver to Business','Driver in Business','Pickup to Customer',
+                                   'Average Delivery Time','Total Target','vs Target','STATE'] if c in _ind_df.columns]
+        with st.expander("📋 Recent Orders (last 50)"):
+            st.dataframe(_ind_df[_show_cols].sort_values('DELIVERY DATE', ascending=False).head(50),
+                         use_container_width=True)
+
+        if not _ind_comp.empty:
+            st.download_button("⬇️ Download Rider Data",
+                               data=excel_bytes(_ind_comp[[c for c in _show_cols if c in _ind_comp.columns]], "Rider Data"),
+                               file_name=f"Rider_{_sel_driver.replace(' ','_')}.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    st.divider()
+
+    # ─── Section B2: Dar es Salaam Monthly Bonus ────────────
+    st.divider()
+    st.markdown("### 🌟 B2. Dar es Salaam Monthly Rider Bonus")
+    st.caption("Monthly bonus based on last 4 completed weeks. Four bonus categories: Acceptance Time · Working Days · Delivery Time · Night/Morning Orders")
+
+    # ── Prepare 4-week window ──
+    _dar_df = raw.copy()
+    _dar_df['DELIVERY DATE'] = pd.to_datetime(_dar_df['DELIVERY DATE'], errors='coerce')
+    _dar_df = _dar_df[_dar_df['BUSINESS CITY'].isin(DAR_CITIES)].copy()
+    _dar_df['Week'] = _dar_df['DELIVERY DATE'].dt.to_period('W-SUN').apply(lambda r: r.start_time)
+    _dar_df = _dar_df[_dar_df['HOUR'].isin(OPERATING_HOURS)] if 'HOUR' in _dar_df.columns else _dar_df.copy()
+    if 'HOUR' not in _dar_df.columns:
+        _dar_df['HOUR'] = _dar_df['DELIVERY TIME'].dt.hour if 'DELIVERY TIME' in _dar_df.columns else 12
+
+    # Get last 4 weeks
+    _dar_4wks = sorted(_dar_df['Week'].dropna().unique(), reverse=True)[:4]
+    _dar_df4 = _dar_df[_dar_df['Week'].isin(_dar_4wks)].copy()
+
+    if _dar_df4.empty:
+        st.info("No Dar es Salaam data found.")
+    else:
+        _dar4_stages = compute_delivery_stages(_dar_df4)
+        _dar4_stages = add_distance(_dar4_stages)
+        _dar4_comp = _dar4_stages[_dar4_stages['STATE'].isin(['Delivery Completed By Driver','Completed'])].copy()
+
+        # Per-order P2C target using distance model
+        if 'DISTANCE (km)' in _dar4_comp.columns:
+            _dar4_comp = _dar4_comp.copy()
+            _dar4_comp['P2C Target'] = (_dar4_comp['DISTANCE (km)'] / STAGE_DRIVING_SPEED_KMH * 60 + STAGE_P2C_OVERHEAD_MIN).round(1)
+            _dar4_comp['Total Target'] = (sum(STAGE_TARGETS_FIXED.values()) + _dar4_comp['P2C Target']).round(1)
+            # Estimated DT = fixed stages + P2C target (purely distance-based estimate)
+            _dar4_comp['Est DT (min)'] = _dar4_comp['Total Target']
+
+        _dar4_all = _dar4_stages.copy()  # all orders including non-completed for acceptance & working days
+
+        # ── DRIVER ID mapping ──
+        _did_map = {}
+        if 'DRIVER ID' in _dar4_all.columns:
+            _did_map = _dar4_all.dropna(subset=['DRIVER ID']).groupby('DRIVER NAME')['DRIVER ID'].first().to_dict()
+
+        # ══ BONUS CONSTANTS ══════════════════════════════════
+        _acc_bonus_tgt  = 2.0    # Avg acceptance ≤ this (min)
+        _acc_bonus_amt  = 20000  # Tsh
+        _days_bonus_tgt = 23     # Must work > this many days
+        _days_bonus_amt = 40000  # Tsh
+        _dt_bonus_amt   = 40000  # Tsh - DT < zone average
+        _time_bonus_tgt = 26     # Must have > this orders in target hours
+        _time_bonus_amt = 20000  # Tsh
+        _fee_qual_tgt   = 400000 # Tsh - minimum total delivery fee to qualify
+        _max_bonus      = _acc_bonus_amt + _days_bonus_amt + _dt_bonus_amt + _time_bonus_amt  # 120,000
+
+        # ── PRE-FILTER: Delivery fee qualification (Tsh 400,000+) ─
+        if 'DELIVERY FEE' in _dar4_all.columns:
+            _fee_grp = (_dar4_all.groupby('DRIVER NAME')['DELIVERY FEE']
+                        .sum().reset_index())
+            _fee_grp.columns = ['DRIVER NAME','Total Delivery Fee (Tsh)']
+            _fee_grp['Fee Qualified'] = _fee_grp['Total Delivery Fee (Tsh)'].apply(
+                lambda x: 'Yes' if pd.notna(x) and x >= _fee_qual_tgt else 'No')
+        else:
+            _fee_grp = pd.DataFrame({'DRIVER NAME': [], 'Total Delivery Fee (Tsh)': [], 'Fee Qualified': []})
+
+        _qualified_drivers = set(_fee_grp[_fee_grp['Fee Qualified'] == 'Yes']['DRIVER NAME'])
+
+        # ── 1. Acceptance Time Bonus (Tsh 20,000) ──────────────
+        _acc_grp = (_dar4_all.groupby('DRIVER NAME')['Accepted by Driver']
+                    .mean().round(1).reset_index())
+        _acc_grp.columns = ['DRIVER NAME','Avg Acceptance (min)']
+        _acc_grp['Accept Bonus Eligible'] = _acc_grp.apply(
+            lambda r: 'Yes' if (r['DRIVER NAME'] in _qualified_drivers
+                                and pd.notna(r['Avg Acceptance (min)'])
+                                and r['Avg Acceptance (min)'] <= _acc_bonus_tgt) else 'No', axis=1)
+
+        # ── 2. Working Days Bonus (Tsh 40,000) ─────────────────
+        _days_grp = (_dar4_all.groupby('DRIVER NAME')['DELIVERY DATE']
+                     .nunique().reset_index())
+        _days_grp.columns = ['DRIVER NAME','Days Worked']
+        _days_grp['Days Bonus Eligible'] = _days_grp.apply(
+            lambda r: 'Yes' if (r['DRIVER NAME'] in _qualified_drivers
+                                and r['Days Worked'] > _days_bonus_tgt) else 'No', axis=1)
+
+        # ── 3. Delivery Time Bonus (Tsh 40,000) ────────────────
+        _dt_grp = _dar4_comp.groupby('DRIVER NAME').agg(
+            Avg_DT=('Average Delivery Time','mean'),
+            Avg_Dist=('DISTANCE (km)','mean'),
+            Est_DT=('Est DT (min)','mean') if 'Est DT (min)' in _dar4_comp.columns else ('Average Delivery Time','mean'),
+            Orders=('ID','count'),
+        ).round(1).reset_index()
+        _dt_grp.columns = ['DRIVER NAME','Avg DT (min)','Avg Dist (km)','Est DT (min)','Orders']
+        _dt_grp['Working Zone'] = _dt_grp['DRIVER NAME'].map(_dr_zone)
+        _zone_avg_dt = _dar4_comp.groupby('BUSINESS CITY')['Average Delivery Time'].mean().round(1)
+        _dt_grp['Zone Avg DT (min)'] = _dt_grp['Working Zone'].map(_zone_avg_dt).round(1)
+        _dt_grp['DT Bonus Eligible'] = _dt_grp.apply(
+            lambda r: 'Yes' if (r['DRIVER NAME'] in _qualified_drivers
+                                and pd.notna(r['Avg DT (min)']) and pd.notna(r['Zone Avg DT (min)'])
+                                and r['Avg DT (min)'] < r['Zone Avg DT (min)']) else 'No', axis=1)
+
+        # ── 4. Night / Morning Orders Bonus (Tsh 20,000) ───────
+        _target_hours = [22, 23, 0, 1, 2, 3, 7, 8, 9, 10]
+        _time_df = _dar4_all[_dar4_all['HOUR'].isin(_target_hours)].copy()
+        _time_grp = _time_df.groupby('DRIVER NAME').size().reset_index(name='Target-Hour Orders')
+        _time_grp['Time Bonus Eligible'] = _time_grp.apply(
+            lambda r: 'Yes' if (r['DRIVER NAME'] in _qualified_drivers
+                                and r['Target-Hour Orders'] > _time_bonus_tgt) else 'No', axis=1)
+
+        # ── Merge all into bonus table ──────────────────────────
+        _all_drivers_dar = sorted(
+            set(_fee_grp['DRIVER NAME']) |
+            set(_acc_grp['DRIVER NAME']) | set(_days_grp['DRIVER NAME']) | set(_dt_grp['DRIVER NAME']))
+
+        _bonus_base = pd.DataFrame({'DRIVER NAME': _all_drivers_dar})
+        _bonus_base = _bonus_base.merge(_fee_grp[['DRIVER NAME','Total Delivery Fee (Tsh)','Fee Qualified']],
+                                        on='DRIVER NAME', how='left')
+        _bonus_base = _bonus_base.merge(_acc_grp[['DRIVER NAME','Avg Acceptance (min)','Accept Bonus Eligible']],
+                                        on='DRIVER NAME', how='left')
+        _bonus_base = _bonus_base.merge(_days_grp[['DRIVER NAME','Days Worked','Days Bonus Eligible']],
+                                        on='DRIVER NAME', how='left')
+        _bonus_base = _bonus_base.merge(_dt_grp[['DRIVER NAME','Working Zone','Avg DT (min)','Avg Dist (km)',
+                                                  'Est DT (min)','Zone Avg DT (min)','DT Bonus Eligible']],
+                                        on='DRIVER NAME', how='left')
+        _bonus_base = _bonus_base.merge(_time_grp[['DRIVER NAME','Target-Hour Orders','Time Bonus Eligible']],
+                                        on='DRIVER NAME', how='left')
+
+        # Bonus amounts
+        _bonus_base['Accept Bonus (Tsh)'] = _bonus_base['Accept Bonus Eligible'].apply(
+            lambda x: _acc_bonus_amt if x == 'Yes' else 0)
+        _bonus_base['Days Bonus (Tsh)'] = _bonus_base['Days Bonus Eligible'].apply(
+            lambda x: _days_bonus_amt if x == 'Yes' else 0)
+        _bonus_base['DT Bonus (Tsh)'] = _bonus_base['DT Bonus Eligible'].apply(
+            lambda x: _dt_bonus_amt if x == 'Yes' else 0)
+        _bonus_base['Time Bonus (Tsh)'] = _bonus_base['Time Bonus Eligible'].apply(
+            lambda x: _time_bonus_amt if x == 'Yes' else 0)
+        _max_bonus = _acc_bonus_amt + _days_bonus_amt + _dt_bonus_amt + _time_bonus_amt
+        _bonus_base['TOTAL BONUS (Tsh)'] = (_bonus_base['Accept Bonus (Tsh)'] + _bonus_base['Days Bonus (Tsh)']
+                                            + _bonus_base['DT Bonus (Tsh)'] + _bonus_base['Time Bonus (Tsh)'])
+
+        # Add DRIVER ID and sort
+        _bonus_base.insert(0, 'DRIVER ID', _bonus_base['DRIVER NAME'].map(_did_map))
+        _bonus_base = _bonus_base.sort_values('DRIVER ID', na_position='last').reset_index(drop=True)
+
+        # Round numerics to 1 decimal
+        for _nc in ['Avg Acceptance (min)','Avg DT (min)','Avg Dist (km)','Est DT (min)','Zone Avg DT (min)']:
+            if _nc in _bonus_base.columns:
+                _bonus_base[_nc] = pd.to_numeric(_bonus_base[_nc], errors='coerce').round(1)
+
+        # ── Bonus criteria cards ──────────────────────────────
+        st.markdown("#### 📋 Bonus Criteria (Must have Tsh 400,000+ delivery fee to qualify)")
+        _bonus_cards = st.columns(5)
+        _fee_qual_count = int((_bonus_base.get('Fee Qualified', pd.Series(['No']*len(_bonus_base))) == 'Yes').sum())
+        with _bonus_cards[0]:
+            st.markdown(f"""<div style="background:#37474f;color:#fff;border-radius:10px;padding:14px 10px;text-align:center;margin-bottom:8px;border:2px solid #ff9800">
+            <div style="font-size:0.75rem;opacity:0.85;margin-bottom:4px">🔑 ELIGIBILITY GATE</div>
+            <div style="font-size:1rem;font-weight:800">Tsh 400,000+</div>
+            <div style="font-size:0.7rem;opacity:0.7">Total Delivery Fee<br>{_fee_qual_count} qualified</div></div>""", unsafe_allow_html=True)
+        for _bidx, (_bname, _bamt, _btgt, _icon, _col) in enumerate([
+            ("Acceptance ≤2.0 min", f"Tsh {_acc_bonus_amt:,}", f"Avg accept time ≤ 2.0 min", "⚡", "#1565c0"),
+            ("Days Worked >23", f"Tsh {_days_bonus_amt:,}", f"In 4-week window", "📅", "#2e7d32"),
+            ("DT < Zone Average", f"Tsh {_dt_bonus_amt:,}", "Faster than city avg", "🚀", "#6a1b9a"),
+            ("Target Hours >26 orders", f"Tsh {_time_bonus_amt:,}", "22–3h & 7–10h", "🌙", "#c62828"),
+        ]):
+            with _bonus_cards[_bidx + 1]:
+                st.markdown(f"""<div style="background:{_col};color:#fff;border-radius:10px;padding:14px 10px;text-align:center;margin-bottom:8px">
+                <div style="font-size:0.75rem;opacity:0.85;margin-bottom:4px">{_icon} {_bname}</div>
+                <div style="font-size:1.1rem;font-weight:800">{_bamt}</div>
+                <div style="font-size:0.7rem;opacity:0.7">{_btgt}</div></div>""", unsafe_allow_html=True)
+
+        # ── Summary KPI metrics ──────────────────────────────
+        _max_bonus = _acc_bonus_amt + _days_bonus_amt + _dt_bonus_amt + _time_bonus_amt
+        _full_bonus_n  = int((_bonus_base['TOTAL BONUS (Tsh)'] == _max_bonus).sum())
+        _partial_n     = int((_bonus_base['TOTAL BONUS (Tsh)'].between(1, _max_bonus-1)).sum())
+        _zero_n        = int((_bonus_base['TOTAL BONUS (Tsh)'] == 0).sum())
+        _total_payout  = int(_bonus_base['TOTAL BONUS (Tsh)'].sum())
+        _acc_elig_n    = int((_bonus_base['Accept Bonus Eligible'] == 'Yes').sum())
+        _days_elig_n   = int((_bonus_base['Days Bonus Eligible'] == 'Yes').sum())
+        _dt_elig_n     = int((_bonus_base['DT Bonus Eligible'] == 'Yes').sum())
+        _time_elig_n   = int((_bonus_base['Time Bonus Eligible'] == 'Yes').sum())
+
+        _krow1 = st.columns(5)
+        _krow1[0].metric("👥 Total Riders", len(_bonus_base))
+        _krow1[1].metric("🔑 Fee Qualified", _fee_qual_count, delta=f"{_fee_qual_count/max(len(_bonus_base),1)*100:.0f}%")
+        _krow1[2].metric("🏆 Full Bonus", _full_bonus_n, delta=f"Tsh {_max_bonus:,} each")
+        _krow1[3].metric("🥈 Partial Bonus", _partial_n)
+        _krow1[4].metric("💰 Total Payout", f"{_total_payout:,.0f}", delta="Tsh")
+
+        # ── Visualizations ────────────────────────────────────
+        _vcol1, _vcol2 = st.columns(2)
+
+        with _vcol1:
+            # Donut: Award distribution
+            st.markdown("**🏆 Bonus Award Distribution**")
+            _fig_donut, _ax_donut = plt.subplots(figsize=(5, 4))
+            _donut_vals  = [_full_bonus_n, _partial_n, _zero_n]
+            _donut_labels= [f'Full ({_full_bonus_n})', f'Partial ({_partial_n})', f'None ({_zero_n})']
+            _donut_colors= ['#2e7d32','#f9a825','#ef5350']
+            _donut_vals_f = [v for v in _donut_vals if v > 0]
+            _donut_labs_f = [l for v,l in zip(_donut_vals, _donut_labels) if v > 0]
+            _donut_cols_f = [cl for v,cl in zip(_donut_vals, _donut_colors) if v > 0]
+            if sum(_donut_vals_f) > 0:
+                _wedges, _texts, _autotexts = _ax_donut.pie(
+                    _donut_vals_f, labels=_donut_labs_f, colors=_donut_cols_f,
+                    autopct='%1.0f%%', startangle=90, pctdistance=0.7,
+                    wedgeprops=dict(width=0.55, edgecolor='white', linewidth=2))
+                for _at in _autotexts: _at.set_fontsize(10); _at.set_fontweight('bold')
+                _ax_donut.text(0, 0, f"{_total_payout//1000}K\nTsh", ha='center', va='center', fontsize=11, fontweight='bold', color='#1a1a2e')
+            _ax_donut.set_title(f"Total Payout: Tsh {_total_payout:,}", fontweight='bold', fontsize=11)
+            plt.tight_layout(); st.pyplot(_fig_donut); plt.close()
+
+        with _vcol2:
+            # Bar: Eligibility per criteria
+            st.markdown("**📊 Eligibility by Criteria**")
+            _fig_elig, _ax_elig = plt.subplots(figsize=(5, 4))
+            _elig_names = ['Fee Qual','Accept','Days','DT','Peak Hrs']
+            _elig_counts= [_fee_qual_count, _acc_elig_n, _days_elig_n, _dt_elig_n, _time_elig_n]
+            _elig_colors= ['#ff9800','#1565c0','#2e7d32','#6a1b9a','#c62828']
+            _bars_elig = _ax_elig.bar(_elig_names, _elig_counts, color=_elig_colors,
+                                      edgecolor='white', linewidth=1.5, width=0.6)
+            _ax_elig.bar_label(_bars_elig, fmt='%d', fontweight='bold', fontsize=10)
+            _ax_elig.axhline(len(_bonus_base), color='#888', lw=1.2, linestyle='--',
+                             label=f'Total riders ({len(_bonus_base)})')
+            _ax_elig.set_ylabel("No. of Riders"); _ax_elig.set_ylim(0, max(len(_bonus_base)*1.2, 5))
+            _ax_elig.set_title("Riders Eligible per Bonus Category", fontweight='bold', fontsize=11)
+            _ax_elig.legend(fontsize=8); _ax_elig.grid(axis='y', alpha=0.2)
+            plt.tight_layout(); st.pyplot(_fig_elig); plt.close()
+
+        # Payout by zone
+        if 'Working Zone' in _bonus_base.columns:
+            st.markdown("**🏙️ Total Bonus Payout by Zone**")
+            _zone_payout = (_bonus_base.groupby('Working Zone')['TOTAL BONUS (Tsh)']
+                            .agg(['sum','count']).reset_index())
+            _zone_payout.columns = ['Zone','Total Payout','Riders']
+            _zone_payout = _zone_payout.sort_values('Total Payout', ascending=True)
+            _fig_zone, _ax_zone = plt.subplots(figsize=(10, max(3, len(_zone_payout)*0.5)))
+            _bars_z = _ax_zone.barh(_zone_payout['Zone'], _zone_payout['Total Payout'],
+                                    color='#1565c0', edgecolor='white', linewidth=1)
+            _zp_payout_vals = _zone_payout['Total Payout'].values
+            _zp_riders_vals = _zone_payout['Riders'].values
+            for _bi, _bar in enumerate(_bars_z):
+                _ax_zone.text(_bar.get_width() + _zone_payout['Total Payout'].max() * 0.01,
+                              _bar.get_y() + _bar.get_height()/2,
+                              f"Tsh {int(_zp_payout_vals[_bi]):,}  ({int(_zp_riders_vals[_bi])} riders)",
+                              va='center', fontsize=9, fontweight='bold')
+            _ax_zone.set_xlabel("Total Payout (Tsh)")
+            _ax_zone.set_title("Bonus Payout by Working Zone", fontweight='bold')
+            _ax_zone.grid(axis='x', alpha=0.2); plt.tight_layout()
+            st.pyplot(_fig_zone); plt.close()
+
+        # Bonus breakdown waterfall bars (top riders)
+        _top_bonus_riders = _bonus_base[_bonus_base['TOTAL BONUS (Tsh)'] > 0].copy()
+        if len(_top_bonus_riders) > 0:
+            st.markdown(f"**🎯 Top Riders — Bonus Breakdown (showing up to 25)**")
+            _top_bonus_riders = _top_bonus_riders.sort_values('TOTAL BONUS (Tsh)', ascending=False).head(25)
+            _fig_stack, _ax_stack = plt.subplots(figsize=(12, max(4, len(_top_bonus_riders)*0.42)))
+            _categories = [('Accept Bonus (Tsh)',  '#1565c0', '⚡ Accept'),
+                           ('Days Bonus (Tsh)',    '#2e7d32', '📅 Days'),
+                           ('DT Bonus (Tsh)',      '#6a1b9a', '🚀 DT'),
+                           ('Time Bonus (Tsh)',    '#c62828', '🌙 Peak')]
+            _left = np.zeros(len(_top_bonus_riders))
+            for _col_b, _clr, _lbl in _categories:
+                if _col_b in _top_bonus_riders.columns:
+                    _vals = pd.to_numeric(_top_bonus_riders[_col_b], errors='coerce').fillna(0).values
+                    _bars_s = _ax_stack.barh(_top_bonus_riders['DRIVER NAME'], _vals,
+                                             left=_left, color=_clr, label=_lbl, height=0.7)
+                    for _bsi, (_bar, _v) in enumerate(zip(_bars_s, _vals)):
+                        if _v >= 8000:
+                            _ax_stack.text(_left[_bsi] + _v/2, _bar.get_y() + _bar.get_height()/2,
+                                          f"{int(_v//1000)}K", ha='center', va='center',
+                                          fontsize=7, color='white', fontweight='bold')
+                    _left += _vals
+            _ax_stack.set_xlabel("Bonus Amount (Tsh)")
+            _ax_stack.set_title("Individual Bonus Breakdown by Category", fontweight='bold')
+            _ax_stack.invert_yaxis()
+            _ax_stack.axvline(_max_bonus, color='gold', lw=1.5, linestyle='--', label=f'Max: Tsh {_max_bonus:,}')
+            _ax_stack.legend(loc='lower right', fontsize=8, ncol=3)
+            _ax_stack.grid(axis='x', alpha=0.2); plt.tight_layout()
+            st.pyplot(_fig_stack); plt.close()
+
+        # ── Main bonus table with styling ──
+        st.markdown("**📋 Dar es Salaam Rider Bonus Table (Last 4 Weeks)**")
+
+        def _style_dar_bonus(df_in):
+            sty = pd.DataFrame('', index=df_in.index, columns=df_in.columns)
+            _elig_cols = {'Fee Qualified':          'Total Delivery Fee (Tsh)',
+                          'Accept Bonus Eligible': 'Accept Bonus (Tsh)',
+                          'Days Bonus Eligible':   'Days Bonus (Tsh)',
+                          'DT Bonus Eligible':     'DT Bonus (Tsh)',
+                          'Time Bonus Eligible':   'Time Bonus (Tsh)'}
+            for _i, row in df_in.iterrows():
+                # Eligibility columns
+                for _ec, _bc in _elig_cols.items():
+                    if _ec in df_in.columns:
+                        val = str(row.get(_ec,''))
+                        sty.at[_i,_ec] = ('background-color:#c8e6c9;color:#1b5e20;font-weight:700' if val == 'Yes'
+                                          else 'background-color:#ffcdd2;color:#b71c1c;font-weight:600')
+                    if _bc in df_in.columns:
+                        try:
+                            bv = float(row.get(_bc, 0))
+                            sty.at[_i,_bc] = ('background-color:#c8e6c9;color:#1b5e20;font-weight:700' if bv > 0
+                                              else 'background-color:#f5f5f5;color:#888')
+                        except: pass
+                # Total bonus
+                if 'TOTAL BONUS (Tsh)' in df_in.columns:
+                    try:
+                        tv = float(row['TOTAL BONUS (Tsh)'])
+                        max_bonus = _acc_bonus_amt + _days_bonus_amt + _dt_bonus_amt + _time_bonus_amt
+                        sty.at[_i,'TOTAL BONUS (Tsh)'] = (
+                            'background-color:#1b5e20;color:#fff;font-weight:800;font-size:1.05em' if tv == max_bonus
+                            else 'background-color:#2e7d32;color:#fff;font-weight:700' if tv >= max_bonus * 0.75
+                            else 'background-color:#f9a825;color:#212121;font-weight:700' if tv > 0
+                            else 'background-color:#f5f5f5;color:#888')
+                    except: pass
+                # vs target for DT
+                if 'Avg DT (min)' in df_in.columns and 'Zone Avg DT (min)' in df_in.columns:
+                    try:
+                        adt = float(row['Avg DT (min)']); zadt = float(row['Zone Avg DT (min)'])
+                        sty.at[_i,'Avg DT (min)'] = ('background-color:#c8e6c9;color:#1b5e20;font-weight:700' if adt < zadt
+                                                      else 'background-color:#ffcdd2;color:#b71c1c;font-weight:600')
+                    except: pass
+            return sty
+
+        st.dataframe(_bonus_base.style.apply(_style_dar_bonus, axis=None),
+                     use_container_width=True,
+                     height=min(80 + len(_bonus_base) * 38, 600))
+        st.caption(f"🟢 Eligible · 🔴 Not eligible  |  Weeks assessed: {', '.join([w.strftime('%d %b') for w in sorted(_dar_4wks)])}")
+
+        # ── Download ──
+        st.download_button("⬇️ Download DAR Bonus Report",
+                           data=excel_bytes(_bonus_base, "DAR Bonus"),
+                           file_name="DAR_Monthly_Bonus.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
     # ─── Section C: Regional Bonus Calculator ───────────────
     st.markdown("### 💰 C. Regional Rider Bonus Calculator")
@@ -3638,1441 +4915,179 @@ with tab5:
                              mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 # ═══════════════════════════════════════════════════════════════
-# TAB 6 — STAFF MONTHLY BONUS TRACKER
+
+# ═══════════════════════════════════════════════════════════════
+# TAB 6 — QUICK ACCESS & TOOLS
 # ═══════════════════════════════════════════════════════════════
 with tab6:
-    # ─── CSS for bonus tracker styling ───
+    st.markdown('<div class="section-header">🔗 Quick Access & Useful Links</div>', unsafe_allow_html=True)
+
     st.markdown("""
     <style>
-    .kpi-section-hdr {
-        background: linear-gradient(90deg,#FF6B00,#CC5500);
-        color:#fff; font-weight:700; font-size:13px;
-        padding:7px 14px; border-radius:6px; margin:12px 0 6px 0;
+    .qa-section-title {
+        font-size: 15px; font-weight: 700; color: #FF6B00;
+        margin: 20px 0 10px 0; border-bottom: 2px solid #FF6B00;
+        padding-bottom: 4px;
     }
-    .auto-chip {
-        background:#E8F5E9; border:1px solid #4CAF50; border-radius:5px;
-        padding:7px 12px; font-size:12.5px; margin-bottom:4px;
+    .qa-card {
+        background: #fff; border-radius: 10px;
+        border: 1px solid #e8e8e8; border-left: 4px solid #FF6B00;
+        padding: 14px 18px; margin: 8px 0;
+        display: flex; align-items: center; gap: 14px;
     }
-    .manual-chip {
-        background:#FFFDE7; border:1px solid #F9A825; border-radius:5px;
-        padding:7px 12px; font-size:12.5px; margin-bottom:4px;
+    .qa-card-icon { font-size: 28px; flex-shrink: 0; }
+    .qa-card-title { font-weight: 700; font-size: 14px; color: #1a1a2e; margin-bottom: 2px; }
+    .qa-card-desc  { font-size: 12px; color: #666; }
+    .qa-card-link  { margin-left: auto; flex-shrink: 0; }
+    .qa-link-btn {
+        background: #FF6B00; color: #fff; font-weight: 700;
+        padding: 7px 16px; border-radius: 20px; text-decoration: none;
+        font-size: 12px; white-space: nowrap;
     }
-    .score-row {
-        background:#F3F4F6; border-radius:5px;
-        padding:5px 12px; font-size:12px; margin-top:3px;
+    .qa-link-btn:hover { background: #CC5500; color: #fff; }
+    .qa-link-btn-blue {
+        background: #4A6CF7; color: #fff; font-weight: 700;
+        padding: 7px 16px; border-radius: 20px; text-decoration: none;
+        font-size: 12px; white-space: nowrap;
     }
-    .verdict-approved {
-        background: linear-gradient(135deg,#E8F5E9,#C8E6C9);
-        border:2px solid #4CAF50; border-radius:10px;
-        padding:16px 20px; text-align:center; margin-top:12px;
+    .qa-link-btn-green {
+        background: #28a745; color: #fff; font-weight: 700;
+        padding: 7px 16px; border-radius: 20px; text-decoration: none;
+        font-size: 12px; white-space: nowrap;
     }
-    .verdict-rejected {
-        background: linear-gradient(135deg,#FFEBEE,#FFCDD2);
-        border:2px solid #E53935; border-radius:10px;
-        padding:16px 20px; text-align:center; margin-top:12px;
+    .qa-link-btn-purple {
+        background: #6f42c1; color: #fff; font-weight: 700;
+        padding: 7px 16px; border-radius: 20px; text-decoration: none;
+        font-size: 12px; white-space: nowrap;
     }
-    .summary-card {
-        background:#fff; border:1px solid #e0e0e0; border-left:4px solid #FF6B00;
-        border-radius:8px; padding:14px; margin:6px 0;
+    .qa-link-btn-teal {
+        background: #00897b; color: #fff; font-weight: 700;
+        padding: 7px 16px; border-radius: 20px; text-decoration: none;
+        font-size: 12px; white-space: nowrap;
     }
+    .qa-divider { height: 1px; background: #f0f0f0; margin: 8px 0; }
     </style>
     """, unsafe_allow_html=True)
 
-    st.markdown('<div class="section-header">🏆 Staff Monthly Bonus Tracker</div>', unsafe_allow_html=True)
+    # ── SECTION 1: Piki Customer & App ──────────────────────────
+    st.markdown('<div class="qa-section-title">🛵 Piki for Customers</div>', unsafe_allow_html=True)
 
-    # intro banner
     st.markdown("""
-    <div style="background:#FFF4EC;border-left:4px solid #FF6B00;border-radius:8px;
-                padding:12px 16px;margin-bottom:14px;font-size:13px;">
-      <b>How this works:</b> &nbsp;
-      🟢 <b>Green cells</b> are <i>auto-filled</i> from your uploaded data (delivery times, failed orders, rider ratios, regions) — no typing needed. &nbsp;
-      🟡 <b>Yellow cells</b> require <i>manual input</i> (compliance scores, CSAT, FCR, retention, etc.). &nbsp;
-      Results, verdicts and a styled Excel report generate <i>instantly</i> as you fill in values.
+    <div class="qa-card">
+        <div class="qa-card-icon">🌐</div>
+        <div>
+            <div class="qa-card-title">Order Online — Piki Website</div>
+            <div class="qa-card-desc">Place food orders directly from piki.co.tz</div>
+        </div>
+        <div class="qa-card-link">
+            <a class="qa-link-btn" href="https://l.instagram.com/?u=http%3A%2F%2Fwww.piki.co.tz%2F%3Futm_source%3Dig%26utm_medium%3Dsocial%26utm_content%3Dlink_in_bio%26fbclid%3DPAZXh0bgNhZW0CMTEAc3J0YwZhcHBfaWQMMjU2MjgxMDQwNTU4AAGn7eZ35ldpBSy-D3M2qJDnujzDhVbD0d1zTShYR0cQrMjM7Yv1cilEocqbFUo_aem_A-6152u0SGk8Eblm8WbZWg&e=AT6S18r4ghfoqWdFoC3nATHbV3vgIBBJ8_Hwv5g0tLCzkQfyMpMU4XhrkYIpq2cV7q0C5PatptYK9IrN71gHFRVQYaC7xFtGEU-MW2w3hQ" target="_blank">Order Now →</a>
+        </div>
+    </div>
+
+    <div class="qa-card">
+        <div class="qa-card-icon">📱</div>
+        <div>
+            <div class="qa-card-title">Download the Piki App</div>
+            <div class="qa-card-desc">Available on Android & iOS — fast delivery at your fingertips</div>
+        </div>
+        <div class="qa-card-link">
+            <a class="qa-link-btn" href="https://l.instagram.com/?u=https%3A%2F%2Fonelink.to%2F9hp5ge%3Futm_source%3Dig%26utm_medium%3Dsocial%26utm_content%3Dlink_in_bio%26fbclid%3DPAZXh0bgNhZW0CMTEAc3J0YwZhcHBfaWQMMjU2MjgxMDQwNTU4AAGnKzDsjnfmImd588_uM-YOPELOAfZhKk_eat5Qa-uFph9miR4XNLXbTJaA1aw_aem_deEtznh7evXpEZZFYcMukg&e=AT6Fm0P6C4xz7nQ6KPVZatzLubC-Zc7hJ_lXpl3gkg469iK59jachvtP7RgueDuGy6xIYJpV8y7D5FFGfRsmadG4MZT2wRgUMaIzyP5KTQ" target="_blank">Download App →</a>
+        </div>
+    </div>
+
+    <div class="qa-card">
+        <div class="qa-card-icon">📸</div>
+        <div>
+            <div class="qa-card-title">Piki on Instagram</div>
+            <div class="qa-card-desc">Follow @piki.tz for promos, updates & community content</div>
+        </div>
+        <div class="qa-card-link">
+            <a class="qa-link-btn-blue" href="https://www.instagram.com/piki.tz/" target="_blank">Follow Us →</a>
+        </div>
     </div>
     """, unsafe_allow_html=True)
 
-    # ── period label ──
-    _b_period = st.text_input("📅 Assessment Period (e.g. Month 1 – W1 to W4)",
-                               "Month 1 – W1 to W4", key="b_period_lbl")
+    # ── SECTION 2: Internal Tools ──────────────────────────────
+    st.markdown('<div class="qa-section-title">⚙️ Internal Tools & Operations</div>', unsafe_allow_html=True)
 
-    # ════════════════════════════════════════════════════════
-    # AUTO-KPI ENGINE — pull everything from the loaded df
-    # ════════════════════════════════════════════════════════
-    @st.cache_data(show_spinner=False)
-    def _bonus_auto_kpis(_df_hash, df_bytes):
-        """Compute every auto-fillable KPI from the main dataframe."""
-        import hashlib, pickle
-        df_src = pickle.loads(df_bytes)
-        out = {}
-        try:
-            df_s = compute_delivery_stages(df_src.copy())
+    st.markdown(f"""
+    <div class="qa-card">
+        <div class="qa-card-icon">📋</div>
+        <div>
+            <div class="qa-card-title">Weekly Standup Presentation</div>
+            <div class="qa-card-desc">Department updates, weekly highlights & meeting notes</div>
+        </div>
+        <div class="qa-card-link">
+            <a class="qa-link-btn-purple" href="https://docs.google.com/presentation/d/1uHEeI-R2xyaKd9HyAcgPxqDc-3guMtRI7O9WmOPh6UY/edit" target="_blank">Open Slides →</a>
+        </div>
+    </div>
 
-            # ── Average Delivery Time (clean completed, outliers excluded) ──
-            _comp = df_s[df_s['STATE'].isin(['Delivery Completed By Driver','Completed'])].copy()
-            _lims = {'Accepted by Business':(0,30),'Assigned Time':(0,30),
-                     'Accepted by Driver':(0,45),'Driver to Business':(0,45),
-                     'Driver in Business':(0,90),'Pickup to Customer':(0,45),
-                     'Average Delivery Time':(0,100)}
-            for _sc,(_lo,_hi) in _lims.items():
-                if _sc in _comp.columns:
-                    _comp = _comp[(_comp[_sc]>=_lo)&(_comp[_sc]<=_hi)]
-            out['adt']         = round(_comp['Average Delivery Time'].mean(), 1) if not _comp.empty else 0.0
-            out['adt_count']   = len(_comp)
-
-            # ── Failed orders ──
-            _fail = df_s[df_s['STATE'].astype(str).str.contains('Failed|failed', na=False)]
-            out['failed_n']    = len(_fail)
-            out['total_n']     = len(df_s)
-            out['failed_pct']  = round(out['failed_n']/max(out['total_n'],1)*100, 2)
-
-            # ── Rejected orders ──
-            _rej = df_s[df_s['STATE'].astype(str).str.contains('Rejected|rejected', na=False)]
-            out['rejected_n']  = len(_rej)
-            out['rejected_pct']= round(out['rejected_n']/max(out['total_n'],1)*100, 2)
-
-            # ── Weekly failed trend (for reduction calc) ──
-            if 'DELIVERY DATE' in df_s.columns:
-                df_s['_yw'] = (df_s['DELIVERY DATE'].dt.isocalendar().year.astype(str)
-                               +"-W"+df_s['DELIVERY DATE'].dt.isocalendar().week.astype(str).str.zfill(2))
-                _wk_fail = (df_s[df_s['STATE'].astype(str).str.contains('Failed|failed',na=False)]
-                            .groupby('_yw').size())
-                _yw_sorted = sorted(_wk_fail.index.tolist())
-                if len(_yw_sorted) >= 2:
-                    _last2  = [_wk_fail.get(_yw_sorted[-1],0), _wk_fail.get(_yw_sorted[-2],0)]
-                    out['fail_reduction_pct'] = round((_last2[1]-_last2[0])/max(_last2[1],1)*100, 1)
-                else:
-                    out['fail_reduction_pct'] = 0.0
-            else:
-                out['fail_reduction_pct'] = 0.0
-
-            # ── Morning / Peak driver:order ratios ──
-            if 'DELIVERY TIME' in df_s.columns and 'DRIVER ID' in df_s.columns:
-                df_s['_hr'] = pd.to_datetime(df_s['DELIVERY TIME'], errors='coerce').dt.hour
-                _morn  = df_s[df_s['_hr'].between(7,11)]
-                _peak  = df_s[df_s['_hr'].between(12,20)]
-                out['morning_drivers'] = _morn['DRIVER ID'].nunique()
-                out['morning_orders']  = len(_morn)
-                out['morning_ratio']   = round(out['morning_drivers']/max(out['morning_orders'],1), 2)
-                out['peak_drivers']    = _peak['DRIVER ID'].nunique()
-                out['peak_orders']     = len(_peak)
-                out['peak_ratio']      = round(out['peak_drivers']/max(out['peak_orders'],1), 2)
-            else:
-                out.update(morning_drivers=0,morning_orders=0,morning_ratio=0,
-                            peak_drivers=0,peak_orders=0,peak_ratio=0)
-
-            # ── Rider active days (proxy for retention) ──
-            if 'DRIVER ID' in df_s.columns and 'DELIVERY DATE' in df_s.columns:
-                _dr_days = (df_s.groupby('DRIVER ID')['DELIVERY DATE']
-                              .nunique().reset_index(name='active_days'))
-                _tot_dr  = _dr_days['DRIVER ID'].nunique()
-                _active_dr = (_dr_days['active_days'] >= 10).sum()
-                out['driver_retention_pct'] = round(_active_dr/max(_tot_dr,1)*100, 1)
-                out['total_drivers']        = int(_tot_dr)
-                out['active_drivers_10d']   = int(_active_dr)
-            else:
-                out.update(driver_retention_pct=0, total_drivers=0, active_drivers_10d=0)
-
-            # ── Regions on KPI target ──
-            if 'BUSINESS CITY' in df_s.columns:
-                df_s['_yw2'] = (df_s['DELIVERY DATE'].dt.isocalendar().year.astype(str)
-                                +"-W"+df_s['DELIVERY DATE'].dt.isocalendar().week.astype(str).str.zfill(2))
-                _yws  = sorted(df_s['_yw2'].unique())
-                _r_on = 0; _r_tot = 0
-                if len(_yws) >= 2:
-                    _cn = df_s[df_s['_yw2']==_yws[-1]].groupby('BUSINESS CITY').size()
-                    _cp = df_s[df_s['_yw2']==_yws[-2]].groupby('BUSINESS CITY').size()
-                    for _city in _cn.index:
-                        _r_tot += 1
-                        if _cn[_city] >= _cp.get(_city,0)*(1+GROWTH_RATE): _r_on += 1
-                out['regions_on']      = _r_on
-                out['regions_total']   = _r_tot
-                out['regions_pct']     = round(_r_on/max(_r_tot,1)*100,1)
-            else:
-                out.update(regions_on=0, regions_total=0, regions_pct=0)
-
-            # ── Weekly order volume for w1-w4 split ──
-            if 'DELIVERY DATE' in df_s.columns:
-                _by_wk = (df_s.groupby('_yw').size()
-                           .reset_index(name='orders').sort_values('_yw').tail(4))
-                out['wk_orders'] = _by_wk['orders'].tolist()
-                out['wk_labels'] = _by_wk['_yw'].tolist()
-            else:
-                out['wk_orders'] = [0,0,0,0]
-                out['wk_labels'] = ['W1','W2','W3','W4']
-        except Exception as _e:
-            st.warning(f"Auto-KPI engine error: {_e}")
-        return out
-
-    # Run engine (cache by df shape+hash)
-    import pickle, hashlib
-    _df_bytes  = pickle.dumps(df[['STATE','DELIVERY DATE','DELIVERY TIME','DRIVER ID',
-                                   'BUSINESS CITY','SUBTOTAL'] if 'BUSINESS CITY' in df.columns
-                                  else ['STATE','DELIVERY DATE','DELIVERY TIME','DRIVER ID','SUBTOTAL']].head(5000))
-    _df_hash   = hashlib.md5(_df_bytes).hexdigest()
-    _auto      = _bonus_auto_kpis(_df_hash, _df_bytes)
-
-    # ── Auto-data reference expander ──
-    with st.expander("🔍 Auto-filled Data Reference (from your dataset)", expanded=False):
-        _ref_rows = [
-            ("Avg Delivery Time (clean)", f"{_auto.get('adt',0):.1f} min",          f"From {_auto.get('adt_count',0):,} clean completed orders"),
-            ("Failed Orders",             f"{_auto.get('failed_n',0):,} orders",    f"{_auto.get('failed_pct',0):.2f}% of total {_auto.get('total_n',0):,}"),
-            ("Failed Order Reduction",    f"{_auto.get('fail_reduction_pct',0):+.1f}%","vs previous week"),
-            ("Rejected Orders",           f"{_auto.get('rejected_n',0):,}",          f"{_auto.get('rejected_pct',0):.2f}% rejection rate"),
-            ("Morning Driver:Order Ratio",f"{_auto.get('morning_ratio',0):.2f}",    f"{_auto.get('morning_drivers',0)} drivers / {_auto.get('morning_orders',0)} orders (07–11h)"),
-            ("Peak Driver:Order Ratio",   f"{_auto.get('peak_ratio',0):.2f}",       f"{_auto.get('peak_drivers',0)} drivers / {_auto.get('peak_orders',0)} orders (12–20h)"),
-            ("Driver Retention (≥10 days)",f"{_auto.get('driver_retention_pct',0):.1f}%",f"{_auto.get('active_drivers_10d',0)} of {_auto.get('total_drivers',0)} drivers"),
-            ("Regions on KPI Target",     f"{_auto.get('regions_on',0)}/{_auto.get('regions_total',0)}",f"{_auto.get('regions_pct',0):.1f}% — based on 1.2% WoW growth"),
-        ]
-        _ref_df = pd.DataFrame(_ref_rows, columns=['KPI','Auto Value','Source / Notes'])
-        st.dataframe(_ref_df, use_container_width=True, hide_index=True)
-
-    # ── Scoring helpers ──
-    def _pct_band(val, bands):
-        """bands = list of (min_threshold, score_pct) in descending order."""
-        for thr, pct in sorted(bands, reverse=True):
-            if val >= thr: return pct
-        return 0.0
-
-    def _score_bar(earned, max_val, label=""):
-        pct = earned/max_val*100 if max_val else 0
-        col_fill = "#FF6B00" if pct>=75 else ("#FF8C3A" if pct>=50 else "#FFD9B3")
-        return (f'<div class="score-row"><b style="color:#333;">{label}</b> &nbsp;'
-                f'<span style="color:{col_fill};font-weight:700;">TSh {earned:,}</span>'
-                f' / TSh {max_val:,} &nbsp;'
-                f'<span style="background:{col_fill};color:#fff;border-radius:3px;'
-                f'padding:1px 7px;font-size:11px;">{pct:.0f}%</span></div>')
-
-    def _pt_bar(earned, max_pts, label=""):
-        pct = earned/max_pts*100 if max_pts else 0
-        col_fill = "#FF6B00" if pct>=75 else ("#FF8C3A" if pct>=50 else "#FFD9B3")
-        return (f'<div class="score-row"><b style="color:#333;">{label}</b> &nbsp;'
-                f'<span style="color:{col_fill};font-weight:700;">{earned}/{max_pts} pts</span>'
-                f' &nbsp;<span style="background:{col_fill};color:#fff;border-radius:3px;'
-                f'padding:1px 7px;font-size:11px;">{pct:.0f}%</span></div>')
-
-    # ════════════════════════════════════════════════════════════
-    # THREE ROLE SUB-TABS
-    # ════════════════════════════════════════════════════════════
-    _btab1, _btab2, _btab3 = st.tabs([
-        "🏢 Head of Operations",
-        "📞 Head of Customer Service",
-        "📍 Zonal Manager",
-    ])
-
-    # ══════════════════════════════════════════════════════
-    # ROLE 1 — HEAD OF OPERATIONS  (TSh 400,000 max)
-    # ══════════════════════════════════════════════════════
-    with _btab1:
-        st.markdown("### 🏢 Head of Operations — Monthly Bonus Assessment")
-        st.caption("Max Bonus: TSh 400,000 &nbsp;|&nbsp; Period = 4 consecutive weeks")
-
-        # ── KPI 1: Delivery Time — AUTO ──
-        st.markdown('<div class="kpi-section-hdr">KPI 1 – Delivery Time Performance &nbsp;|&nbsp; Weight: 25% &nbsp;|&nbsp; Max: TSh 100,000</div>', unsafe_allow_html=True)
-        _h1_adt = _auto.get('adt', 0)
-        st.markdown(f'<div class="auto-chip">🟢 <b>Auto-filled from data:</b> &nbsp; Average Delivery Time = <b>{_h1_adt:.1f} min</b> &nbsp; (from {_auto.get("adt_count",0):,} clean completed orders, outliers excluded)</div>', unsafe_allow_html=True)
-        if _h1_adt == 0:    _h1_kpi1_s = 0.0
-        elif _h1_adt <= 41: _h1_kpi1_s = 1.00
-        elif _h1_adt <= 43: _h1_kpi1_s = 0.75
-        elif _h1_adt <= 45: _h1_kpi1_s = 0.50
-        else:               _h1_kpi1_s = 0.00
-        _h1_kpi1_p = int(100000 * _h1_kpi1_s)
-        st.markdown(_score_bar(_h1_kpi1_p, 100000, "KPI 1 Payout:") + "&nbsp;&nbsp;<small style='color:#888;'>≤41 min→100% | ≤43→75% | ≤45→50% | >45→0%</small>", unsafe_allow_html=True)
-
-        # ── KPI 2: Rider Availability — MANUAL ──
-        st.markdown('<div class="kpi-section-hdr">KPI 2 – Rider Availability & Utilisation &nbsp;|&nbsp; Weight: 20% &nbsp;|&nbsp; Max: TSh 80,000</div>', unsafe_allow_html=True)
-        st.markdown('<div class="manual-chip">🟡 <b>Manual input:</b> Active rider hours ÷ planned rider hours × 100</div>', unsafe_allow_html=True)
-        _h1_avail = st.number_input("Rider Availability % (actual ÷ planned × 100)", 0.0, 100.0, 0.0, 0.5, key="h1_avail", format="%.1f")
-        _h1_kpi2_s = _pct_band(_h1_avail, [(95,1.0),(85,0.75),(80,0.5)])
-        _h1_kpi2_p = int(80000 * _h1_kpi2_s)
-        st.markdown(_score_bar(_h1_kpi2_p, 80000, "KPI 2 Payout:") + "&nbsp;&nbsp;<small style='color:#888;'>≥95%→100% | 85–94%→75% | 80–84%→50% | &lt;80%→0%</small>", unsafe_allow_html=True)
-
-        # ── KPI 3: Rider Compliance — MANUAL ──
-        st.markdown('<div class="kpi-section-hdr">KPI 3 – Rider Compliance & Professional Standards &nbsp;|&nbsp; Weight: 15% &nbsp;|&nbsp; Max: TSh 60,000</div>', unsafe_allow_html=True)
-        st.markdown('<div class="manual-chip">🟡 <b>Manual input:</b> Compliance score % (uniform, safety, complaints, incidents)</div>', unsafe_allow_html=True)
-        _h1_comp = st.number_input("Compliance Score %", 0.0, 100.0, 0.0, 0.5, key="h1_comp", format="%.1f")
-        _h1_kpi3_s = _pct_band(_h1_comp, [(95,1.0),(90,0.75),(85,0.5)])
-        _h1_kpi3_p = int(60000 * _h1_kpi3_s)
-        st.markdown(_score_bar(_h1_kpi3_p, 60000, "KPI 3 Payout:") + "&nbsp;&nbsp;<small style='color:#888;'>≥95%→100% | 90–94%→75% | 85–89%→50% | &lt;85%→0%</small>", unsafe_allow_html=True)
-
-        # ── KPI 4: Regional Performance — AUTO ──
-        st.markdown('<div class="kpi-section-hdr">KPI 4 – Regional Performance Management &nbsp;|&nbsp; Weight: 20% &nbsp;|&nbsp; Max: TSh 80,000</div>', unsafe_allow_html=True)
-        _h1_reg_pct = _auto.get('regions_pct', 0)
-        st.markdown(f'<div class="auto-chip">🟢 <b>Auto-filled:</b> &nbsp; {_auto.get("regions_on",0)} of {_auto.get("regions_total",0)} regions on the 1.2% growth KPI target = <b>{_h1_reg_pct:.1f}%</b></div>', unsafe_allow_html=True)
-        _h1_kpi4_s = _pct_band(_h1_reg_pct, [(90,1.0),(80,0.75),(70,0.5)])
-        _h1_kpi4_p = int(80000 * _h1_kpi4_s)
-        st.markdown(_score_bar(_h1_kpi4_p, 80000, "KPI 4 Payout:") + "&nbsp;&nbsp;<small style='color:#888;'>≥90%→100% | 80–89%→75% | 70–79%→50% | &lt;70%→0%</small>", unsafe_allow_html=True)
-
-        # ── KPI 5: Rider Performance Reviews — MANUAL ──
-        st.markdown('<div class="kpi-section-hdr">KPI 5 – Rider Performance Reviews &nbsp;|&nbsp; Weight: 20% &nbsp;|&nbsp; Max: TSh 80,000</div>', unsafe_allow_html=True)
-        st.markdown('<div class="manual-chip">🟡 <b>Manual input:</b> % riders reviewed + documented scorecards + improvement plans completed</div>', unsafe_allow_html=True)
-        _h1_rev = st.number_input("% Riders fully reviewed this month", 0.0, 100.0, 0.0, 0.5, key="h1_rev", format="%.1f")
-        _h1_kpi5_s = _pct_band(_h1_rev, [(95,1.0),(85,0.75),(75,0.5)])
-        _h1_kpi5_p = int(80000 * _h1_kpi5_s)
-        st.markdown(_score_bar(_h1_kpi5_p, 80000, "KPI 5 Payout:") + "&nbsp;&nbsp;<small style='color:#888;'>≥95%→100% | 85–94%→75% | 75–84%→50% | &lt;75%→0%</small>", unsafe_allow_html=True)
-
-        # ── TOTAL + VERDICT ──
-        _h1_total = _h1_kpi1_p + _h1_kpi2_p + _h1_kpi3_p + _h1_kpi4_p + _h1_kpi5_p
-        _h1_pct   = _h1_total / 400000 * 100
-        st.divider()
-
-        _verdict_class = "verdict-approved" if _h1_total > 0 else "verdict-rejected"
-        _verdict_icon  = "✅" if _h1_total > 0 else "❌"
-        _verdict_text  = "BONUS APPROVED" if _h1_total > 0 else "NO BONUS — all KPIs scored 0"
-        st.markdown(f"""
-        <div class="{_verdict_class}">
-          <div style="font-size:28px;">{_verdict_icon}</div>
-          <div style="font-size:20px;font-weight:800;margin:4px 0;">{_verdict_text}</div>
-          <div style="font-size:30px;font-weight:900;color:#FF6B00;">TSh {_h1_total:,}</div>
-          <div style="font-size:13px;color:#555;">out of TSh 400,000 maximum ({_h1_pct:.1f}% achieved)</div>
-        </div>""", unsafe_allow_html=True)
-
-        # Visualisation
-        st.markdown("#### 📊 KPI Breakdown Visualisation")
-        _fig_h1, (_ax_h1a, _ax_h1b) = plt.subplots(1, 2, figsize=(12, 4.5))
-        _h1_labels  = ['KPI 1\nDelivery Time\n(25%)', 'KPI 2\nRider Avail.\n(20%)',
-                        'KPI 3\nCompliance\n(15%)', 'KPI 4\nRegional\n(20%)', 'KPI 5\nReviews\n(20%)']
-        _h1_earned  = [_h1_kpi1_p, _h1_kpi2_p, _h1_kpi3_p, _h1_kpi4_p, _h1_kpi5_p]
-        _h1_maxvals = [100000, 80000, 60000, 80000, 80000]
-        _h1_colors  = ['#FF6B00' if e==m else ('#FF8C3A' if e>0 else '#FFD9B3') for e,m in zip(_h1_earned, _h1_maxvals)]
-        _ax_h1a.bar(range(5), _h1_maxvals, color='#FFD9B3', width=0.55, zorder=1)
-        _ax_h1a.bar(range(5), _h1_earned,  color=_h1_colors, width=0.55, zorder=2)
-        for i,(e,m) in enumerate(zip(_h1_earned, _h1_maxvals)):
-            _ax_h1a.text(i, m+2500, f"Max\n{m//1000}k", ha='center', fontsize=7.5, color='#999')
-            if e>0: _ax_h1a.text(i, e/2, f"TSh\n{e//1000}k", ha='center', fontsize=8.5, fontweight='bold', color='white')
-        _ax_h1a.set_xticks(range(5)); _ax_h1a.set_xticklabels(_h1_labels, fontsize=8.5)
-        _ax_h1a.set_ylabel("TSh"); _ax_h1a.set_title("KPI Bonus Breakdown (TSh)", fontweight='bold')
-        _ax_h1a.yaxis.set_major_formatter(plt.FuncFormatter(lambda x,_: f"{int(x/1000)}k"))
-        _ax_h1a.grid(True, axis='y', alpha=0.25)
-        # Donut chart total
-        _h1_remaining = 400000 - _h1_total
-        _ax_h1b.pie([_h1_total, max(_h1_remaining,0)],
-                    labels=[f'Earned\nTSh {_h1_total:,}', f'Remaining\nTSh {max(_h1_remaining,0):,}'],
-                    colors=['#FF6B00','#FFD9B3'], startangle=90, wedgeprops={'width':0.55},
-                    autopct='%1.0f%%', pctdistance=0.75, textprops={'fontsize':10})
-        _ax_h1b.set_title(f"Bonus Achievement\n{_h1_pct:.1f}% of Maximum", fontweight='bold')
-        plt.tight_layout()
-        st.pyplot(_fig_h1); plt.close()
-
-        # ── Download Excel ──
-        def _build_h1_excel():
-            import openpyxl
-            from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
-            wb = openpyxl.Workbook(); ws = wb.active; ws.title = "Head of Ops"
-            _thin = Border(left=Side(style='thin'),right=Side(style='thin'),
-                           top=Side(style='thin'),bottom=Side(style='thin'))
-            _fill_or  = PatternFill("solid", fgColor="FF6B00")
-            _fill_or2 = PatternFill("solid", fgColor="FFD9B3")
-            _fill_grn = PatternFill("solid", fgColor="E8F5E9")
-            _fill_yel = PatternFill("solid", fgColor="FFFDE7")
-            _fill_hdr = PatternFill("solid", fgColor="2D2D2D")
-            _fill_tot = PatternFill("solid", fgColor="FFF4EC")
-            _f_wh = Font(color="FFFFFF", bold=True, size=11)
-            _f_or = Font(color="FF6B00", bold=True, size=12)
-            _f_b  = Font(bold=True)
-            _ctr  = Alignment(horizontal='center', vertical='center', wrap_text=True)
-            _lft  = Alignment(horizontal='left',   vertical='center', wrap_text=True)
-            # column widths
-            for col,w in [('A',38),('B',18),('C',36),('D',12),('E',16),('F',16)]:
-                ws.column_dimensions[col].width = w
-            ws.row_dimensions[1].height = 28; ws.row_dimensions[4].height = 18
-            # Title
-            ws.merge_cells("A1:F1")
-            _c = ws["A1"]; _c.value = "HEAD OF OPERATIONS – MONTHLY BONUS TRACKER"
-            _c.fill = _fill_or; _c.font = _f_wh; _c.alignment = _ctr
-            ws["A2"] = "Period:"; ws["B2"] = _b_period; ws["A2"].font = _f_b
-            ws["A3"] = f"Assessment generated by Piki BI Dashboard  |  Total auto-KPIs from {_auto.get('total_n',0):,} orders"
-            ws["A3"].font = Font(italic=True, color="888888", size=9)
-            ws.merge_cells("A3:F3")
-            # Column headers
-            for ci,(hdr) in enumerate(["KPI Description","Value","Target / Scoring Rule","Score %","Max (TSh)","Earned (TSh)"],1):
-                _c2 = ws.cell(4, ci, hdr); _c2.fill = _fill_hdr; _c2.font = _f_wh; _c2.alignment = _ctr; _c2.border = _thin
-            # Data rows
-            _rows_h1 = [
-                ("KPI 1 – Avg Delivery Time", f"{_h1_adt:.1f} min (AUTO)", "≤41→100% | ≤43→75% | ≤45→50% | >45→0%", _h1_kpi1_s, 100000, _h1_kpi1_p, True),
-                ("KPI 2 – Rider Availability %", f"{_h1_avail:.1f}% (MANUAL)", "≥95%→100% | 85–94%→75% | 80–84%→50% | <80%→0%", _h1_kpi2_s, 80000, _h1_kpi2_p, False),
-                ("KPI 3 – Rider Compliance %", f"{_h1_comp:.1f}% (MANUAL)", "≥95%→100% | 90–94%→75% | 85–89%→50% | <85%→0%", _h1_kpi3_s, 60000, _h1_kpi3_p, False),
-                ("KPI 4 – Regions on Target %", f"{_h1_reg_pct:.1f}% (AUTO)", "≥90%→100% | 80–89%→75% | 70–79%→50% | <70%→0%", _h1_kpi4_s, 80000, _h1_kpi4_p, True),
-                ("KPI 5 – Rider Reviews %", f"{_h1_rev:.1f}% (MANUAL)", "≥95%→100% | 85–94%→75% | 75–84%→50% | <75%→0%", _h1_kpi5_s, 80000, _h1_kpi5_p, False),
-            ]
-            for ri, (desc, val, tgt, sc, mx, earned, is_auto) in enumerate(_rows_h1, 5):
-                ws.row_dimensions[ri].height = 20
-                _vf = _fill_grn if is_auto else _fill_yel
-                for ci, v in enumerate([desc, val, tgt, f"{sc*100:.0f}%", mx, earned], 1):
-                    _c3 = ws.cell(ri, ci, v); _c3.border = _thin
-                    _c3.alignment = _ctr if ci >= 3 else _lft
-                    if ci == 2: _c3.fill = _vf
-                    if ci == 4: _c3.font = _f_b
-                    if ci == 6: _c3.font = _f_or; _c3.number_format = '#,##0'
-                    if ci == 5: _c3.number_format = '#,##0'
-            # Total row
-            _tr = len(_rows_h1) + 5
-            ws.row_dimensions[_tr].height = 24
-            ws.merge_cells(f"A{_tr}:D{_tr}")
-            _tc = ws.cell(_tr, 1, "TOTAL BONUS EARNED"); _tc.fill = _fill_tot; _tc.font = Font(bold=True,size=12); _tc.alignment = _ctr; _tc.border = _thin
-            ws.cell(_tr, 5, 400000).number_format = '#,##0'; ws.cell(_tr,5).border = _thin
-            _te = ws.cell(_tr, 6, _h1_total); _te.fill = _fill_tot; _te.font = Font(bold=True,color="FF6B00",size=13); _te.number_format = '#,##0'; _te.border = _thin; _te.alignment = _ctr
-            # Verdict
-            _vr = _tr + 1; ws.row_dimensions[_vr].height = 22
-            ws.merge_cells(f"A{_vr}:E{_vr}")
-            ws.cell(_vr,1, "RESULT VERDICT").font = Font(bold=True); ws.cell(_vr,1).alignment = _ctr; ws.cell(_vr,1).border = _thin
-            _vc = ws.cell(_vr, 6, "✅ APPROVED" if _h1_total>0 else "❌ NO BONUS")
-            _vc.font = Font(bold=True, color="008000" if _h1_total>0 else "CC0000"); _vc.border = _thin; _vc.alignment = _ctr
-            # Legend
-            _lr = _vr + 2
-            ws.cell(_lr,1,"🟢 Green = auto-filled from data  |  🟡 Yellow = manual input").font = Font(italic=True,color="888888",size=9)
-            ws.merge_cells(f"A{_lr}:F{_lr}")
-            buf = io.BytesIO(); wb.save(buf); buf.seek(0); return buf.read()
-
-        st.download_button("⬇️ Download Head of Ops Bonus Sheet (Excel)",
-            data=_build_h1_excel(),
-            file_name=f"HeadOfOps_Bonus_{_b_period.replace(' ','_').replace('–','to')}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key="dl_h1_bonus")
-
-    # ══════════════════════════════════════════════════════
-    # ROLE 2 — HEAD OF CUSTOMER SERVICE  (TSh 400,000 max)
-    # ══════════════════════════════════════════════════════
-    with _btab2:
-        st.markdown("### 📞 Head of Customer Service — Monthly Bonus Assessment")
-        st.caption("Max Bonus: TSh 400,000 &nbsp;|&nbsp; Period = 4 consecutive weeks")
-
-        # KPI 1 — CSAT (manual)
-        st.markdown('<div class="kpi-section-hdr">KPI 1 – Customer Satisfaction (CSAT) &nbsp;|&nbsp; Weight: 30% &nbsp;|&nbsp; Max: TSh 120,000</div>', unsafe_allow_html=True)
-        st.markdown('<div class="manual-chip">🟡 <b>Manual:</b> Positive ratings (4.5–5 stars) ÷ total responses × 100</div>', unsafe_allow_html=True)
-        _h2_csat = st.number_input("CSAT % (positive ÷ total × 100)", 0.0, 100.0, 0.0, 0.5, key="h2_csat", format="%.1f")
-        _h2_k1_s = _pct_band(_h2_csat, [(95,1.0),(85,0.75),(80,0.5)])
-        _h2_k1_p = int(120000 * _h2_k1_s)
-        st.markdown(_score_bar(_h2_k1_p,120000,"KPI 1 Payout:")+"&nbsp;&nbsp;<small style='color:#888;'>≥95%→100% | 85–94%→75% | 80–84%→50% | &lt;80%→0%</small>", unsafe_allow_html=True)
-
-        # KPI 2 — FCR (manual)
-        st.markdown('<div class="kpi-section-hdr">KPI 2 – First Contact Resolution (FCR) &nbsp;|&nbsp; Weight: 15% &nbsp;|&nbsp; Max: TSh 60,000</div>', unsafe_allow_html=True)
-        st.markdown('<div class="manual-chip">🟡 <b>Manual:</b> Resolved on first contact ÷ total contacts × 100</div>', unsafe_allow_html=True)
-        _h2_fcr = st.number_input("FCR %", 0.0, 100.0, 0.0, 0.5, key="h2_fcr", format="%.1f")
-        _h2_k2_s = _pct_band(_h2_fcr, [(80,1.0),(75,0.5)])
-        _h2_k2_p = int(60000 * _h2_k2_s)
-        st.markdown(_score_bar(_h2_k2_p,60000,"KPI 2 Payout:")+"&nbsp;&nbsp;<small style='color:#888;'>≥80%→100% | 75–79%→50% | &lt;75%→0%</small>", unsafe_allow_html=True)
-
-        # KPI 3 — SLA / AHT / Unanswered (all 3 conditions)
-        st.markdown('<div class="kpi-section-hdr">KPI 3 – SLA & Call Handling Efficiency &nbsp;|&nbsp; Weight: 20% &nbsp;|&nbsp; Max: TSh 80,000 &nbsp;(ALL 3 conditions required)</div>', unsafe_allow_html=True)
-        st.markdown('<div class="manual-chip">🟡 <b>Manual — three sub-metrics, all conditions needed for full payout</b></div>', unsafe_allow_html=True)
-        _h2c1, _h2c2, _h2c3 = st.columns(3)
-        with _h2c1:
-            _h2_sla = st.number_input("3a — SLA Met (%)", 0.0, 100.0, 0.0, 0.5, key="h2_sla", format="%.1f")
-            _h2_sla_ok = _h2_sla >= 90
-            st.markdown(f"{'✅ Target met (≥90%)' if _h2_sla_ok else '❌ Below target (<90%)'}")
-        with _h2c2:
-            _h2_aht = st.number_input("3b — Avg Handle Time (min)", 0.0, 30.0, 0.0, 0.1, key="h2_aht", format="%.1f")
-            _h2_aht_ok = _h2_aht <= 1.0 and _h2_aht >= 0
-            st.markdown(f"{'✅ Target met (≤1 min)' if _h2_aht_ok else '❌ Above target (>1 min)'}")
-        with _h2c3:
-            _h2_unans = st.number_input("3c — Unanswered Calls (%)", 0.0, 100.0, 0.0, 0.1, key="h2_unans", format="%.1f")
-            _h2_unans_ok = _h2_unans <= 1.0
-            st.markdown(f"{'✅ Target met (≤1%)' if _h2_unans_ok else '❌ Above target (>1%)'}")
-        _h2_k3_conds = sum([_h2_sla_ok, _h2_aht_ok, _h2_unans_ok])
-        _h2_k3_s = 1.0 if _h2_k3_conds == 3 else (0.5 if _h2_k3_conds == 2 else 0.0)
-        _h2_k3_p = int(80000 * _h2_k3_s)
-        st.markdown(_score_bar(_h2_k3_p,80000,"KPI 3 Payout:")+f"&nbsp;&nbsp;<small style='color:#888;'>{_h2_k3_conds}/3 conditions met — All 3→100% | 2/3→50% | &lt;2→0%</small>", unsafe_allow_html=True)
-
-        # KPI 4 — Schedule Adherence (manual)
-        st.markdown('<div class="kpi-section-hdr">KPI 4 – Agent Productivity / Schedule Adherence &nbsp;|&nbsp; Weight: 15% &nbsp;|&nbsp; Max: TSh 60,000</div>', unsafe_allow_html=True)
-        st.markdown('<div class="manual-chip">🟡 <b>Manual:</b> Schedule adherence rate (%)</div>', unsafe_allow_html=True)
-        _h2_adhr = st.number_input("Schedule Adherence %", 0.0, 100.0, 0.0, 0.5, key="h2_adhr", format="%.1f")
-        _h2_k4_s = _pct_band(_h2_adhr, [(95,1.0),(90,0.5)])
-        _h2_k4_p = int(60000 * _h2_k4_s)
-        st.markdown(_score_bar(_h2_k4_p,60000,"KPI 4 Payout:")+"&nbsp;&nbsp;<small style='color:#888;'>≥95%→100% | 90–94%→50% | &lt;90%→0%</small>", unsafe_allow_html=True)
-
-        # KPI 5 — Failed Order Reduction (auto-assisted)
-        st.markdown('<div class="kpi-section-hdr">KPI 5 – Failed Order Cost Reduction &nbsp;|&nbsp; Weight: 20% &nbsp;|&nbsp; Max: TSh 80,000</div>', unsafe_allow_html=True)
-        _h2_fail_auto = _auto.get('fail_reduction_pct', 0)
-        st.markdown(f'<div class="auto-chip">🟢 <b>Auto-reference:</b> Failed order rate = <b>{_auto.get("failed_pct",0):.2f}%</b> ({_auto.get("failed_n",0):,} failed / {_auto.get("total_n",0):,} orders). &nbsp; Estimated week-on-week reduction: <b>{_h2_fail_auto:+.1f}%</b></div>', unsafe_allow_html=True)
-        st.markdown('<div class="manual-chip">🟡 <b>Manual override:</b> Enter the actual month-on-month failed order rate reduction %</div>', unsafe_allow_html=True)
-        _h2_fail_red = st.number_input("Failed order rate reduction vs previous month (%)", -50.0, 100.0,
-                                        max(0.0, float(_h2_fail_auto)), 0.1, key="h2_fail_red", format="%.1f",
-                                        help="Positive = improvement (fewer failed orders). Auto-value pre-filled from data but you can override.")
-        _h2_k5_s = 1.0 if _h2_fail_red >= 15 else (0.5 if _h2_fail_red >= 6 else 0.0)
-        _h2_k5_p = int(80000 * _h2_k5_s)
-        st.markdown(_score_bar(_h2_k5_p,80000,"KPI 5 Payout:")+"&nbsp;&nbsp;<small style='color:#888;'>≥15% reduction→100% | 6–14%→50% | &lt;5%→0%</small>", unsafe_allow_html=True)
-
-        # ── TOTAL + VERDICT ──
-        _h2_total = _h2_k1_p + _h2_k2_p + _h2_k3_p + _h2_k4_p + _h2_k5_p
-        _h2_pct   = _h2_total / 400000 * 100
-        st.divider()
-        _v2_class = "verdict-approved" if _h2_total > 0 else "verdict-rejected"
-        _v2_icon  = "✅" if _h2_total > 0 else "❌"
-        _v2_text  = "BONUS APPROVED" if _h2_total > 0 else "NO BONUS — all KPIs scored 0"
-        st.markdown(f"""
-        <div class="{_v2_class}">
-          <div style="font-size:28px;">{_v2_icon}</div>
-          <div style="font-size:20px;font-weight:800;margin:4px 0;">{_v2_text}</div>
-          <div style="font-size:30px;font-weight:900;color:#FF6B00;">TSh {_h2_total:,}</div>
-          <div style="font-size:13px;color:#555;">out of TSh 400,000 maximum ({_h2_pct:.1f}% achieved)</div>
-        </div>""", unsafe_allow_html=True)
-
-        st.markdown("#### 📊 KPI Breakdown Visualisation")
-        _fig_h2, (_ax_h2a, _ax_h2b) = plt.subplots(1, 2, figsize=(12, 4.5))
-        _h2_labels  = ['KPI 1\nCSAT\n(30%)', 'KPI 2\nFCR\n(15%)', 'KPI 3\nSLA/AHT\n(20%)', 'KPI 4\nAdherence\n(15%)', 'KPI 5\nFailed Red.\n(20%)']
-        _h2_earned  = [_h2_k1_p, _h2_k2_p, _h2_k3_p, _h2_k4_p, _h2_k5_p]
-        _h2_maxvals = [120000, 60000, 80000, 60000, 80000]
-        _h2_colors  = ['#FF6B00' if e==m else ('#FF8C3A' if e>0 else '#FFD9B3') for e,m in zip(_h2_earned, _h2_maxvals)]
-        _ax_h2a.bar(range(5), _h2_maxvals, color='#FFD9B3', width=0.55, zorder=1)
-        _ax_h2a.bar(range(5), _h2_earned,  color=_h2_colors, width=0.55, zorder=2)
-        for i,(e,m) in enumerate(zip(_h2_earned, _h2_maxvals)):
-            _ax_h2a.text(i, m+2500, f"Max\n{m//1000}k", ha='center', fontsize=7.5, color='#999')
-            if e>0: _ax_h2a.text(i, e/2, f"TSh\n{e//1000}k", ha='center', fontsize=8.5, fontweight='bold', color='white')
-        _ax_h2a.set_xticks(range(5)); _ax_h2a.set_xticklabels(_h2_labels, fontsize=8.5)
-        _ax_h2a.set_ylabel("TSh"); _ax_h2a.set_title("KPI Bonus Breakdown (TSh)", fontweight='bold')
-        _ax_h2a.yaxis.set_major_formatter(plt.FuncFormatter(lambda x,_: f"{int(x/1000)}k"))
-        _ax_h2a.grid(True, axis='y', alpha=0.25)
-        _h2_rem = 400000 - _h2_total
-        _ax_h2b.pie([_h2_total, max(_h2_rem,0)],
-                    labels=[f'Earned\nTSh {_h2_total:,}',f'Remaining\nTSh {max(_h2_rem,0):,}'],
-                    colors=['#FF6B00','#FFD9B3'], startangle=90, wedgeprops={'width':0.55},
-                    autopct='%1.0f%%', pctdistance=0.75, textprops={'fontsize':10})
-        _ax_h2b.set_title(f"Bonus Achievement\n{_h2_pct:.1f}% of Maximum", fontweight='bold')
-        plt.tight_layout(); st.pyplot(_fig_h2); plt.close()
-
-        def _build_h2_excel():
-            import openpyxl
-            from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
-            wb2 = openpyxl.Workbook(); ws2 = wb2.active; ws2.title = "Head of CS"
-            _thin2 = Border(left=Side(style='thin'),right=Side(style='thin'),top=Side(style='thin'),bottom=Side(style='thin'))
-            _fo2 = PatternFill("solid",fgColor="FF6B00"); _fh2 = PatternFill("solid",fgColor="2D2D2D")
-            _fg2 = PatternFill("solid",fgColor="E8F5E9"); _fy2 = PatternFill("solid",fgColor="FFFDE7")
-            _ft2 = PatternFill("solid",fgColor="FFF4EC")
-            _fw2 = Font(color="FFFFFF",bold=True,size=11); _fb2 = Font(bold=True)
-            _fo2f = Font(color="FF6B00",bold=True,size=12); _ctr2 = Alignment(horizontal='center',vertical='center',wrap_text=True)
-            _lft2 = Alignment(horizontal='left',vertical='center',wrap_text=True)
-            for col,w in [('A',38),('B',20),('C',38),('D',12),('E',16),('F',16)]: ws2.column_dimensions[col].width = w
-            ws2.merge_cells("A1:F1"); _c2 = ws2["A1"]
-            _c2.value = "HEAD OF CUSTOMER SERVICE – MONTHLY BONUS TRACKER"
-            _c2.fill = _fo2; _c2.font = _fw2; _c2.alignment = _ctr2; ws2.row_dimensions[1].height = 28
-            ws2["A2"] = "Period:"; ws2["B2"] = _b_period; ws2["A2"].font = _fb2
-            for ci,hdr in enumerate(["KPI Description","Value","Target / Scoring","Score %","Max (TSh)","Earned (TSh)"],1):
-                _cc = ws2.cell(4,ci,hdr); _cc.fill = _fh2; _cc.font = _fw2; _cc.alignment = _ctr2; _cc.border = _thin2
-            _rows_h2 = [
-                ("KPI 1 – CSAT %",                   f"{_h2_csat:.1f}% (MANUAL)", "≥95→100% | 85–94→75% | 80–84→50% | <80→0%", _h2_k1_s, 120000, _h2_k1_p, False),
-                ("KPI 2 – First Contact Resolution %",f"{_h2_fcr:.1f}% (MANUAL)",  "≥80→100% | 75–79→50% | <75→0%",              _h2_k2_s, 60000, _h2_k2_p,  False),
-                ("KPI 3 – SLA/AHT/Unanswered",        f"SLA:{_h2_sla:.0f}% AHT:{_h2_aht:.1f}m Unans:{_h2_unans:.1f}%","All 3 met→100% | 2/3→50% | <2→0%", _h2_k3_s, 80000, _h2_k3_p, False),
-                ("KPI 4 – Schedule Adherence %",      f"{_h2_adhr:.1f}% (MANUAL)", "≥95→100% | 90–94→50% | <90→0%",               _h2_k4_s, 60000, _h2_k4_p,  False),
-                ("KPI 5 – Failed Order Reduction %",  f"{_h2_fail_red:.1f}% (MANUAL/AUTO)", "≥15→100% | 6–14→50% | <5→0%",         _h2_k5_s, 80000, _h2_k5_p,  False),
-            ]
-            for ri,(_desc,_val,_tgt,_sc,_mx,_earned,_is_auto) in enumerate(_rows_h2,5):
-                ws2.row_dimensions[ri].height = 20
-                for ci,v in enumerate([_desc,_val,_tgt,f"{_sc*100:.0f}%",_mx,_earned],1):
-                    _c3 = ws2.cell(ri,ci,v); _c3.border = _thin2; _c3.alignment = _ctr2 if ci>=3 else _lft2
-                    if ci==2: _c3.fill = _fg2 if _is_auto else _fy2
-                    if ci==4: _c3.font = _fb2
-                    if ci==6: _c3.font = _fo2f; _c3.number_format='#,##0'
-                    if ci==5: _c3.number_format='#,##0'
-            _tr2 = len(_rows_h2)+5; ws2.row_dimensions[_tr2].height = 24
-            ws2.merge_cells(f"A{_tr2}:D{_tr2}")
-            ws2.cell(_tr2,1,"TOTAL BONUS EARNED").fill=_ft2; ws2.cell(_tr2,1).font=Font(bold=True,size=12); ws2.cell(_tr2,1).alignment=_ctr2; ws2.cell(_tr2,1).border=_thin2
-            ws2.cell(_tr2,5,400000).number_format='#,##0'; ws2.cell(_tr2,5).border=_thin2
-            _te2=ws2.cell(_tr2,6,_h2_total); _te2.fill=_ft2; _te2.font=Font(bold=True,color="FF6B00",size=13); _te2.number_format='#,##0'; _te2.border=_thin2; _te2.alignment=_ctr2
-            _vr2=_tr2+1; ws2.cell(_vr2,6,"✅ APPROVED" if _h2_total>0 else "❌ NO BONUS").font=Font(bold=True,color="008000" if _h2_total>0 else "CC0000"); ws2.cell(_vr2,6).border=_thin2; ws2.cell(_vr2,6).alignment=_ctr2
-            buf2 = io.BytesIO(); wb2.save(buf2); buf2.seek(0); return buf2.read()
-
-        st.download_button("⬇️ Download Head of CS Bonus Sheet (Excel)",
-            data=_build_h2_excel(),
-            file_name=f"HeadOfCS_Bonus_{_b_period.replace(' ','_').replace('–','to')}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_h2_bonus")
-
-    # ══════════════════════════════════════════════════════
-    # ROLE 3 — ZONAL MANAGER  (20 points scoring)
-    # ══════════════════════════════════════════════════════
-    with _btab3:
-        st.markdown("### 📍 Zonal Operations Manager — Monthly Bonus Assessment")
-        st.caption("Max Score: 20 Points &nbsp;|&nbsp; Minimum threshold to earn bonus: 14/20 &nbsp;|&nbsp; Period = 4 consecutive weeks")
-
-        # Identity
-        _zm_c1, _zm_c2 = st.columns(2)
-        _zm_name = _zm_c1.text_input("Manager Name", "", key="zm_name_inp")
-        _zm_zone = _zm_c2.text_input("Zone / City", "", key="zm_zone_inp")
-
-        # ── KPI 1 — Driver Availability (5 pts) ──
-        st.markdown('<div class="kpi-section-hdr">KPI 1 – Driver Availability &nbsp;|&nbsp; 5 Points</div>', unsafe_allow_html=True)
-        _morn_r = _auto.get('morning_ratio', 0)
-        _peak_r  = _auto.get('peak_ratio', 0)
-        st.markdown(f'<div class="auto-chip">🟢 <b>Auto-reference from data:</b> Morning driver:order ratio = <b>{_morn_r:.2f}</b> ({_auto.get("morning_drivers",0)} drivers / {_auto.get("morning_orders",0)} orders, 07–11h) &nbsp;|&nbsp; Peak ratio = <b>{_peak_r:.2f}</b> ({_auto.get("peak_drivers",0)} drivers / {_auto.get("peak_orders",0)} orders, 12–20h)</div>', unsafe_allow_html=True)
-
-        _zm1_col1, _zm1_col2, _zm1_col3 = st.columns(3)
-        with _zm1_col1:
-            st.markdown("**1a — Morning Hours Ratio** *(2 pts max)*")
-            st.caption("Enter weekly driver:order ratios (e.g. 1.3 = 1.3 drivers per order). Auto-reference above.")
-            _z1a = [st.number_input(f"W{i+1} Morning ratio", 0.0, 5.0, float(round(_morn_r,2)), 0.05, key=f"z1a_w{i}", format="%.2f") for i in range(4)]
-        with _zm1_col2:
-            st.markdown("**1b — Peak Hours Ratio** *(1 pt max)*")
-            st.caption("Peak hours driver:order ratio per week")
-            _z1b = [st.number_input(f"W{i+1} Peak ratio", 0.0, 5.0, float(round(_peak_r,2)), 0.05, key=f"z1b_w{i}", format="%.2f") for i in range(4)]
-        with _zm1_col3:
-            st.markdown("**1c — Monthly Availability %** *(2 pts max)*")
-            st.caption("Actual ÷ required drivers × 100 per week")
-            _dr_ret = _auto.get('driver_retention_pct', 0)
-            _z1c = [st.number_input(f"W{i+1} Availability %", 0.0, 100.0, float(_dr_ret), 0.5, key=f"z1c_w{i}", format="%.1f") for i in range(4)]
-
-        _z1a_avg = float(np.mean(_z1a)); _z1b_avg = float(np.mean(_z1b)); _z1c_avg = float(np.mean(_z1c))
-        _z_kpi1a = 2 if _z1a_avg >= 1.2 else (1 if _z1a_avg >= 1.0 else 0)
-        _z_kpi1b = 1 if _z1b_avg >= 1.2 else 0
-        _z_kpi1c = 2 if _z1c_avg >= 90 else (1 if _z1c_avg >= 80 else 0)
-        _z_kpi1  = _z_kpi1a + _z_kpi1b + _z_kpi1c
-        st.markdown(_pt_bar(_z_kpi1, 5, "KPI 1 Total:") + f"&nbsp;&nbsp;<small style='color:#888;'>1a:{_z_kpi1a}/2 | 1b:{_z_kpi1b}/1 | 1c:{_z_kpi1c}/2</small>", unsafe_allow_html=True)
-
-        # ── KPI 2 — Delivery Time (4 pts) — AUTO ──
-        st.markdown('<div class="kpi-section-hdr">KPI 2 – Delivery Time Performance &nbsp;|&nbsp; 4 Points</div>', unsafe_allow_html=True)
-        _zm_dt_target = st.number_input("Zone delivery time target (minutes)", 25.0, 90.0, 45.0, 1.0, key="zm_dt_tgt")
-        _zm_adt = _auto.get('adt', 0)
-        _zm_dev = round(_zm_adt - _zm_dt_target, 1)
-        _dev_colour = "#28a745" if _zm_dev <= 0 else "#dc3545"
-        st.markdown(f'<div class="auto-chip">🟢 <b>Auto-filled:</b> Avg Delivery Time = <b>{_zm_adt:.1f} min</b> &nbsp;|&nbsp; Zone Target = {_zm_dt_target:.0f} min &nbsp;|&nbsp; Deviation = <b style="color:{_dev_colour};">{_zm_dev:+.1f} min</b> {"✅ faster than target" if _zm_dev<=0 else "⚠️ slower than target"}</div>', unsafe_allow_html=True)
-        _z_kpi2 = 4 if _zm_dev<=-5 else (3 if _zm_dev<=-2 else (2 if _zm_dev<=0 else (1 if _zm_dev<=3 else 0)))
-        st.markdown(_pt_bar(_z_kpi2, 4, "KPI 2 Score:") + "&nbsp;&nbsp;<small style='color:#888;'>≤−5min→4pts | ≤−2→3 | on target→2 | ≤+3→1 | >+3→0</small>", unsafe_allow_html=True)
-
-        # ── KPI 3 — Compliance (2 pts) — manual ──
-        st.markdown('<div class="kpi-section-hdr">KPI 3 – Driver Appearance & Compliance &nbsp;|&nbsp; 2 Points</div>', unsafe_allow_html=True)
-        st.markdown('<div class="manual-chip">🟡 <b>Manual:</b> Compliance rate % per week (uniform, grooming, in-app, customer relations)</div>', unsafe_allow_html=True)
-        _z3_cols = st.columns(4)
-        _z3 = [_z3_cols[i].number_input(f"W{i+1} %", 0.0, 100.0, 0.0, 0.5, key=f"z3_w{i}", format="%.1f") for i in range(4)]
-        _z3_avg = float(np.mean(_z3))
-        _z_kpi3 = 2 if _z3_avg >= 95 else (1 if _z3_avg >= 85 else 0)
-        st.markdown(_pt_bar(_z_kpi3, 2, "KPI 3 Score:") + f"&nbsp;&nbsp;<small style='color:#888;'>Avg: {_z3_avg:.1f}% — ≥95→2pts | 85–94→1 | &lt;85→0</small>", unsafe_allow_html=True)
-
-        # ── KPI 4 — Driver Retention (2 pts) — auto-assisted ──
-        st.markdown('<div class="kpi-section-hdr">KPI 4 – Driver Retention ≥80% active ≥10 days/month &nbsp;|&nbsp; 2 Points</div>', unsafe_allow_html=True)
-        _zm_ret_auto = _auto.get('driver_retention_pct', 0)
-        st.markdown(f'<div class="auto-chip">🟢 <b>Auto-reference:</b> Drivers with ≥10 active delivery days = <b>{_zm_ret_auto:.1f}%</b> ({_auto.get("active_drivers_10d",0)} of {_auto.get("total_drivers",0)} drivers)</div>', unsafe_allow_html=True)
-        st.markdown('<div class="manual-chip">🟡 Confirm or override per-week retention % below</div>', unsafe_allow_html=True)
-        _z4_cols = st.columns(4)
-        _z4 = [_z4_cols[i].number_input(f"W{i+1} Retention %", 0.0, 100.0, float(_zm_ret_auto), 0.5, key=f"z4_w{i}", format="%.1f") for i in range(4)]
-        _z4_avg = float(np.mean(_z4))
-        _z_kpi4 = 2 if _z4_avg >= 80 else (1 if _z4_avg >= 70 else 0)
-        st.markdown(_pt_bar(_z_kpi4, 2, "KPI 4 Score:") + f"&nbsp;&nbsp;<small style='color:#888;'>Avg: {_z4_avg:.1f}% — ≥80%→2pts | 70–79%→1 | &lt;70%→0</small>", unsafe_allow_html=True)
-
-        # ── KPI 5 — Performance Reviews (3 pts) — manual ──
-        st.markdown('<div class="kpi-section-hdr">KPI 5 – Delivery Performance Reviews &nbsp;|&nbsp; 3 Points</div>', unsafe_allow_html=True)
-        st.markdown('<div class="manual-chip">🟡 <b>Manual — 3 sub-components per week</b></div>', unsafe_allow_html=True)
-        _z5_a_col, _z5_b_col, _z5_c_col = st.columns(3)
-        with _z5_a_col:
-            st.markdown("**5a — % Drivers Reviewed**")
-            _z5a = [st.number_input(f"W{i+1} % reviewed", 0.0,100.0,0.0,0.5,key=f"z5a_w{i}",format="%.1f") for i in range(4)]
-        with _z5_b_col:
-            st.markdown("**5b — Follow-up within 2 days?** *(1=Yes / 0=No)*")
-            _z5b = [st.number_input(f"W{i+1}",0,1,0,1,key=f"z5b_w{i}") for i in range(4)]
-        with _z5_c_col:
-            st.markdown("**5c — Documented improvement actions?** *(1=Yes / 0=No)*")
-            _z5c = [st.number_input(f"W{i+1}",0,1,0,1,key=f"z5c_w{i}") for i in range(4)]
-        _z5a_avg=float(np.mean(_z5a)); _z5b_avg=float(np.mean(_z5b)); _z5c_avg=float(np.mean(_z5c))
-        _z_kpi5a = 1 if _z5a_avg>=80 else 0
-        _z_kpi5b = 1 if _z5b_avg>=0.75 else 0
-        _z_kpi5c = 1 if _z5c_avg>=0.75 else 0
-        _z_kpi5  = _z_kpi5a + _z_kpi5b + _z_kpi5c
-        st.markdown(_pt_bar(_z_kpi5, 3, "KPI 5 Score:") + f"&nbsp;&nbsp;<small style='color:#888;'>5a:{_z_kpi5a}/1 | 5b:{_z_kpi5b}/1 | 5c:{_z_kpi5c}/1</small>", unsafe_allow_html=True)
-
-        # ── KPI 6 — Reporting Accuracy (2 pts) — manual ──
-        st.markdown('<div class="kpi-section-hdr">KPI 6 – Reporting Accuracy &nbsp;|&nbsp; 2 Points</div>', unsafe_allow_html=True)
-        st.markdown('<div class="manual-chip">🟡 <b>Manual:</b> 2 = Full & on time | 1 = Minor issues | 0 = Failed/late</div>', unsafe_allow_html=True)
-        _z6_cols = st.columns(4)
-        _z6 = [_z6_cols[i].number_input(f"W{i+1} (0/1/2)", 0, 2, 2, 1, key=f"z6_w{i}") for i in range(4)]
-        _z6_avg = float(np.mean(_z6))
-        _z_kpi6 = 2 if _z6_avg >= 1.75 else (1 if _z6_avg >= 1.0 else 0)
-        st.markdown(_pt_bar(_z_kpi6, 2, "KPI 6 Score:") + f"&nbsp;&nbsp;<small style='color:#888;'>Avg: {_z6_avg:.2f} — ≥1.75→2pts | ≥1.0→1 | &lt;1→0</small>", unsafe_allow_html=True)
-
-        # ── KPI 7 — Issues Resolution (2 pts) — manual ──
-        st.markdown('<div class="kpi-section-hdr">KPI 7 – Issues Resolution &nbsp;|&nbsp; 2 Points</div>', unsafe_allow_html=True)
-        st.markdown('<div class="manual-chip">🟡 <b>Manual:</b> 2 = All resolved promptly | 1 = Most | 0 = Poor</div>', unsafe_allow_html=True)
-        _z7_cols = st.columns(4)
-        _z7 = [_z7_cols[i].number_input(f"W{i+1} (0/1/2)", 0, 2, 2, 1, key=f"z7_w{i}") for i in range(4)]
-        _z7_avg = float(np.mean(_z7))
-        _z_kpi7 = 2 if _z7_avg >= 1.75 else (1 if _z7_avg >= 1.0 else 0)
-        st.markdown(_pt_bar(_z_kpi7, 2, "KPI 7 Score:") + f"&nbsp;&nbsp;<small style='color:#888;'>Avg: {_z7_avg:.2f} — ≥1.75→2pts | ≥1.0→1 | &lt;1→0</small>", unsafe_allow_html=True)
-
-        # ── TOTAL SCORE + VERDICT ──
-        _zm_total = _z_kpi1 + _z_kpi2 + _z_kpi3 + _z_kpi4 + _z_kpi5 + _z_kpi6 + _z_kpi7
-        if _zm_total >= 18:   _zm_band = "🌟 Exceptional"; _zm_colour = "#FF6B00"; _zm_ok = True
-        elif _zm_total >= 16: _zm_band = "✅ Meets Expectations"; _zm_colour = "#28a745"; _zm_ok = True
-        elif _zm_total >= 14: _zm_band = "⚠️ Needs Improvement"; _zm_colour = "#f39c12"; _zm_ok = True
-        else:                  _zm_band = "❌ Below Threshold"; _zm_colour = "#dc3545"; _zm_ok = False
-        st.divider()
-        _vz_class = "verdict-approved" if _zm_ok else "verdict-rejected"
-        st.markdown(f"""
-        <div class="{_vz_class}">
-          <div style="font-size:26px;">{_zm_band}</div>
-          <div style="font-size:36px;font-weight:900;color:{_zm_colour};">{_zm_total} / 20</div>
-          <div style="font-size:14px;color:#555;">Manager: <b>{_zm_name or '—'}</b> &nbsp;|&nbsp; Zone: <b>{_zm_zone or '—'}</b></div>
-          <div style="font-size:13px;color:#555;margin-top:4px;">{'✅ BONUS ENTITLED — minimum threshold of 14/20 met' if _zm_ok else '❌ NO BONUS — score below minimum threshold of 14/20'}</div>
-        </div>""", unsafe_allow_html=True)
-
-        # ── Visualisation ──
-        st.markdown("#### 📊 Score Breakdown Visualisation")
-        _fig_zm, (_ax_zma, _ax_zmb) = plt.subplots(1, 2, figsize=(14, 5))
-        _zm_kpi_labels = ['KPI1\nAvailability\n(5pts)','KPI2\nDelivery\nTime (4)','KPI3\nCompliance\n(2)','KPI4\nRetention\n(2)','KPI5\nReviews\n(3)','KPI6\nReporting\n(2)','KPI7\nResolution\n(2)']
-        _zm_scores  = [_z_kpi1, _z_kpi2, _z_kpi3, _z_kpi4, _z_kpi5, _z_kpi6, _z_kpi7]
-        _zm_maxpts  = [5, 4, 2, 2, 3, 2, 2]
-        _zm_fill_c  = ['#FF6B00' if s==m else ('#FF8C3A' if s>0 else '#FFD9B3') for s,m in zip(_zm_scores,_zm_maxpts)]
-        _ax_zma.bar(range(7), _zm_maxpts, color='#FFD9B3', width=0.6, zorder=1)
-        _ax_zma.bar(range(7), _zm_scores, color=_zm_fill_c, width=0.6, zorder=2)
-        for i,(s,m) in enumerate(zip(_zm_scores, _zm_maxpts)):
-            _ax_zma.text(i, m+0.12, f"{m}pt", ha='center', fontsize=8, color='#aaa')
-            if s>0: _ax_zma.text(i, s/2, str(s), ha='center', fontsize=11, fontweight='bold', color='white')
-        _ax_zma.set_xticks(range(7)); _ax_zma.set_xticklabels(_zm_kpi_labels, fontsize=8.5)
-        _ax_zma.set_ylabel("Points"); _ax_zma.set_ylim(0, 6.5)
-        _ax_zma.set_title(f"Score Breakdown — {_zm_name or 'Zonal Manager'} ({_zm_zone or '?'})", fontweight='bold')
-        _ax_zma.axhline(0, color='#ddd', lw=0.5); _ax_zma.grid(True, axis='y', alpha=0.25)
-        # Gauge-style donut
-        _ax_zmb.pie([_zm_total, max(20-_zm_total,0)],
-                    labels=[f'Scored\n{_zm_total} pts', f'Remaining\n{max(20-_zm_total,0)} pts'],
-                    colors=[_zm_colour,'#FFD9B3'], startangle=90, wedgeprops={'width':0.55},
-                    autopct='%1.0f%%', pctdistance=0.75, textprops={'fontsize':11})
-        _ax_zmb.set_title(f"Total Score: {_zm_total}/20\n{_zm_band}", fontweight='bold')
-        # Threshold marker
-        _ax_zmb.text(0, 0, f"Min: 14\n{'✅ PASS' if _zm_ok else '❌ FAIL'}",
-                     ha='center', va='center', fontsize=12, fontweight='bold',
-                     color='#008000' if _zm_ok else '#CC0000')
-        plt.tight_layout(); st.pyplot(_fig_zm); plt.close()
-
-        def _build_zm_excel():
-            import openpyxl
-            from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
-            wb3 = openpyxl.Workbook(); ws3 = wb3.active; ws3.title = "Zonal Manager"
-            _thin3 = Border(left=Side(style='thin'),right=Side(style='thin'),top=Side(style='thin'),bottom=Side(style='thin'))
-            _fo3 = PatternFill("solid",fgColor="FF6B00"); _fh3 = PatternFill("solid",fgColor="2D2D2D")
-            _fg3 = PatternFill("solid",fgColor="E8F5E9"); _fy3 = PatternFill("solid",fgColor="FFFDE7")
-            _ft3 = PatternFill("solid",fgColor="FFF4EC")
-            _fw3 = Font(color="FFFFFF",bold=True,size=11); _fb3 = Font(bold=True)
-            _fo3f = Font(color="FF6B00",bold=True,size=12)
-            _ctr3 = Alignment(horizontal='center',vertical='center',wrap_text=True)
-            _lft3 = Alignment(horizontal='left',vertical='center',wrap_text=True)
-            for col,w in [('A',32),('B',12),('C',12),('D',12),('E',12),('F',14),('G',12),('H',12)]:
-                ws3.column_dimensions[col].width = w
-            ws3.merge_cells("A1:H1"); _c3t = ws3["A1"]
-            _c3t.value = "ZONAL OPERATIONS MANAGER – MONTHLY BONUS TRACKER"
-            _c3t.fill = _fo3; _c3t.font = _fw3; _c3t.alignment = _ctr3; ws3.row_dimensions[1].height = 28
-            ws3["A2"]="Manager:"; ws3["B2"]=_zm_name; ws3["C2"]="Zone:"; ws3["D2"]=_zm_zone
-            ws3["E2"]="Period:"; ws3["F2"]=_b_period
-            for ci,hdr in enumerate(["KPI","W1","W2","W3","W4","Avg / Auto","Score","Max pts"],1):
-                _hc = ws3.cell(4,ci,hdr); _hc.fill=_fh3; _hc.font=_fw3; _hc.alignment=_ctr3; _hc.border=_thin3
-            _zm_rows = [
-                ("KPI 1a – Morning Driver:Order Ratio", *_z1a, f"{_z1a_avg:.2f} (auto ref)", _z_kpi1a, 2, True),
-                ("KPI 1b – Peak Driver:Order Ratio",    *_z1b, f"{_z1b_avg:.2f} (auto ref)", _z_kpi1b, 1, True),
-                ("KPI 1c – Availability %",             *_z1c, f"{_z1c_avg:.1f}%",           _z_kpi1c, 2, False),
-                ("KPI 2 – Delivery Time Deviation",     "AUTO","AUTO","AUTO","AUTO", f"{_zm_dev:+.1f} min (AUTO)", _z_kpi2, 4, True),
-                ("KPI 3 – Compliance %",                *_z3,  f"{_z3_avg:.1f}%",            _z_kpi3, 2, False),
-                ("KPI 4 – Driver Retention %",          *_z4,  f"{_z4_avg:.1f}% (auto ref)", _z_kpi4, 2, True),
-                ("KPI 5a – % Drivers Reviewed",         *_z5a, f"{_z5a_avg:.0f}%",           _z_kpi5a, 1, False),
-                ("KPI 5b – Follow-up (Yes/No)",         *_z5b, f"{_z5b_avg:.0%}",            _z_kpi5b, 1, False),
-                ("KPI 5c – Actions Documented",         *_z5c, f"{_z5c_avg:.0%}",            _z_kpi5c, 1, False),
-                ("KPI 6 – Reporting Accuracy",          *_z6,  f"{_z6_avg:.2f}",             _z_kpi6, 2, False),
-                ("KPI 7 – Issues Resolution",           *_z7,  f"{_z7_avg:.2f}",             _z_kpi7, 2, False),
-            ]
-            for ri, row_data in enumerate(_zm_rows, 5):
-                _desc, _w1, _w2, _w3, _w4, _avgv, _sc, _mx, _is_auto = row_data
-                ws3.row_dimensions[ri].height = 18
-                for ci, v in enumerate([_desc, _w1, _w2, _w3, _w4, str(_avgv), _sc, _mx], 1):
-                    _rc = ws3.cell(ri, ci, v); _rc.border = _thin3; _rc.alignment = _ctr3 if ci>1 else _lft3
-                    if ci in (2,3,4,5): _rc.fill = _fg3 if _is_auto else _fy3
-                    if ci == 7: _rc.font = _fo3f
-            _tr3 = len(_zm_rows)+5; ws3.row_dimensions[_tr3].height = 26
-            ws3.merge_cells(f"A{_tr3}:F{_tr3}")
-            ws3.cell(_tr3,1,"TOTAL SCORE").fill=_ft3; ws3.cell(_tr3,1).font=Font(bold=True,size=12); ws3.cell(_tr3,1).alignment=_ctr3; ws3.cell(_tr3,1).border=_thin3
-            ws3.cell(_tr3,7,f"{_zm_total}/20").font=Font(bold=True,color="FF6B00",size=14); ws3.cell(_tr3,7).border=_thin3; ws3.cell(_tr3,7).alignment=_ctr3
-            ws3.cell(_tr3,8,"20").border=_thin3; ws3.cell(_tr3,8).alignment=_ctr3
-            _vr3=_tr3+1
-            ws3.merge_cells(f"A{_vr3}:F{_vr3}"); ws3.cell(_vr3,1,_zm_band).fill=_ft3; ws3.cell(_vr3,1).font=Font(bold=True); ws3.cell(_vr3,1).alignment=_ctr3; ws3.cell(_vr3,1).border=_thin3
-            _vs3=ws3.cell(_vr3,7,"✅ ENTITLED" if _zm_ok else "❌ NO BONUS")
-            _vs3.font=Font(bold=True,color="008000" if _zm_ok else "CC0000"); _vs3.border=_thin3; _vs3.alignment=_ctr3
-            buf3=io.BytesIO(); wb3.save(buf3); buf3.seek(0); return buf3.read()
-
-        st.download_button("⬇️ Download Zonal Manager Bonus Sheet (Excel)",
-            data=_build_zm_excel(),
-            file_name=f"ZonalMgr_{(_zm_name or 'Manager').replace(' ','_')}_Bonus_{_b_period.replace(' ','_').replace('–','to')}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_zm_bonus")
-
-    # ══════════════════════════════════════════════════════
-    # COMBINED ALL-STAFF SUMMARY
-    # ══════════════════════════════════════════════════════
-    st.divider()
-    st.markdown("### 📋 Combined Staff Bonus Summary — All Roles")
-    _sum_c1, _sum_c2, _sum_c3 = st.columns(3)
-    with _sum_c1:
-        _h1_pct_disp = _h1_total / 400000 * 100
-        st.markdown(f"""<div class="summary-card">
-          <div style="font-size:13px;font-weight:700;color:#FF6B00;">🏢 Head of Operations</div>
-          <div style="font-size:26px;font-weight:900;color:#333;margin:4px 0;">TSh {_h1_total:,}</div>
-          <div style="font-size:12px;color:#777;">{_h1_pct_disp:.1f}% of TSh 400,000</div>
-          <div style="margin-top:6px;">{"✅ <b>APPROVED</b>" if _h1_total>0 else "❌ <b>NO BONUS</b>"}</div>
-          <div style="background:#FF6B00;height:5px;border-radius:3px;width:{min(_h1_pct_disp,100):.0f}%;margin-top:8px;"></div>
-        </div>""", unsafe_allow_html=True)
-    with _sum_c2:
-        _h2_pct_disp = _h2_total / 400000 * 100
-        st.markdown(f"""<div class="summary-card">
-          <div style="font-size:13px;font-weight:700;color:#FF6B00;">📞 Head of Customer Service</div>
-          <div style="font-size:26px;font-weight:900;color:#333;margin:4px 0;">TSh {_h2_total:,}</div>
-          <div style="font-size:12px;color:#777;">{_h2_pct_disp:.1f}% of TSh 400,000</div>
-          <div style="margin-top:6px;">{"✅ <b>APPROVED</b>" if _h2_total>0 else "❌ <b>NO BONUS</b>"}</div>
-          <div style="background:#FF6B00;height:5px;border-radius:3px;width:{min(_h2_pct_disp,100):.0f}%;margin-top:8px;"></div>
-        </div>""", unsafe_allow_html=True)
-    with _sum_c3:
-        _zm_pct_disp = _zm_total / 20 * 100
-        st.markdown(f"""<div class="summary-card">
-          <div style="font-size:13px;font-weight:700;color:#FF6B00;">📍 Zonal Manager{' — '+_zm_name if _zm_name else ''}</div>
-          <div style="font-size:26px;font-weight:900;color:#333;margin:4px 0;">{_zm_total} / 20 pts</div>
-          <div style="font-size:12px;color:#777;">{_zm_pct_disp:.1f}% of max &nbsp;|&nbsp; {_zm_band}</div>
-          <div style="margin-top:6px;">{"✅ <b>ENTITLED</b>" if _zm_ok else "❌ <b>NOT ENTITLED</b>"}</div>
-          <div style="background:#FF6B00;height:5px;border-radius:3px;width:{min(_zm_pct_disp,100):.0f}%;margin-top:8px;"></div>
-        </div>""", unsafe_allow_html=True)
-
-    # Combined bar chart
-    st.markdown("#### 📊 Overall Achievement — All Roles")
-    _fig_all, _ax_all = plt.subplots(figsize=(10, 3.5))
-    _all_roles = ['Head of Operations', 'Head of CS', f'Zonal Manager\n({_zm_name or "—"})']
-    _all_pcts  = [_h1_total/400000*100, _h2_total/400000*100, _zm_total/20*100]
-    _all_cols  = ['#FF6B00' if p>=75 else ('#FF8C3A' if p>=50 else '#FFD9B3') for p in _all_pcts]
-    _hbars = _ax_all.barh(_all_roles, _all_pcts, color=_all_cols, height=0.45, zorder=2)
-    _ax_all.axvline(100, color='#28a745', linestyle='--', lw=1.5, alpha=0.8, label='100% (full bonus)')
-    _ax_all.axvline(75, color='#FF6B00',  linestyle=':', lw=1.2, alpha=0.7, label='75% (good performance)')
-    for _hb, _pv in zip(_hbars, _all_pcts):
-        _ax_all.text(min(_pv,99)+1, _hb.get_y()+_hb.get_height()/2,
-                     f'{_pv:.1f}%', va='center', fontsize=11, fontweight='bold', color='#333')
-    _ax_all.set_xlim(0, 115); _ax_all.set_xlabel("Achievement (% of maximum)")
-    _ax_all.set_title(f"Staff Bonus Achievement — {_b_period}", fontweight='bold', fontsize=13)
-    _ax_all.legend(fontsize=9, loc='lower right'); _ax_all.grid(True, axis='x', alpha=0.25)
-    plt.tight_layout(); st.pyplot(_fig_all); plt.close()
-
-    # Master download — all 3 roles in one Excel workbook
-    def _build_master_excel():
-        import openpyxl
-        from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
-        _thin_m = Border(left=Side(style='thin'),right=Side(style='thin'),top=Side(style='thin'),bottom=Side(style='thin'))
-        wbm = openpyxl.Workbook()
-        # ── Summary sheet ──
-        wsm = wbm.active; wsm.title = "Summary"
-        _fo_m = PatternFill("solid",fgColor="FF6B00"); _fw_m = Font(color="FFFFFF",bold=True,size=11)
-        _fh_m = PatternFill("solid",fgColor="2D2D2D"); _ft_m = PatternFill("solid",fgColor="FFF4EC")
-        _ctr_m = Alignment(horizontal='center',vertical='center',wrap_text=True)
-        wsm.merge_cells("A1:F1"); wsm["A1"]="PIKI STAFF MONTHLY BONUS — COMBINED SUMMARY"
-        wsm["A1"].fill=_fo_m; wsm["A1"].font=_fw_m; wsm["A1"].alignment=_ctr_m; wsm.row_dimensions[1].height=28
-        wsm["A2"]=f"Period: {_b_period}"; wsm["A2"].font=Font(bold=True); wsm.merge_cells("A2:F2")
-        for ci,hdr in enumerate(["Role","Bonus Earned","Max Possible","Achievement %","Status","Band"],1):
-            _hc=wsm.cell(4,ci,hdr); _hc.fill=_fh_m; _hc.font=_fw_m; _hc.alignment=_ctr_m; _hc.border=_thin_m
-        for ci,w in [('A',28),('B',18),('C',18),('D',16),('E',18),('F',22)]: wsm.column_dimensions[ci].width=w
-        _summ_rows = [
-            ("Head of Operations",      f"TSh {_h1_total:,}", "TSh 400,000", f"{_h1_total/400000*100:.1f}%", "✅ Approved" if _h1_total>0 else "❌ No Bonus", "—"),
-            ("Head of Customer Service",f"TSh {_h2_total:,}", "TSh 400,000", f"{_h2_total/400000*100:.1f}%", "✅ Approved" if _h2_total>0 else "❌ No Bonus", "—"),
-            (f"Zonal Mgr – {_zm_name or '?'} ({_zm_zone or '?'})", f"{_zm_total}/20 pts", "20 pts", f"{_zm_total/20*100:.1f}%", "✅ Entitled" if _zm_ok else "❌ Not Entitled", _zm_band),
-        ]
-        for ri, row in enumerate(_summ_rows, 5):
-            wsm.row_dimensions[ri].height=20
-            for ci, v in enumerate(row,1):
-                _rc=wsm.cell(ri,ci,v); _rc.border=_thin_m; _rc.alignment=_ctr_m
-                if ci==5:
-                    _rc.font=Font(bold=True,color="008000" if "✅" in str(v) else "CC0000")
-        # ── individual sheets ──
-        for _ws_func, _ws_title in [(_build_h1_excel,"Head of Ops"), (_build_h2_excel,"Head of CS"), (_build_zm_excel,"Zonal Manager")]:
-            _wb_tmp = openpyxl.load_workbook(io.BytesIO(_ws_func()))
-            _ws_src = _wb_tmp.active
-            _ws_dst = wbm.create_sheet(title=_ws_title)
-            for row in _ws_src.iter_rows():
-                for cell in row:
-                    _nc = _ws_dst.cell(row=cell.row, column=cell.column, value=cell.value)
-                    if cell.has_style:
-                        try: _nc.font = cell.font.copy()
-                        except: pass
-                        try: _nc.fill = cell.fill.copy()
-                        except: pass
-                        try: _nc.alignment = cell.alignment.copy()
-                        except: pass
-                        try: _nc.border = cell.border.copy()
-                        except: pass
-            for col, dim in _ws_src.column_dimensions.items():
-                _ws_dst.column_dimensions[col].width = dim.width
-        buf_m = io.BytesIO(); wbm.save(buf_m); buf_m.seek(0); return buf_m.read()
-
-    st.download_button(
-        "⬇️ Download FULL Bonus Report — All 3 Roles (Excel)",
-        data=_build_master_excel(),
-        file_name=f"Piki_Staff_Bonus_All_Roles_{_b_period.replace(' ','_').replace('–','to')}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key="dl_master_bonus",
-        type="primary"
-    )
-
-
-# ─────────────────────────────────────────────────
-
-
-
-# ═══════════════════════════════════════════════════════════════
-# TAB 7 — DEPARTMENT KPIs
-# ═══════════════════════════════════════════════════════════════
-with tab7:
-    st.markdown('<div class="section-header">🏢 Department KPIs — Weekly Intelligence Hub</div>', unsafe_allow_html=True)
-
-    # ── CSS ──────────────────────────────────────────────────────
-    st.markdown("""
-    <style>
-    .dept-card {
-        background:#fff; border-radius:10px; border:1px solid #e0e0e0;
-        border-left:4px solid #FF6B00; padding:14px 18px; margin-bottom:10px;
-    }
-    .dept-card-title { font-size:14px; font-weight:700; color:#FF6B00; margin-bottom:6px; }
-    .slide-card {
-        background:#F8F9FF; border-radius:8px; border:1px solid #d0d8ff;
-        border-left:4px solid #4A6CF7; padding:14px 18px; margin:8px 0;
-    }
-    .slide-dept-badge {
-        display:inline-block; background:#4A6CF7; color:#fff;
-        font-size:10px; font-weight:700; padding:2px 8px;
-        border-radius:20px; margin-bottom:6px; letter-spacing:0.5px;
-    }
-    .slide-title { font-weight:700; color:#2c3e50; font-size:14px; margin-bottom:6px; }
-    .slide-body  { font-size:12.5px; color:#444; line-height:1.7; }
-    .slide-meta  { font-size:11px; color:#888; margin-top:6px; }
-    .tracker-status-done   { background:#E8F5E9; color:#28a745; padding:2px 8px; border-radius:10px; font-weight:700; font-size:11px; }
-    .tracker-status-prog   { background:#FFF3E0; color:#FF6B00; padding:2px 8px; border-radius:10px; font-weight:700; font-size:11px; }
-    .tracker-status-review { background:#E3F2FD; color:#1565C0; padding:2px 8px; border-radius:10px; font-weight:700; font-size:11px; }
-    .tracker-status-todo   { background:#F5F5F5; color:#666; padding:2px 8px; border-radius:10px; font-weight:700; font-size:11px; }
-    .erp-project-card {
-        background:#F8FFF9; border-radius:8px; border:1px solid #b2dfdb;
-        border-left:4px solid #00897b; padding:10px 16px; margin:5px 0;
-        display:flex; justify-content:space-between; align-items:center;
-    }
-    .erp-proj-name { font-weight:700; font-size:13px; color:#004d40; }
-    .erp-proj-status-open { color:#FF6B00; font-weight:700; font-size:12px; }
-    .erp-proj-status-done { color:#28a745; font-weight:700; font-size:12px; }
-    .erp-proj-pct { font-size:20px; font-weight:800; color:#00897b; }
-    </style>
+    <div class="qa-card">
+        <div class="qa-card-icon">📝</div>
+        <div>
+            <div class="qa-card-title">Content Team Tracker</div>
+            <div class="qa-card-desc">Content submissions, status tracking & work pipeline</div>
+        </div>
+        <div class="qa-card-link">
+            <a class="qa-link-btn-green" href="https://docs.google.com/spreadsheets/d/1nk_a_aObBK7njLGKzz_Eghr2WXUwJRARw5m9Iiugqlo/edit" target="_blank">Open Tracker →</a>
+        </div>
+    </div>
     """, unsafe_allow_html=True)
 
-    # ─── CONSTANTS ────────────────────────────────────────────────
-    SLIDES_PRES_ID = "1uHEeI-R2xyaKd9HyAcgPxqDc-3guMtRI7O9WmOPh6UY"
-    SHEETS_DOC_ID  = "1nk_a_aObBK7njLGKzz_Eghr2WXUwJRARw5m9Iiugqlo"
-    TRACKER_SHEET  = "Trackers"
-    ERP_BASE       = "http://erp.piki.co.tz"
+    # ── SECTION 3: ERP Links ────────────────────────────────────
+    st.markdown('<div class="qa-section-title">🏗️ ERP — Project Management</div>', unsafe_allow_html=True)
 
-    # ── Service account JSON baked directly into the app ──────────
-    _SA_INFO = {
-        "type": "service_account",
-        "project_id": "weekly-report-488807",
-        "private_key_id": "fddd809eee878dd686d3c9a8c8b471c061bfb637",
-        "private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDP7JBCM0CXCXVH\n0O6kjWUTrngelrSUdC/egdewiWDcZ13XI83B5CjxzSolRdcmGr7fVY1P9lC1UIx3\nZTaPYuyRMn1gfJFniEiRZp9P4tErKSHo5G/JJAdS8kr/gWCfPprfZqaxL9eLMCHk\nAPS4g3WQ0WiQp9pjgYdIIs486f7KxfF4UbpBoOz6TC6muw3+Bj9xW/xPmDLiofKg\ntPD5Je6E8QiLWPqhv3IpegH8d6OUKeMEe650VKmuNBLjLH/9ZALUSa1BOADM1ktx\naWLi5krJoLW0E39Qt9mMK8CZ6wt7Br2kzAhABqBbhN8ddpacprftGZLowXg4E7vC\nFCVSmR/RAgMBAAECggEAGAzQaN/dxjqhVrO7jswOF3c0TLF45L0FtnKFXNWfHw9T\nwulQyO8Xr1RgXhxUdQNd9Z5DMK8Yicht3veVloNGQss4xlrSRMv2PN9GaSqesCPb\nWMFnjrf8ouMEusYfw3ut1U5d1JvojiB8ow9bPyZxiFU4h5bqw1y9paHlAhW8035Z\nPVUyvqOt/Sbk385Rp8tsb48l7zzByJoVEfvoCJW/Llkt0tJ9+RspOYW6cJugYY8N\n1DerNtZd1ASZ7W6oH17w90MbbES/SdAEguUTu7UXAF3+HnDBfpx3rnqe25pT3nLF\nb80lcaHyoHdu+rAYjDB00ylrjPnCgOt8MnVZYyg2owKBgQD+daOkOmZIvip8oq3A\nM3Pmumz3PxJbdg3uqIvLwO/kQQ4ppSstJiKwQ0+nhf+Q9HNybjjnzguu/DA7dwi9\nyZjr66kNQoNwK24IPHZ4lH/BwQhS66VObugVyTIUMOb91y8vFm9YWLwu6vqwCNSM\nbp99JSZ8zy/mZkbT+NRThpCg9wKBgQDRLs3Cr+8XgCIZiJzqbv/S6j7jWSP9XtaF\nendkUhqXoHT1J3KEMmAtnzbmiG7R5VEL7HpZJbd40QkyLjN6ImYwC1MUscCv0Nyk\nkjiUiRmqbzVNecyZfebapKfefB+2at2oCKS+8GD59hFWMzW+3HRgZdZBdxYnmqcp\nm4FOce3bdwKBgQCRsqAZR8sLOb+wD6G3HH7vjK0ZwMZtEiKWFXG+H+H76vgGBmm7\nd0uDa3cvb71OrXlw+wWgTM1Jy2J+mgCqUsU5yHzKd9w0nNlq49vd3QFt2m4+tGi5\niS1gVAxVnU6V5+E/b/QfPOe7YZZatyOkqS6vBFeOPT+rB8LkWmSQ0sr7LwKBgAKn\n1XTjRuXFeqlYUqWnQxgqYSIBv7M3wQFwzJM5d5z1LIbwOUP0X8Q0gT3r/XwsrRq5\npdP75phiDvvUGlMynJl/i0538zpILITqVk2McAb54nNZWH+aWZPtAzSP3tcyBB5d\n/blu08xYk1/ExqnlopSWtmGeYWmfTP/6OWoFiD+BAoGBAIJFWGljPhDoT0yY40xa\nQHGNH3XjL2lrW9MwCXhW5qk5TYy8z/4yJdCmRrAJNc7u6hd5pqkF1Fe2KmSjWj6z\n+WfdwTfhuZ79aN5BlyGAKCcQ3frWECLrs9eOydh1c7UiA5PzoNkOqlzNOUNOfMPb\nEWtF9LB78ae0WDelxbpCZ2sl\n-----END PRIVATE KEY-----\n",
-        "client_email": "weekly-report@weekly-report-488807.iam.gserviceaccount.com",
-        "client_id": "101726571385090204082",
-        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-        "token_uri": "https://oauth2.googleapis.com/token",
-        "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-        "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/weekly-report%40weekly-report-488807.iam.gserviceaccount.com",
-        "universe_domain": "googleapis.com"
-    }
+    st.markdown("""
+    <div class="qa-card">
+        <div class="qa-card-icon">📁</div>
+        <div>
+            <div class="qa-card-title">General Projects</div>
+            <div class="qa-card-desc">All active company projects and tasks</div>
+        </div>
+        <div class="qa-card-link">
+            <a class="qa-link-btn-teal" href="http://erp.piki.co.tz/app/projects" target="_blank">Open ERP →</a>
+        </div>
+    </div>
 
-    _GOOGLE_SCOPES_DEPT = [
-        "https://www.googleapis.com/auth/presentations.readonly",
-        "https://www.googleapis.com/auth/spreadsheets.readonly",
-    ]
+    <div class="qa-card">
+        <div class="qa-card-icon">🎨</div>
+        <div>
+            <div class="qa-card-title">Design Projects</div>
+            <div class="qa-card-desc">Creative & design work tracking</div>
+        </div>
+        <div class="qa-card-link">
+            <a class="qa-link-btn-teal" href="http://erp.piki.co.tz/app/design-projects" target="_blank">Open ERP →</a>
+        </div>
+    </div>
 
-    # ─── Build Google credentials (always works — no secrets.toml needed) ───
-    @st.cache_resource(ttl=7200)
-    def _get_dept_creds():
-        if not _GOOGLE_LIBS_OK:
-            return None
-        try:
-            return _sa.Credentials.from_service_account_info(_SA_INFO, scopes=_GOOGLE_SCOPES_DEPT)
-        except Exception as e:
-            return None
+    <div class="qa-card">
+        <div class="qa-card-icon">📣</div>
+        <div>
+            <div class="qa-card-title">Content & Marketing Projects</div>
+            <div class="qa-card-desc">Kanban board for content & marketing campaign work</div>
+        </div>
+        <div class="qa-card-link">
+            <a class="qa-link-btn-teal" href="http://erp.piki.co.tz/app/content-and-marketing-projects/view/kanban/piki" target="_blank">Open ERP →</a>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 
-    # ─── Fetch all slides, return structured list ─────────────────
-    @st.cache_data(ttl=600, show_spinner=False)
-    def _fetch_all_slides(_creds_dummy):
-        creds = _get_dept_creds()
-        if creds is None:
-            return None, "Google libraries not installed (pip install google-api-python-client google-auth)"
-        try:
-            svc = _gbuild("slides", "v1", credentials=creds, cache_discovery=False)
-            pres = svc.presentations().get(presentationId=SLIDES_PRES_ID).execute()
-            slides_raw = pres.get("slides", [])
-            results = []
-            for i, slide in enumerate(slides_raw):
-                title_text = ""
-                body_parts = []
-                for el in slide.get("pageElements", []):
-                    shape = el.get("shape", {})
-                    tf = shape.get("text", {})
-                    segs = []
-                    for te in tf.get("textElements", []):
-                        tr = te.get("textRun")
-                        if tr:
-                            s = tr.get("content", "").strip()
-                            if s:
-                                segs.append(s)
-                    full = " ".join(segs)
-                    if not full:
-                        continue
-                    ph_type = shape.get("placeholder", {}).get("type", "")
-                    if ph_type in ("TITLE", "CENTERED_TITLE"):
-                        title_text = full
-                    else:
-                        body_parts.append(full)
-                results.append({
-                    "slide_num": i + 1,
-                    "title": title_text or f"Slide {i+1}",
-                    "body": "\n".join(body_parts),
-                    "all_text": (title_text + " " + " ".join(body_parts)).lower(),
-                })
-            return results, None
-        except Exception as e:
-            return None, str(e)
+    # ── SECTION 4: Training ─────────────────────────────────────
+    st.markdown('<div class="qa-section-title">📚 Training & Resources</div>', unsafe_allow_html=True)
 
-    # ─── Identify the last slide per department ───────────────────
-    def _get_last_dept_slides(all_slides):
-        """
-        For each department, find the LAST slide in the deck that matches
-        that department's keywords. Returns a dict: dept_name → slide_dict.
-        """
-        DEPT_KEYWORDS = {
-            "Operations":  ["operation", "ops", "order", "delivery", "rider", "driver", "logistics"],
-            "Content":     ["content", "creative", "post", "social media", "blog", "copy"],
-            "Marketing":   ["marketing", "campaign", "promo", "growth", "acquisition", "brand", "ads", "advert"],
-            "Design":      ["design", "ui", "ux", "graphic", "visual", "figma", "adobe"],
-            "Tech / IT":   ["tech", "it ", "app", "system", "bug", "feature", "dev", "engineer", "api", "server"],
-            "Finance":     ["finance", "revenue", "cost", "profit", "budget", "expense", "invoice", "payment"],
-            "HR":          ["hr", "human resource", "staff", "recruit", "hire", "training", "onboard", "payroll"],
-            "Management":  ["management", "ceo", "director", "strategy", "goal", "kpi", "okr", "board"],
-        }
-        last_per_dept = {}
-        for slide in all_slides:
-            text = slide["all_text"]
-            for dept, kws in DEPT_KEYWORDS.items():
-                if any(kw in text for kw in kws):
-                    last_per_dept[dept] = slide   # keep overwriting → last match wins
-        return last_per_dept
+    st.markdown("""
+    <div class="qa-card">
+        <div class="qa-card-icon">🚴</div>
+        <div>
+            <div class="qa-card-title">Piki Driver App Training Guide</div>
+            <div class="qa-card-desc">Login, order flow, delivery completion & reporting protocols</div>
+        </div>
+        <div class="qa-card-link">
+            <a class="qa-link-btn" href="https://www.piki.co.tz" target="_blank">View Guide →</a>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 
-    # ─── Fetch Google Sheets Tracker ─────────────────────────────
-    @st.cache_data(ttl=300, show_spinner=False)
-    def _fetch_tracker_data(_creds_dummy):
-        creds = _get_dept_creds()
-        if creds is None:
-            return None, "Google libraries not installed"
-        try:
-            gc = _gspread.authorize(creds)
-            sh = gc.open_by_key(SHEETS_DOC_ID)
-            ws = sh.worksheet(TRACKER_SHEET)
-            all_vals = ws.get_all_values()
-            if not all_vals:
-                return pd.DataFrame(), None
-            headers = all_vals[0]
-            rows = all_vals[1:]
-            df = pd.DataFrame(rows, columns=headers)
-            # Drop fully empty rows
-            df = df[df.apply(lambda r: r.str.strip().ne("").any(), axis=1)].reset_index(drop=True)
-            return df, None
-        except Exception as e:
-            return None, str(e)
-
-    # ─── ERP fetch with proper token auth ─────────────────────────
-    def _fetch_erp_data(api_key: str, api_secret: str):
-        headers = {
-            "Authorization": f"token {api_key}:{api_secret}",
-            "Content-Type": "application/json",
-        }
-        results = {}
-        # Try multiple doctype names ERPNext may use
-        endpoint_map = {
-            "📁 General Projects":    f"{ERP_BASE}/api/resource/Project",
-            "🎨 Design Projects":     f"{ERP_BASE}/api/resource/Design%20Project",
-            "📣 Content & Marketing": f"{ERP_BASE}/api/resource/Content%20and%20Marketing%20Project",
-        }
-        fields = ["name", "project_name", "status", "percent_complete", "expected_end_date", "project_type", "description"]
-        for label, base_url in endpoint_map.items():
-            url = f"{base_url}?fields={json.dumps(fields)}&limit_page_length=200&order_by=modified+desc"
-            try:
-                r = _requests.get(url, headers=headers, timeout=12)
-                if r.status_code == 200:
-                    results[label] = r.json().get("data", [])
-                elif r.status_code == 403:
-                    results[label] = {"_error": "403 Forbidden — check API permissions"}
-                elif r.status_code == 404:
-                    # Try Project with type filter
-                    short_label = label.split()[-1]
-                    url2 = (f"{ERP_BASE}/api/resource/Project"
-                            f"?fields={json.dumps(fields)}"
-                            f"&filters=[[\"project_type\",\"like\",\"%{short_label}%\"]]"
-                            f"&limit_page_length=200&order_by=modified+desc")
-                    r2 = _requests.get(url2, headers=headers, timeout=12)
-                    results[label] = r2.json().get("data", []) if r2.status_code == 200 else []
-                else:
-                    results[label] = []
-            except Exception as ex:
-                results[label] = {"_error": str(ex)}
-        return results
-
-    # ─── AI helper ───────────────────────────────────────────────
-    def _dept_ai(context: str, question: str) -> str:
-        try:
-            _cl = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
-            msg = _cl.messages.create(
-                model="claude-opus-4-6",
-                max_tokens=600,
-                messages=[{"role": "user", "content": (
-                    "You are a business analyst for Piki, a food delivery startup in Tanzania. "
-                    "Be concise, professional, and use bullet points. "
-                    f"Data:\n\n{context}\n\nQuestion: {question}"
-                )}]
-            )
-            return msg.content[0].text
-        except Exception as e:
-            return f"_AI unavailable: {e}_"
-
-    # ════════════════════════════════════════════════════════════
-    # ERP credentials (visible section at top)
-    # ════════════════════════════════════════════════════════════
-    with st.expander("🔑 ERPNext API Credentials", expanded=("_dept_erp_key" not in st.session_state)):
-        st.caption(f"Login to [erp.piki.co.tz ↗]({ERP_BASE}) → My Profile → Generate API Key & Secret")
-        ec1, ec2 = st.columns(2)
-        with ec1:
-            _ek = st.text_input("API Key", key="erp_key_input",
-                                value=st.session_state.get("_dept_erp_key", ""),
-                                placeholder="528c89565c9d1c2...")
-            if _ek:
-                st.session_state["_dept_erp_key"] = _ek
-        with ec2:
-            _es = st.text_input("API Secret", key="erp_secret_input", type="password",
-                                value=st.session_state.get("_dept_erp_secret", ""),
-                                placeholder="paste your secret here")
-            if _es:
-                st.session_state["_dept_erp_secret"] = _es
-
-        if st.session_state.get("_dept_erp_key"):
-            st.success(f"✅ API Key set: `{st.session_state['_dept_erp_key'][:8]}…`")
-
-    st.divider()
-
-    # ════════════════════════════════════════════════════════════
-    # THREE SUB-TABS
-    # ════════════════════════════════════════════════════════════
-    d_sub1, d_sub2, d_sub3 = st.tabs([
-        "📋 Weekly Standup Slides",
-        "📝 Content Team Tracker",
-        "🏗️ ERP Projects",
-    ])
-
-    # ════════════════════════════════════════════════════════════
-    # SUB-TAB 1 — GOOGLE SLIDES (last slide per department)
-    # ════════════════════════════════════════════════════════════
-    with d_sub1:
-        st.markdown("### 📋 Latest Standup Update — Per Department")
-        st.caption(
-            f"Showing the **most recent slide** for each department from your weekly standup. "
-            f"[Open full presentation ↗](https://docs.google.com/presentation/d/{SLIDES_PRES_ID}/edit)"
-        )
-
-        _rb_col, _ = st.columns([1, 5])
-        with _rb_col:
-            if st.button("🔄 Refresh", key="refresh_slides"):
-                st.cache_data.clear()
-                st.rerun()
-
-        with st.spinner("Loading presentation…"):
-            _all_slides, _slides_err = _fetch_all_slides(id(SLIDES_PRES_ID))
-
-        if _slides_err:
-            st.error(f"⚠️ Slides error: {_slides_err}")
-            st.markdown("""
-            **Fix checklist:**
-            - Run: `pip install google-api-python-client google-auth gspread`
-            - Enable **Google Slides API** in [Google Cloud Console ↗](https://console.cloud.google.com/apis/library/slides.googleapis.com)
-            - Share the presentation with `weekly-report@weekly-report-488807.iam.gserviceaccount.com` (Viewer)
-            """)
-        elif not _all_slides:
-            st.warning("No slides found in the presentation.")
-        else:
-            _last_by_dept = _get_last_dept_slides(_all_slides)
-
-            if not _last_by_dept:
-                st.info(f"Loaded {len(_all_slides)} slides. No department keywords matched — showing the last 3 slides instead.")
-                _display_slides = _all_slides[-3:]
-                for sl in _display_slides:
-                    st.markdown(f"""
-                    <div class="slide-card">
-                        <div class="slide-title">Slide {sl['slide_num']}: {sl['title']}</div>
-                        <div class="slide-body">{sl['body'][:600].replace(chr(10), '<br>')}</div>
-                        <div class="slide-meta">Slide {sl['slide_num']} of {len(_all_slides)}</div>
-                    </div>
-                    """, unsafe_allow_html=True)
-            else:
-                st.success(f"✅ {len(_last_by_dept)} department(s) detected across {len(_all_slides)} slides")
-
-                # ── Department filter pills ──
-                dept_options = ["All Departments"] + sorted(_last_by_dept.keys())
-                _sel_dept = st.selectbox("Show department", dept_options, key="slide_dept_sel")
-
-                depts_to_show = (
-                    {k: v for k, v in _last_by_dept.items() if k == _sel_dept}
-                    if _sel_dept != "All Departments"
-                    else _last_by_dept
-                )
-
-                for dept_name, slide in depts_to_show.items():
-                    body_clean = slide["body"][:800].replace("<", "&lt;").replace(">", "&gt;")
-                    st.markdown(f"""
-                    <div class="slide-card">
-                        <span class="slide-dept-badge">{dept_name.upper()}</span>
-                        <div class="slide-title">Slide {slide['slide_num']}: {slide['title']}</div>
-                        <div class="slide-body">{body_clean.replace(chr(10), '<br>')}</div>
-                        <div class="slide-meta">📍 Last update found at Slide {slide['slide_num']} of {len(_all_slides)}</div>
-                    </div>
-                    """, unsafe_allow_html=True)
-
-                # ── AI Summary ──
-                st.divider()
-                st.markdown("#### 🤖 AI Standup Summary")
-                if st.button("Generate AI Summary of All Departments", key="btn_slides_ai"):
-                    _ctx = "\n\n".join(
-                        f"{dept} (Slide {sl['slide_num']}):\n{sl['title']}\n{sl['body'][:400]}"
-                        for dept, sl in _last_by_dept.items()
-                    )
-                    with st.spinner("Claude is reading all department updates…"):
-                        _summary = _dept_ai(_ctx,
-                            "Summarize each department's latest update. Highlight wins, blockers, and top action items for this week.")
-                    st.markdown(f'<div class="ai-insight-card">{_summary}</div>', unsafe_allow_html=True)
-
-    # ════════════════════════════════════════════════════════════
-    # SUB-TAB 2 — CONTENT TRACKER (Google Sheets)
-    # ════════════════════════════════════════════════════════════
-    with d_sub2:
-        st.markdown("### 📝 Content Team Tracker")
-        st.caption(
-            f"Sheet: **'Trackers'** | "
-            f"[Open Google Sheet ↗](https://docs.google.com/spreadsheets/d/{SHEETS_DOC_ID}/edit)"
-        )
-
-        _rt_col, _ = st.columns([1, 5])
-        with _rt_col:
-            if st.button("🔄 Refresh", key="refresh_tracker"):
-                st.cache_data.clear()
-                st.rerun()
-
-        with st.spinner("Loading tracker…"):
-            _tdf, _terr = _fetch_tracker_data(id(SHEETS_DOC_ID))
-
-        if _terr:
-            st.error(f"⚠️ Tracker error: {_terr}")
-            st.markdown("""
-            **Fix checklist:**
-            - Run: `pip install gspread google-auth`
-            - Enable **Google Sheets API** in [Google Cloud Console ↗](https://console.cloud.google.com/apis/library/sheets.googleapis.com)
-            - Share the spreadsheet with `weekly-report@weekly-report-488807.iam.gserviceaccount.com` (Viewer)
-            - Make sure the sheet tab is named exactly **Trackers** (case-sensitive)
-            """)
-        elif _tdf is not None and not _tdf.empty:
-            st.success(f"✅ {len(_tdf)} rows · {len(_tdf.columns)} columns loaded")
-
-            # ── Show all column names for reference ──
-            with st.expander("📋 Available columns in your sheet", expanded=False):
-                st.write(list(_tdf.columns))
-
-            # ── Auto-detect status column ──
-            _status_col = None
-            for _c in _tdf.columns:
-                if "status" in _c.lower():
-                    _status_col = _c
-                    break
-
-            # ── Filters (up to 3 columns) ──
-            _filterable = [c for c in _tdf.columns if _tdf[c].nunique() < 40 and _tdf[c].nunique() > 1][:3]
-            if _filterable:
-                _fcols = st.columns(len(_filterable))
-                _active_f = {}
-                for _fi, _fc in enumerate(_filterable):
-                    with _fcols[_fi]:
-                        _uvals = ["All"] + sorted(_tdf[_fc].dropna().astype(str).unique().tolist())
-                        _chosen = st.selectbox(f"{_fc}", _uvals, key=f"tf_{_fi}")
-                        if _chosen != "All":
-                            _active_f[_fc] = _chosen
-
-                _fdf = _tdf.copy()
-                for _col, _val in _active_f.items():
-                    _fdf = _fdf[_fdf[_col].astype(str) == _val]
-            else:
-                _fdf = _tdf.copy()
-
-            # ── KPI metric cards ──
-            st.markdown("#### 📊 Summary")
-            _km1, _km2, _km3, _km4 = st.columns(4)
-            _km1.metric("Total Items", len(_fdf))
-
-            if _status_col:
-                _st_lower = _fdf[_status_col].astype(str).str.lower()
-                _done  = _st_lower.str.contains(r"done|complete|published|approved|finish", na=False).sum()
-                _prog  = _st_lower.str.contains(r"progress|ongoing|wip|review|in review", na=False).sum()
-                _todo  = _st_lower.str.contains(r"todo|to do|not started|pending|open", na=False).sum()
-                _km2.metric("✅ Done", int(_done))
-                _km3.metric("🔄 In Progress", int(_prog))
-                _km4.metric("📋 Pending", int(_todo))
-
-                if len(_fdf) > 0:
-                    _pct_done = _done / len(_fdf) * 100
-                    st.markdown(f"""
-                    <div style="margin:8px 0 16px 0;">
-                        <div style="font-size:12px;color:#555;margin-bottom:4px;">
-                            Completion: <strong style="color:#FF6B00;">{_pct_done:.0f}%</strong>
-                            &nbsp; ({int(_done)} of {len(_fdf)} items)
-                        </div>
-                        <div style="background:#e9ecef;border-radius:6px;height:14px;">
-                            <div style="background:linear-gradient(90deg,#FF6B00,#28a745);
-                                        width:{_pct_done:.0f}%;height:14px;border-radius:6px;"></div>
-                        </div>
-                    </div>
-                    """, unsafe_allow_html=True)
-
-            # ── Full data table ──
-            st.markdown("#### 📄 Full Tracker Data")
-            st.dataframe(_fdf, use_container_width=True, height=420)
-
-            # ── Download ──
-            _csv = _fdf.to_csv(index=False).encode("utf-8")
-            st.download_button("⬇️ Download CSV", _csv,
-                               file_name="piki_content_tracker.csv", mime="text/csv")
-
-            # ── AI Analysis ──
-            st.divider()
-            if st.button("🤖 AI Analysis of Content Performance", key="btn_tracker_ai"):
-                _t_ctx = f"Total: {len(_fdf)} items.\n"
-                if _status_col:
-                    _t_ctx += f"Done: {int(_done)}, In Progress: {int(_prog)}, Pending: {int(_todo)}.\n"
-                _t_ctx += f"\nSample data:\n{_fdf.head(25).to_string(index=False)}"
-                with st.spinner("Analysing…"):
-                    _t_ai = _dept_ai(_t_ctx,
-                        "What is the content team's completion rate? Any bottlenecks? What content types are most active? Key recommendations for this week.")
-                st.markdown(f'<div class="ai-insight-card">{_t_ai}</div>', unsafe_allow_html=True)
-        elif _tdf is not None and _tdf.empty:
-            st.warning("The 'Trackers' sheet appears to be empty. Add some rows and refresh.")
-        else:
-            st.info("Waiting for data…")
-
-    # ════════════════════════════════════════════════════════════
-    # SUB-TAB 3 — ERP PROJECTS
-    # ════════════════════════════════════════════════════════════
-    with d_sub3:
-        st.markdown("### 🏗️ ERP Project Dashboard")
-
-        _erp_links_row = st.columns(3)
-        with _erp_links_row[0]:
-            st.markdown(f"[📁 General Projects ↗]({ERP_BASE}/app/projects)")
-        with _erp_links_row[1]:
-            st.markdown(f"[🎨 Design Projects ↗]({ERP_BASE}/app/design-projects)")
-        with _erp_links_row[2]:
-            st.markdown(f"[📣 Content & Marketing ↗]({ERP_BASE}/app/content-and-marketing-projects/view/kanban/piki)")
-
-        _erp_key = st.session_state.get("_dept_erp_key", "")
-        _erp_sec = st.session_state.get("_dept_erp_secret", "")
-
-        if not _erp_key or not _erp_sec:
-            st.warning("⚠️ Enter your ERPNext API Key **and** Secret in the credentials section above, then come back here.")
-            st.markdown("""
-            **Where to find your ERP credentials:**
-            1. Go to [erp.piki.co.tz ↗](http://erp.piki.co.tz) and log in
-            2. Click your **profile icon** (top right) → **My Settings**
-            3. Scroll to **API Access** section
-            4. Click **Generate Keys** — copy both the API Key and API Secret
-            5. Paste them in the credentials box above ↑
-            """)
-        else:
-            _re_col, _ = st.columns([1, 5])
-            with _re_col:
-                _do_erp_refresh = st.button("🔄 Refresh ERP", key="refresh_erp")
-
-            with st.spinner("Connecting to ERPNext…"):
-                _erp_data = _fetch_erp_data(_erp_key, _erp_sec)
-
-            _total_erp = sum(len(v) if isinstance(v, list) else 0 for v in _erp_data.values())
-
-            if _total_erp == 0:
-                st.error("❌ No projects loaded. Check your API credentials or ERP server connection.")
-                for _lbl, _items in _erp_data.items():
-                    if isinstance(_items, dict) and "_error" in _items:
-                        st.caption(f"{_lbl}: {_items['_error']}")
-            else:
-                st.success(f"✅ {_total_erp} project(s) loaded from ERPNext")
-
-                # ── Overall metrics ──
-                _all_p = []
-                for _grp, _ps in _erp_data.items():
-                    if isinstance(_ps, list):
-                        for _p in _ps:
-                            _p["_group"] = _grp
-                            _all_p.append(_p)
-                _all_pdf = pd.DataFrame(_all_p)
-
-                if not _all_pdf.empty:
-                    _ov1, _ov2, _ov3, _ov4 = st.columns(4)
-                    _ov1.metric("Total Projects", len(_all_pdf))
-                    if "status" in _all_pdf:
-                        _sc = _all_pdf["status"].value_counts()
-                        _ov2.metric("🟠 Open", int(_sc.get("Open", 0)))
-                        _ov3.metric("✅ Completed", int(_sc.get("Completed", 0)))
-                        _ov4.metric("⏸️ On Hold", int(_sc.get("Hold", 0) + _sc.get("On Hold", 0)))
-
-                # ── Per-group expanders ──
-                for _grp_name, _projs in _erp_data.items():
-                    if not isinstance(_projs, list) or not _projs:
-                        continue
-                    with st.expander(f"{_grp_name} — {len(_projs)} project(s)", expanded=True):
-                        _g_df = pd.DataFrame(_projs)
-
-                        # Metrics
-                        _gc1, _gc2, _gc3 = st.columns(3)
-                        _gc1.metric("Total", len(_g_df))
-                        if "status" in _g_df:
-                            _gc2.metric("Open", int((_g_df["status"] == "Open").sum()))
-                            _gc3.metric("Done", int((_g_df["status"] == "Completed").sum()))
-
-                        # Avg progress bar
-                        if "percent_complete" in _g_df.columns:
-                            _avg_p = pd.to_numeric(_g_df["percent_complete"], errors="coerce").mean()
-                            if pd.notna(_avg_p):
-                                st.markdown(f"""
-                                <div style="margin:8px 0 12px 0;">
-                                    <div style="font-size:11px;color:#555;">Avg Progress: <strong>{_avg_p:.0f}%</strong></div>
-                                    <div style="background:#e9ecef;border-radius:4px;height:10px;margin-top:3px;">
-                                        <div style="background:#00897b;width:{min(_avg_p,100):.0f}%;height:10px;border-radius:4px;"></div>
-                                    </div>
-                                </div>
-                                """, unsafe_allow_html=True)
-
-                        # Table
-                        _show_cols = [c for c in ["project_name","status","percent_complete",
-                                                   "expected_end_date","project_type"] if c in _g_df.columns]
-                        _g_show = _g_df[_show_cols].copy() if _show_cols else _g_df
-                        if "percent_complete" in _g_show:
-                            _g_show["percent_complete"] = pd.to_numeric(
-                                _g_show["percent_complete"], errors="coerce"
-                            ).apply(lambda x: f"{x:.0f}%" if pd.notna(x) else "—")
-                        st.dataframe(_g_show.rename(columns={
-                            "project_name": "Project", "status": "Status",
-                            "percent_complete": "Progress", "expected_end_date": "Due Date",
-                            "project_type": "Type"
-                        }), use_container_width=True)
-
-                # ── AI Summary ──
-                st.divider()
-                if st.button("🤖 AI Project Portfolio Summary", key="btn_erp_ai"):
-                    _erp_ctx = ""
-                    for _gn, _ps in _erp_data.items():
-                        if isinstance(_ps, list) and _ps:
-                            _erp_ctx += f"\n{_gn} ({len(_ps)} projects):\n"
-                            for _p in _ps[:20]:
-                                _erp_ctx += (
-                                    f"  • {_p.get('project_name',_p.get('name',''))} | "
-                                    f"Status: {_p.get('status','')} | "
-                                    f"Progress: {_p.get('percent_complete','')}% | "
-                                    f"Due: {_p.get('expected_end_date','')}\n"
-                                )
-                    with st.spinner("Analysing project portfolio…"):
-                        _erp_ai = _dept_ai(_erp_ctx,
-                            "Assess the project portfolio health. Which projects are at risk? "
-                            "What are this week's top priorities? Any patterns across design vs content vs general projects?")
-                    st.markdown(f'<div class="ai-insight-card">{_erp_ai}</div>', unsafe_allow_html=True)
-
-
-# FOOTER
 # ─────────────────────────────────────────────────
 st.divider()
 st.markdown(
