@@ -656,7 +656,7 @@ Use real numbers. Be concise."""
 # ─────────────────────────────────────────────────
 with st.sidebar:
     st.markdown(f'<img src="data:image/jpeg;base64,{PIKI_LOGO_B64}" style="width:100%;border-radius:8px;margin-bottom:8px;" />', unsafe_allow_html=True)
-    st.title("📊 Piki Dashboard")
+    st.title("📊 Piki Dashboard Report")
     st.divider()
 
     # ─────────────────────────────────────────────────
@@ -892,19 +892,69 @@ if df.empty:
     st.error("No data matches the current filters. Adjust the filters in the sidebar.")
     st.stop()
 
-# ── Quick KPI bar ──
-col1, col2, col3, col4, col5 = st.columns(5)
-total_orders  = len(df)
-total_sales   = df['SUBTOTAL'].sum() if 'SUBTOTAL' in df.columns else 0
-total_failed  = len(df[df['STATE'] == 'Delivery Failed By Driver']) if 'STATE' in df.columns else 0
-unique_biz    = df['BUSINESS NAME'].nunique()
-unique_drivers = df['DRIVER NAME'].nunique() if 'DRIVER NAME' in df.columns else 0
+# ── Quick KPI bar — CURRENT WEEK ONLY with WoW direction ──
+_kpi_df = df.copy()
+_kpi_df['DELIVERY DATE'] = pd.to_datetime(_kpi_df['DELIVERY DATE'], errors='coerce')
+_kpi_df['_kpi_wk'] = _kpi_df['DELIVERY DATE'].dt.to_period('W-SUN')
+_kpi_wks_sorted = sorted(_kpi_df['_kpi_wk'].dropna().unique(), reverse=True)
+_kpi_cur_wk  = _kpi_wks_sorted[0]  if len(_kpi_wks_sorted) >= 1 else None
+_kpi_prev_wk = _kpi_wks_sorted[1]  if len(_kpi_wks_sorted) >= 2 else None
 
-col1.metric("📦 Total Orders",  f"{total_orders:,}")
-col2.metric("💰 Total Sales",   f"{total_sales/1_000_000:.1f}M TZS")
-col3.metric("❌ Failed Orders", f"{total_failed}")
-col4.metric("🏪 Active Businesses", f"{unique_biz}")
-col5.metric("🚴 Active Riders", f"{unique_drivers}")
+def _kpi_subset(wk):
+    if wk is None: return pd.DataFrame()
+    return _kpi_df[_kpi_df['_kpi_wk'] == wk]
+
+_cur  = _kpi_subset(_kpi_cur_wk)
+_prev = _kpi_subset(_kpi_prev_wk)
+
+def _delta_str(cur_val, prev_val, pct=True, invert=False):
+    """Return delta string with direction arrow and % or absolute."""
+    if prev_val == 0 or pd.isna(prev_val): return None
+    diff = cur_val - prev_val
+    pct_val = diff / prev_val * 100
+    arrow = "▲" if diff > 0 else "▼"
+    if invert:  # for failed orders, up is bad
+        arrow = "▼" if diff > 0 else "▲"
+    if pct:
+        return f"{arrow} {abs(pct_val):.1f}%  WoW"
+    return f"{arrow} {abs(diff):,.0f}  WoW"
+
+def _delta_col(cur_val, prev_val, invert=False):
+    if prev_val == 0: return "off"
+    return ("inverse" if invert else "normal") if cur_val >= prev_val else ("normal" if invert else "inverse")
+
+# Current week values
+total_orders   = len(_cur)
+total_sales    = _cur['SUBTOTAL'].sum()    if 'SUBTOTAL'     in _cur.columns else 0
+total_failed   = len(_cur[_cur['STATE'] == 'Delivery Failed By Driver']) if 'STATE' in _cur.columns else 0
+unique_biz     = _cur['BUSINESS NAME'].nunique()
+unique_drivers = _cur['DRIVER NAME'].nunique() if 'DRIVER NAME' in _cur.columns else 0
+
+# Previous week values
+prev_orders   = len(_prev) if not _prev.empty else 0
+prev_sales    = _prev['SUBTOTAL'].sum()    if (not _prev.empty and 'SUBTOTAL' in _prev.columns) else 0
+prev_failed   = len(_prev[_prev['STATE'] == 'Delivery Failed By Driver']) if (not _prev.empty and 'STATE' in _prev.columns) else 0
+prev_biz      = _prev['BUSINESS NAME'].nunique() if not _prev.empty else 0
+prev_drivers  = _prev['DRIVER NAME'].nunique()   if (not _prev.empty and 'DRIVER NAME' in _prev.columns) else 0
+
+_wk_lbl = f"Wk {_kpi_cur_wk.week} ({_kpi_cur_wk.start_time.strftime('%d %b')})" if _kpi_cur_wk else "Current"
+
+col1, col2, col3, col4, col5 = st.columns(5)
+col1.metric(f"📦 Orders — {_wk_lbl}", f"{total_orders:,}",
+            delta=_delta_str(total_orders, prev_orders),
+            delta_color=_delta_col(total_orders, prev_orders))
+col2.metric(f"💰 Sales — {_wk_lbl}", f"{total_sales/1_000_000:.1f}M TZS",
+            delta=_delta_str(total_sales, prev_sales),
+            delta_color=_delta_col(total_sales, prev_sales))
+col3.metric(f"❌ Failed — {_wk_lbl}", f"{total_failed}",
+            delta=_delta_str(total_failed, prev_failed, pct=False, invert=True),
+            delta_color=_delta_col(total_failed, prev_failed, invert=True))
+col4.metric(f"🏪 Businesses — {_wk_lbl}", f"{unique_biz}",
+            delta=_delta_str(unique_biz, prev_biz, pct=False),
+            delta_color=_delta_col(unique_biz, prev_biz))
+col5.metric(f"🚴 Riders — {_wk_lbl}", f"{unique_drivers}",
+            delta=_delta_str(unique_drivers, prev_drivers, pct=False),
+            delta_color=_delta_col(unique_drivers, prev_drivers))
 
 st.divider()
 
@@ -3183,20 +3233,81 @@ with tab3:
     # ─── Section B2: Dar es Salaam Monthly Bonus ────────────
     st.divider()
     st.markdown("### 🌟 B2. Dar es Salaam Monthly Rider Bonus")
-    st.caption("Monthly bonus based on last 4 completed weeks. Four bonus categories: Acceptance Time · Working Days · Delivery Time · Night/Morning Orders")
+    st.caption("Monthly bonus based on a custom date range. Default = last 4 calendar weeks from data.")
 
-    # ── Prepare 4-week window ──
-    _dar_df = raw.copy()
-    _dar_df['DELIVERY DATE'] = pd.to_datetime(_dar_df['DELIVERY DATE'], errors='coerce')
-    _dar_df = _dar_df[_dar_df['BUSINESS CITY'].isin(DAR_CITIES)].copy()
+    # ── DATE RANGE FILTER ─────────────────────────────────
+    st.markdown("##### 📅 Bonus Period — Select Date Range")
+    st.info(
+        "**Default:** last 4 weeks in the data.  "
+        "**To calculate a real bonus month** (e.g. 29 Jan → 28 Feb), select the exact dates below. "
+        "The system will use ALL orders within the selected range.",
+        icon="ℹ️"
+    )
+
+    _dar_raw_all = raw.copy()
+    _dar_raw_all['DELIVERY DATE'] = pd.to_datetime(_dar_raw_all['DELIVERY DATE'], errors='coerce')
+    _dar_raw_dar = _dar_raw_all[_dar_raw_all['BUSINESS CITY'].isin(DAR_CITIES)].copy()
+
+    # Compute default: last 4 complete weeks in data
+    _dar_raw_dar['_wk'] = _dar_raw_dar['DELIVERY DATE'].dt.to_period('W-SUN')
+    _dar_avail_wks = sorted(_dar_raw_dar['_wk'].dropna().unique(), reverse=True)
+    _dar_default_4wks = _dar_avail_wks[:4]
+    if _dar_default_4wks:
+        _dar_default_start = _dar_default_4wks[-1].start_time.date()   # earliest week start
+        _dar_default_end   = _dar_default_4wks[0].end_time.date()      # latest week end
+    else:
+        import datetime as _dt_lib
+        _dar_default_end   = _dt_lib.date.today()
+        _dar_default_start = _dar_default_end - _dt_lib.timedelta(days=27)
+
+    _dar_min_date = _dar_raw_dar['DELIVERY DATE'].min().date() if not _dar_raw_dar.empty else _dar_default_start
+    _dar_max_date = _dar_raw_dar['DELIVERY DATE'].max().date() if not _dar_raw_dar.empty else _dar_default_end
+
+    _dc1, _dc2 = st.columns(2)
+    with _dc1:
+        _dar_bonus_start = st.date_input(
+            "📅 Bonus Period Start",
+            value=_dar_default_start,
+            min_value=_dar_min_date,
+            max_value=_dar_max_date,
+            key="dar_bonus_start",
+            help="Start of the bonus calculation period (e.g. 29 January)"
+        )
+    with _dc2:
+        _dar_bonus_end = st.date_input(
+            "📅 Bonus Period End",
+            value=_dar_default_end,
+            min_value=_dar_min_date,
+            max_value=_dar_max_date,
+            key="dar_bonus_end",
+            help="End of the bonus calculation period (e.g. 28 February)"
+        )
+
+    if _dar_bonus_start > _dar_bonus_end:
+        st.error("⚠️ Start date must be before end date. Please adjust the date range.")
+        st.stop()
+
+    _dar_period_days = (_dar_bonus_end - _dar_bonus_start).days + 1
+    st.caption(
+        f"📆 **Selected period:** {_dar_bonus_start.strftime('%d %b %Y')} → "
+        f"{_dar_bonus_end.strftime('%d %b %Y')}  ({_dar_period_days} days)  |  "
+        f"Default was: {_dar_default_start.strftime('%d %b')} → {_dar_default_end.strftime('%d %b')} (4 weeks)"
+    )
+
+    # ── Filter Dar data to selected date range ────────────
+    _dar_df = _dar_raw_dar[
+        (_dar_raw_dar['DELIVERY DATE'].dt.date >= _dar_bonus_start) &
+        (_dar_raw_dar['DELIVERY DATE'].dt.date <= _dar_bonus_end)
+    ].copy()
     _dar_df['Week'] = _dar_df['DELIVERY DATE'].dt.to_period('W-SUN').apply(lambda r: r.start_time)
     _dar_df = _dar_df[_dar_df['HOUR'].isin(OPERATING_HOURS)] if 'HOUR' in _dar_df.columns else _dar_df.copy()
     if 'HOUR' not in _dar_df.columns:
         _dar_df['HOUR'] = _dar_df['DELIVERY TIME'].dt.hour if 'DELIVERY TIME' in _dar_df.columns else 12
 
-    # Get last 4 weeks
-    _dar_4wks = sorted(_dar_df['Week'].dropna().unique(), reverse=True)[:4]
-    _dar_df4 = _dar_df[_dar_df['Week'].isin(_dar_4wks)].copy()
+    _dar_4wks = sorted(_dar_df['Week'].dropna().unique())   # all weeks in range (not just 4)
+    _dar_df4  = _dar_df.copy()                               # all filtered data = bonus window
+    _dar_date_start = _dar_bonus_start.strftime('%d %b %Y')
+    _dar_date_end   = _dar_bonus_end.strftime('%d %b %Y')
 
     if _dar_df4.empty:
         st.info("No Dar es Salaam data found.")
@@ -3501,7 +3612,7 @@ with tab3:
         st.dataframe(_bonus_base.style.apply(_style_dar_bonus, axis=None),
                      use_container_width=True,
                      height=min(80 + len(_bonus_base) * 38, 600))
-        st.caption(f"🟢 Eligible · 🔴 Not eligible  |  Weeks assessed: {', '.join([w.strftime('%d %b') for w in sorted(_dar_4wks)])}")
+        st.caption(f"🟢 Eligible · 🔴 Not eligible  |  Bonus Period: {_dar_date_start} to {_dar_date_end}  ({len(_dar_4wks)} weeks)")
 
         # ── Download ──
         st.download_button("⬇️ Download DAR Bonus Report",
@@ -3511,7 +3622,10 @@ with tab3:
 
     # ─── Section C: Regional Bonus Calculator ───────────────
     st.markdown("### 💰 C. Regional Rider Bonus Calculator")
-    st.caption("Calculates bonus eligibility based on order volume vs city average and delivery time (target < 50 min)")
+    st.caption(
+        "**Availability:** orders ≥ zone average ÷ 1.5 (rider gets bonus even if slightly below avg, "
+        "e.g. zone with 20 orders / 2 riders → threshold = 6.7 → both 9 and 11 qualify)  |  "
+        "**Delivery Time:** avg DT ≤ zone average (not a fixed target)")
 
     _BONUS = 15000
     _regional_df = raw.copy()
@@ -3549,10 +3663,15 @@ with tab3:
                     .agg(lambda x: x.mode().iloc[0] if not x.mode().empty else "Unknown")
                     .reindex(_drivers_reg, fill_value="Unknown"))
 
-        # City average orders per driver
-        _city_ord = _bonus_reg.groupby('BUSINESS CITY')['ID'].count()
-        _city_drv = _bonus_reg.groupby('BUSINESS CITY')['DRIVER NAME'].nunique()
-        _avg_city = (_city_ord / _city_drv).fillna(0)
+        # Zone total orders, riders, average per rider, and min threshold (avg / 1.5)
+        _city_ord_total = _bonus_reg.groupby('BUSINESS CITY')['ID'].count()
+        _city_drv_count = _bonus_reg.groupby('BUSINESS CITY')['DRIVER NAME'].nunique()
+        _zone_avg_orders = (_city_ord_total / _city_drv_count).fillna(0)  # avg orders per rider per zone
+        # Availability threshold: zone_avg / 1.5  (riders within 1.5× below avg still qualify)
+        _zone_avail_thresh = (_zone_avg_orders / 1.5).round(1)
+
+        # Zone average DT (for DT eligibility)
+        _zone_avg_dt_reg = _bonus_comp_reg.groupby('BUSINESS CITY')['Average Delivery Time'].mean()
 
         _bonus_df = pd.DataFrame({
             'Rider Name': _drivers_reg,
@@ -3560,11 +3679,19 @@ with tab3:
             'Total Orders': _tot_ord.values,
             'Avg Delivery Time (min)': _avg_dt.round(1).values
         })
-        _bonus_df['City Avg Orders'] = _bonus_df['Working Zone'].map(_avg_city).round(1)
+        _bonus_df['Zone Avg Orders/Rider'] = _bonus_df['Working Zone'].map(_zone_avg_orders).round(1)
+        _bonus_df['Avail Threshold (÷1.5)'] = _bonus_df['Working Zone'].map(_zone_avail_thresh).round(1)
+        _bonus_df['Zone Avg DT (min)'] = _bonus_df['Working Zone'].map(_zone_avg_dt_reg).round(1)
+
+        # Availability: rider orders >= zone_avg / 1.5
         _bonus_df['Availability Eligible'] = _bonus_df.apply(
-            lambda r: '✅ Yes' if r['Total Orders'] > r['City Avg Orders'] else '❌ No', axis=1)
-        _bonus_df['DT Eligible'] = _bonus_df['Avg Delivery Time (min)'].apply(
-            lambda x: '✅ Yes' if pd.notna(x) and x < 50 else '❌ No')
+            lambda r: '✅ Yes' if r['Total Orders'] >= r['Avail Threshold (÷1.5)'] else '❌ No', axis=1)
+        # DT eligibility: rider avg DT <= zone avg DT
+        _bonus_df['DT Eligible'] = _bonus_df.apply(
+            lambda r: ('✅ Yes' if pd.notna(r['Avg Delivery Time (min)']) and
+                       pd.notna(r['Zone Avg DT (min)']) and
+                       r['Avg Delivery Time (min)'] <= r['Zone Avg DT (min)']
+                       else '❌ No'), axis=1)
         _bonus_df['Availability Bonus'] = _bonus_df['Availability Eligible'].apply(
             lambda x: _BONUS if x == '✅ Yes' else 0)
         _bonus_df['DT Bonus'] = _bonus_df['DT Eligible'].apply(
