@@ -1399,7 +1399,33 @@ with tab1:
                                    file_name=f"failed_{sel_week}.xlsx",
                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-                ai_insight_button("failed_orders", "Failed Orders", build_failed_insight, failed_weekly_wl, pivot, sel_week)
+                # Professional inline insight — no AI button
+                _f_tot = int(pivot.loc['TOTAL','Total']) if 'TOTAL' in pivot.index and 'Total' in pivot.columns else 0
+                _f_kpi_ok = _f_tot <= FAILED_KPI
+                _f_trend_vals = failed_weekly_wl['Failed Orders'].tolist()
+                _f_trend_dir = ""
+                if len(_f_trend_vals) >= 2:
+                    _f_last2 = _f_trend_vals[-2:]
+                    if _f_last2[-1] > _f_last2[-2]: _f_trend_dir = "📈 worsening"
+                    elif _f_last2[-1] < _f_last2[-2]: _f_trend_dir = "📉 improving"
+                    else: _f_trend_dir = "→ stable"
+                _f_worst_city = pivot.drop('TOTAL', errors='ignore')['Total'].idxmax() if 'Total' in pivot.columns and len(pivot.drop('TOTAL', errors='ignore')) > 0 else "—"
+                _f_worst_cnt  = int(pivot.drop('TOTAL', errors='ignore')['Total'].max()) if 'Total' in pivot.columns and len(pivot.drop('TOTAL', errors='ignore')) > 0 else 0
+                _f_worst_day  = pivot.drop('TOTAL', errors='ignore')[
+                    [d for d in DAY_NAMES if d in pivot.columns]].sum().idxmax() if any(d in pivot.columns for d in DAY_NAMES) else "—"
+                _f_color = "#c8e6c9" if _f_kpi_ok else "#ffcdd2"
+                _f_border = "#2e7d32" if _f_kpi_ok else "#b71c1c"
+                _f_icon   = "✅" if _f_kpi_ok else "🚨"
+                st.markdown(f"""<div style="background:{_f_color};border-left:4px solid {_f_border};
+                padding:14px 18px;border-radius:8px;font-size:13px;line-height:1.8;margin:8px 0;">
+                <b>{_f_icon} Failed Orders — {sel_week} Analysis</b><br>
+                <b>KPI Status:</b> {_f_tot} failed orders — {"within" if _f_kpi_ok else f"<b>over KPI by {_f_tot - FAILED_KPI}</b> orders. Immediate investigation needed."}<br>
+                <b>Trend:</b> {_f_trend_dir} week-over-week. {"Consider immediate root-cause review." if "worsening" in _f_trend_dir else "Monitor closely to sustain." if "improving" in _f_trend_dir else ""}<br>
+                <b>Worst city:</b> {_f_worst_city} with {_f_worst_cnt} failures. 
+                {"Focus driver review and route quality check there first." if _f_worst_cnt > 0 else ""}<br>
+                <b>Worst day:</b> {_f_worst_day} — operations team should review dispatch load and driver availability on that day.<br>
+                <small style="opacity:0.75">Tip: Cross-reference with Delivery Time tab — high failure days often correlate with peak-hour overload or new driver assignments.</small>
+                </div>""", unsafe_allow_html=True)
 
         if not rejected_df.empty:
             st.markdown("#### 🚫 Rejected Orders Analysis")
@@ -1408,13 +1434,49 @@ with tab1:
                 fig_r, rej_weekly = result_r
                 st.pyplot(fig_r); plt.close()
 
-                # ── Total orders per city (for % calculation) ──
-                _total_orders_by_city = df.groupby('BUSINESS CITY')['ID'].count()
-                _total_orders_by_biz  = df.groupby('BUSINESS NAME')['ID'].count()
-                _grand_total_orders   = len(df)
+                # ── Week + City filters for rejected section ──
+                _rj_f1, _rj_f2 = st.columns(2)
+                _rej_avail_weeks = sorted(rej_weekly['Week_Label'].unique(), reverse=True)
+                with _rj_f1:
+                    _rej_week_sel = st.selectbox(
+                        "📅 Filter Week (tables & hour chart)",
+                        ["All Weeks"] + _rej_avail_weeks,
+                        index=0, key="rej_week_filter"
+                    )
+                with _rj_f2:
+                    _rej_city_sel_main = st.multiselect(
+                        "🏙️ Filter City (tables & hour chart)",
+                        sorted(rejected_df['BUSINESS CITY'].dropna().unique()),
+                        placeholder="All cities", key="rej_city_filter_main"
+                    )
+
+                # Apply week filter to rejected_df slice
+                _rej_filtered = rejected_df.copy()
+                if _rej_week_sel != "All Weeks":
+                    _rj_yr = int(_rej_week_sel.split("-W")[0])
+                    _rj_wn = int(_rej_week_sel.split("-W")[1])
+                    _rj_wstart = pd.to_datetime(f"{_rj_yr}-W{_rj_wn}-1", format='%G-W%V-%u')
+                    _rj_wend   = _rj_wstart + pd.Timedelta(days=6)
+                    _rej_filtered = _rej_filtered[
+                        (_rej_filtered['DELIVERY DATE'] >= _rj_wstart) &
+                        (_rej_filtered['DELIVERY DATE'] <= _rj_wend)]
+                if _rej_city_sel_main:
+                    _rej_filtered = _rej_filtered[_rej_filtered['BUSINESS CITY'].isin(_rej_city_sel_main)]
+
+                # ── Total orders per city (for % calculation — use same filter scope) ──
+                _df_scope = df.copy()
+                if _rej_week_sel != "All Weeks":
+                    _df_scope = _df_scope[
+                        (_df_scope['DELIVERY DATE'] >= _rj_wstart) &
+                        (_df_scope['DELIVERY DATE'] <= _rj_wend)]
+                if _rej_city_sel_main:
+                    _df_scope = _df_scope[_df_scope['BUSINESS CITY'].isin(_rej_city_sel_main)]
+                _total_orders_by_city = _df_scope.groupby('BUSINESS CITY')['ID'].count()
+                _total_orders_by_biz  = _df_scope.groupby('BUSINESS NAME')['ID'].count()
+                _grand_total_orders   = len(_df_scope)
 
                 # ── City breakdown with % of total orders ──
-                _rej_city = (rejected_df.groupby('BUSINESS CITY')
+                _rej_city = (_rej_filtered.groupby('BUSINESS CITY')
                              .agg(Rejections=('ID','count'), Revenue_Lost=('SUBTOTAL','sum'))
                              .reset_index())
                 _rej_city['Total Orders'] = _rej_city['BUSINESS CITY'].map(_total_orders_by_city).fillna(0).astype(int)
@@ -1439,7 +1501,7 @@ with tab1:
                 _rej_city_disp = _rej_city_disp.rename(columns={'BUSINESS CITY': 'City', 'Revenue_Lost': 'Revenue Lost'})
 
                 # ── Restaurant breakdown with % of restaurant's total orders ──
-                _rej_biz = (rejected_df.groupby('BUSINESS NAME')
+                _rej_biz = (_rej_filtered.groupby('BUSINESS NAME')
                             .agg(Rejections=('ID','count'), Revenue_Lost=('SUBTOTAL','sum'))
                             .reset_index())
                 _rej_biz['Total Orders'] = _rej_biz['BUSINESS NAME'].map(_total_orders_by_biz).fillna(0).astype(int)
@@ -1454,7 +1516,7 @@ with tab1:
                     'Total Orders': _grand_total_orders,
                     'Rejection %': round(_rej_biz['Rejections'].sum() / max(_grand_total_orders,1) * 100, 1),
                 }])
-                _total_lost = rejected_df['SUBTOTAL'].sum()
+                _total_lost = _rej_filtered['SUBTOTAL'].sum()
 
                 # ── Sort control ──
                 _sort_col, _sort_info = st.columns([2, 3])
@@ -1486,32 +1548,50 @@ with tab1:
                     st.markdown("##### 🍽️ Top Restaurants with Rejections")
                     st.dataframe(_rej_biz_disp, use_container_width=True)
 
-                st.metric("💸 Total Revenue Lost to Rejections",
+                _scope_lbl = ""
+                if _rej_week_sel != "All Weeks": _scope_lbl += f" | {_rej_week_sel}"
+                if _rej_city_sel_main: _scope_lbl += f" | {', '.join(_rej_city_sel_main)}"
+                st.metric(f"💸 Total Revenue Lost to Rejections{_scope_lbl}",
                           f"{_total_lost/1e6:.2f}M TZS",
-                          delta=f"{len(rejected_df)} orders lost", delta_color="inverse")
+                          delta=f"{len(_rej_filtered)} orders lost", delta_color="inverse")
 
-                # ── Rejected by Hour — with city filter ──
-                st.markdown("##### 🕐 Rejected Orders by Hour of Day")
-                _rh_cities = sorted(rejected_df['BUSINESS CITY'].dropna().unique().tolist())
-                _rh_city_f = st.multiselect(
-                    "🏙️ Filter by City (Hour chart)", _rh_cities,
-                    placeholder="All cities", key="rej_hour_city"
-                )
-                _rej_hour_df = (rejected_df[rejected_df['BUSINESS CITY'].isin(_rh_city_f)]
-                                if _rh_city_f else rejected_df.copy())
-                _rej_hour = (pd.DataFrame() if 'HOUR' not in _rej_hour_df.columns
-                             else _rej_hour_df.groupby('HOUR').size().reset_index(name='Rejections'))
+                # ── Rejected by Hour — % of total orders that hour ──
+                st.markdown("##### 🕐 Rejection Rate by Hour of Day")
+                st.caption("Filters above (week & city) also apply to this chart. Y-axis = rejections ÷ total orders in that hour (%).")
+                if 'HOUR' in _rej_filtered.columns and 'HOUR' in _df_scope.columns:
+                    _rej_h_count   = _rej_filtered.groupby('HOUR').size().rename('Rejections')
+                    _total_h_count = _df_scope.groupby('HOUR').size().rename('Total')
+                    _rej_hour = pd.DataFrame({'Rejections': _rej_h_count, 'Total': _total_h_count}).reset_index()
+                    _rej_hour = _rej_hour.dropna(subset=['Rejections'])
+                    _rej_hour['Total'] = _rej_hour['Total'].fillna(0)
+                    _rej_hour['Rej %'] = (_rej_hour['Rejections'] / _rej_hour['Total'].replace(0, 1) * 100).round(1)
+                    _rej_hour['Hour_Label'] = _rej_hour['HOUR'].astype(int).apply(lambda h: f"{h:02d}:00")
+                    _rej_hour = _rej_hour.sort_values('HOUR')
 
-                if not _rej_hour.empty:
-                    fig_rh, ax_rh = plt.subplots(figsize=(12,4))
-                    _rh_title = f"Rejected Orders by Hour{' — ' + ', '.join(_rh_city_f) if _rh_city_f else ' — All Cities'}"
-                    ax_rh.bar(_rej_hour['HOUR'].astype(str).apply(lambda h: f"{int(h):02d}:00"),
-                              _rej_hour['Rejections'], color='#9467bd', alpha=0.8)
-                    ax_rh.set_title(_rh_title)
-                    ax_rh.set_xlabel("Hour"); ax_rh.set_ylabel("Rejections")
-                    ax_rh.grid(True, alpha=0.3, axis='y')
-                    plt.xticks(rotation=45); plt.tight_layout()
-                    st.pyplot(fig_rh); plt.close()
+                    if not _rej_hour.empty:
+                        _city_lbl = ', '.join(_rej_city_sel_main) if _rej_city_sel_main else 'All Cities'
+                        _week_lbl = _rej_week_sel if _rej_week_sel != 'All Weeks' else 'All Weeks'
+                        fig_rh, ax_rh = plt.subplots(figsize=(12, 4))
+                        _bar_cols = ['#b71c1c' if v >= 10 else ('#e57373' if v >= 5 else '#9467bd')
+                                     for v in _rej_hour['Rej %']]
+                        _bars = ax_rh.bar(_rej_hour['Hour_Label'], _rej_hour['Rej %'],
+                                          color=_bar_cols, alpha=0.85, edgecolor='white', linewidth=0.5)
+                        # Value labels on bars
+                        for _b, _pct in zip(_bars, _rej_hour['Rej %']):
+                            if _pct > 0.3:
+                                ax_rh.text(_b.get_x() + _b.get_width()/2,
+                                           _b.get_height() + 0.15, f"{_pct:.1f}%",
+                                           ha='center', va='bottom', fontsize=7.5, fontweight='bold')
+                        ax_rh.axhline(5, color='orange', linestyle='--', lw=1.2, alpha=0.7, label='5% threshold')
+                        ax_rh.axhline(10, color='#b71c1c', linestyle='--', lw=1.2, alpha=0.7, label='10% critical')
+                        ax_rh.set_title(f"Rejection Rate by Hour — {_week_lbl} | {_city_lbl}",
+                                        fontweight='bold', fontsize=11)
+                        ax_rh.set_xlabel("Hour of Day"); ax_rh.set_ylabel("Rejection Rate (%)")
+                        ax_rh.legend(fontsize=8); ax_rh.grid(True, alpha=0.2, axis='y')
+                        plt.xticks(rotation=45, fontsize=8); plt.tight_layout()
+                        st.pyplot(fig_rh); plt.close()
+                        st.caption("🔴 >10% = critical · 🟠 5–10% = high · 🟣 <5% = normal  |  "
+                                   "Rate = rejections ÷ total orders in that hour")
 
                 # ── AI insight — auto-runs ──
                 _rej_ctx = (
@@ -1796,6 +1876,80 @@ with tab1:
         file_name="Restaurant_Weekly_Trend.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
+    # ── 🤖 AI Insight — Restaurant Trend Monitor ────────────
+    st.markdown("---")
+    st.markdown("#### 🤖 AI Restaurant Intelligence")
+    st.caption("Auto-generated analysis: inactive restaurants · decline trends · growth opportunities · recommended actions")
+
+    if _rv_latest and len(_rv_wk_cols) >= 2:
+        # Build context for AI
+        _rv_inactive_list = (_rv_pivot[_rv_pivot[_rv_latest] == 0][['City','BUSINESS NAME','Total']]
+                              .query("Total > 0").sort_values('Total', ascending=False).head(15))
+        _rv_declining_list = (_rv_pivot[_rv_pivot['Trend'] == '📉 Declining']
+                               .sort_values('WoW Change', ascending=True)
+                               [['City','BUSINESS NAME',_rv_latest,'WoW Change','Total']].head(15))
+        _rv_growing_list = (_rv_pivot[_rv_pivot['Trend'] == '📈 Growing']
+                             .sort_values('WoW Change', ascending=False)
+                             [['City','BUSINESS NAME',_rv_latest,'WoW Change','Total']].head(10))
+        _rv_top10 = _rv_pivot.nlargest(10,'Total')[['City','BUSINESS NAME'] + list(_rv_wk_cols) + ['Total','WoW Change','Trend']]
+
+        _rv_ai_ctx = (
+            "RESTAURANT WEEKLY TREND ANALYSIS - " + str(len(_rv_wk_cols)) + " weeks tracked\n"
+            + "Total restaurants: " + str(_rv_total_biz) + " | Latest week: " + str(_rv_latest) + "\n"
+            + "Inactive latest week (had orders before): " + str(_rv_inactive_n) + "\n"
+            + "Growing: " + str(_rv_growing_n) + " | Declining: " + str(_rv_declining_n) + " | Stable: " + str(_rv_stable_n) + "\n\n"
+            + "TOP 10 RESTAURANTS BY TOTAL ORDERS:\n" + _rv_top10.to_string(index=False) + "\n\n"
+            + "INACTIVE THIS WEEK (had orders before - possible closure/issue):\n"
+            + (_rv_inactive_list.to_string(index=False) if not _rv_inactive_list.empty else 'None') + "\n\n"
+            + "DECLINING RESTAURANTS (ordered by biggest drop):\n"
+            + (_rv_declining_list.to_string(index=False) if not _rv_declining_list.empty else 'None') + "\n\n"
+            + "GROWING RESTAURANTS:\n"
+            + (_rv_growing_list.to_string(index=False) if not _rv_growing_list.empty else 'None') + "\n"
+        )
+        _rv_ai_prompt = (
+            "You are a senior business intelligence analyst for Piki, a Tanzanian food delivery platform. "
+            "Your analysis directly informs the commercial team's daily decisions.\n\n"
+            + _rv_ai_ctx
+            + "\n\nProvide a PROFESSIONAL, INSIGHTFUL analysis with these sections:\n\n"
+            "1. **INACTIVE ALERT** - List each restaurant that went to ZERO this week. "
+            "For each: was this a top performer? Estimate weekly revenue at risk. "
+            "Possible causes (operational hours change, supply issue, system error, seasonal). "
+            "Urgency level and recommended action (call within 24h, investigate, monitor).\n\n"
+            "2. **DECLINE WATCH** - For the top 5 declining restaurants: "
+            "quantify the drop (orders and estimated revenue), assess whether the decline is accelerating, "
+            "suggest likely root causes (menu issues, competitor entry, service quality, delivery time), "
+            "and what the account manager should do in the next 48 hours.\n\n"
+            "3. **GROWTH SPOTLIGHT** - Which restaurants are growing strongly? "
+            "What can the team learn from their success (menu, promotions, location)? "
+            "Should more similar restaurants be recruited?\n\n"
+            "4. **PORTFOLIO HEALTH SCORE** - Overall assessment: "
+            "Is the restaurant mix healthy? Concentration risk (are top 3 restaurants >50% of orders)? "
+            "Which cities need urgent restaurant acquisition?\n\n"
+            "5. **3 ACTIONS THIS WEEK** - Specific, numbered, actionable steps with restaurant names and cities.\n\n"
+            "Use exact numbers. Be direct. Do not repeat statistics already visible in tables. "
+            "Focus on insight, causality and recommended action."
+        )
+        _rv_ins_key = "rv_auto_insight"
+        _rv_ctx_hash = str(hash(_rv_ai_ctx[:300]))
+        if _rv_ins_key not in st.session_state:
+            st.session_state[_rv_ins_key] = None
+            st.session_state[_rv_ins_key + "_h"] = None
+        if (st.session_state[_rv_ins_key] is None or
+                st.session_state.get(_rv_ins_key + "_h") != _rv_ctx_hash):
+            with st.spinner("🤖 Analyzing restaurant portfolio — inactive alerts, decline trends, growth signals…"):
+                try:
+                    st.session_state[_rv_ins_key] = claude_insight(_rv_ai_prompt, 1200)
+                    st.session_state[_rv_ins_key + "_h"] = _rv_ctx_hash
+                except Exception as _rv_err:
+                    st.session_state[_rv_ins_key] = f"Analysis error: {_rv_err}"
+        if st.session_state[_rv_ins_key]:
+            ai_block("restaurant_trend", _rv_ai_ctx, st.session_state[_rv_ins_key])
+            if st.button("🔄 Refresh Restaurant AI Analysis", key="btn_rv_refresh"):
+                st.session_state[_rv_ins_key] = None
+                st.rerun()
+    else:
+        st.info("Need at least 2 weeks of data for restaurant AI analysis.")
+
 # TAB 2 — DELIVERY TIMES
 # ═══════════════════════════════════════════════════════════════
 with tab2:
@@ -1860,19 +2014,42 @@ with tab2:
         _wk_avg_dist = 0.0; _wk_p2c_tgt = 16.0
     _wk_total_tgt = round(sum(STAGE_TARGETS_FIXED.values()) + _wk_p2c_tgt, 1)
 
+    # Count total completed vs clean (problematic = excluded)
+    _total_completed = len(df2_week[df2_week['STATE'].isin(['Delivery Completed By Driver','Completed'])])
+    _clean_count = len(_comp)
+    _problematic_count = _total_completed - _clean_count
+
+    # Filter factors info
+    _filter_factors = (
+        "Accepted by Business >15 min · Assigned Time >15 min · Accepted by Driver >15 min · "
+        "Driver→Restaurant >30 min · Vendor Prep >45 min · Pickup→Customer >45 min · "
+        "Total Delivery Time >120 min"
+    )
+
+    # Show order count transparency card before metrics
+    _count_col = "normal" if _problematic_count == 0 else ("off" if _problematic_count / max(_total_completed,1) < 0.05 else "inverse")
+    st.info(
+        f"📊 **Data basis (clean completed orders only):** "
+        f"{_clean_count:,} orders counted · "
+        f"{_problematic_count:,} problematic orders excluded "
+        f"({_problematic_count/_total_completed*100:.1f}% of {_total_completed:,} completed)  |  "
+        f"**Exclusion filters:** {_filter_factors}",
+        icon="ℹ️"
+    )
+
     mc1, mc2, mc3, mc4 = st.columns(4)
-    mc1.metric("⏱ Avg Delivery Time",
+    mc1.metric("⏱ Avg Delivery Time  (clean orders)",
                f"{avg_adt:.1f} min",
                delta=f"Target {_wk_total_tgt:.1f} min",
                delta_color=("normal" if avg_adt <= _wk_total_tgt else "inverse"),
                help=f"Sum of all 6 stages incl. overhead. Target=25.5+P2C({_wk_p2c_tgt:.1f}) for avg {_wk_avg_dist:.1f} km")
-    mc2.metric("🍳 Vendor Prep Time",    f"{avg_dib:.1f} min",
+    mc2.metric("🍳 Vendor Prep Time  (clean orders)",    f"{avg_dib:.1f} min",
                delta="Target 12 min",  delta_color=("normal" if avg_dib <= 12 else "inverse"))
-    mc3.metric("🛵 Pickup→Customer",     f"{avg_p2c:.1f} min",
+    mc3.metric("🛵 Pickup→Customer  (clean orders)",     f"{avg_p2c:.1f} min",
                delta=f"Target {_wk_p2c_tgt:.1f} min",
                delta_color=("normal" if avg_p2c <= _wk_p2c_tgt else "inverse"),
                help=f"Drive time + 6 min overhead. Avg dist = {_wk_avg_dist:.1f} km")
-    mc4.metric("✅ Business Acceptance", f"{avg_abb:.1f} min",
+    mc4.metric("✅ Business Acceptance  (clean orders)", f"{avg_abb:.1f} min",
                delta="Target 2 min", delta_color=("normal" if avg_abb <= 2 else "inverse"))
 
     # ── Stage methodology note ──
@@ -2174,7 +2351,8 @@ with tab2:
             _story = (f"Last week avg delivery was **{_last_val:.1f} min** — "
                       f"stable vs previous average of {_prev_avg:.1f} min →.")
 
-        _fig_adt, _ax_adt = plt.subplots(figsize=(max(10, len(_adt_labels) * 1.2), 5))
+        _fig_width = min(16, max(9, len(_adt_labels) * 1.1))
+        _fig_adt, _ax_adt = plt.subplots(figsize=(_fig_width, 4.5))
 
         # Previous average dashed line
         _ax_adt.axhline(_prev_avg, color='#95a5a6', linestyle='--', lw=1.5, alpha=0.8,
@@ -2211,10 +2389,14 @@ with tab2:
         _ax_adt.set_ylabel("Avg Delivery Time (min)")
         _ax_adt.set_xlabel("Week")
         _adt_city_title = f" — {', '.join(_t2_city_f)}" if _t2_city_f else " — All Cities"
-        _ax_adt.set_title(f"Weekly Avg Delivery Time Trend{_adt_city_title} (Clean Completed Orders)")
+        _ax_adt.set_title(
+            f"Weekly Avg Delivery Time Trend{_adt_city_title}\n"
+            f"(Problematic orders excluded — {_clean_count:,} clean / {_problematic_count:,} excluded this week)",
+            fontsize=10, fontweight='bold')
         _ax_adt.grid(True, alpha=0.25, axis='y')
         _ax_adt.legend(fontsize=9)
-        plt.tight_layout()
+        _ax_adt.margins(x=0.04)
+        plt.tight_layout(pad=1.5)
         st.pyplot(_fig_adt); plt.close()
 
         # Story explanation card
@@ -2720,17 +2902,37 @@ with tab3:
     if _all_att:
         _att_all = pd.concat(_all_att, ignore_index=True)
         _att_all['Working Zone'] = _att_all['DRIVER NAME'].map(_dr_zone)
-        _att_cols = ['Week','DRIVER NAME','Working Zone'] + _weekdays_order + ['Days','Orders']
+        _att_all['Orders'] = pd.to_numeric(_att_all['Orders'], errors='coerce').fillna(0).astype(int)
+        _att_all['Days']   = pd.to_numeric(_att_all['Days'],   errors='coerce').fillna(0).astype(int)
+        # Rider:Order ratio = 1 rider per N orders (lower = better utilisation)
+        _att_all['Orders/Day'] = _att_all.apply(
+            lambda r: round(r['Orders'] / r['Days'], 1) if r['Days'] > 0 else 0.0, axis=1)
+        _att_cols = ['Week','DRIVER NAME','Working Zone'] + _weekdays_order + ['Days','Orders','Orders/Day']
         _att_all = _att_all[[c for c in _att_cols if c in _att_all.columns]]
         _perf_zones = sorted(_att_all['Working Zone'].dropna().unique())
         _att_show = _att_all.copy()
 
-        # Total row
+        # ── Zone summary (worst = highest riders vs lowest orders/rider) ──
+        _zone_summary = (_att_all.groupby('Working Zone').agg(
+            Riders=('DRIVER NAME','nunique'),
+            Total_Orders=('Orders','sum'),
+        ).reset_index())
+        _zone_summary['Orders/Rider'] = (_zone_summary['Total_Orders'] / _zone_summary['Riders'].replace(0,1)).round(1)
+        _zone_summary['Rider:Order Ratio'] = _zone_summary.apply(
+            lambda r: f"1:{r['Orders/Rider']:.0f}" if r['Orders/Rider'] > 0 else "—", axis=1)
+        _zone_worst = _zone_summary.nsmallest(1, 'Orders/Rider')['Working Zone'].values[0] if not _zone_summary.empty else "—"
+        st.caption(f"⚠️ **Worst zone (lowest orders per rider):** {_zone_worst} — consider rebalancing riders there")
+
+        # Total row at bottom
         _att_numeric = _att_show[['Days','Orders']].sum()
+        _att_total_orders_per_day = round(_att_numeric['Orders'] / max(_att_numeric['Days'],1), 1)
         _att_total_row = pd.DataFrame([{
-            'Week': '—', 'DRIVER NAME': 'TOTAL', 'Working Zone': f"{_att_show['DRIVER NAME'].nunique()} drivers",
+            'Week': '—', 'DRIVER NAME': '▌ TOTAL ALL RIDERS',
+            'Working Zone': f"{_att_show['DRIVER NAME'].nunique()} drivers",
             **{d: '' for d in _weekdays_order},
-            'Days': _att_numeric['Days'], 'Orders': int(_att_numeric['Orders'])
+            'Days': int(_att_numeric['Days']),
+            'Orders': int(_att_numeric['Orders']),
+            'Orders/Day': _att_total_orders_per_day,
         }])
         _att_display = pd.concat([_att_show, _att_total_row], ignore_index=True)
 
@@ -2740,9 +2942,15 @@ with tab3:
             if v == '—':  return 'background-color:#fff3cd;color:#856404'
             return ''
 
-        st.dataframe(_att_display.style.applymap(_style_att,
-                     subset=[c for c in _weekdays_order if c in _att_display.columns]),
-                     use_container_width=True, height=400)
+        def _style_att_total(row):
+            if str(row.get('DRIVER NAME','')).startswith('▌'):
+                return ['background-color:#1e3a5f;color:#fff;font-weight:800'] * len(row)
+            return [''] * len(row)
+
+        _att_styled = (_att_display.style
+            .applymap(_style_att, subset=[c for c in _weekdays_order if c in _att_display.columns])
+            .apply(_style_att_total, axis=1))
+        st.dataframe(_att_styled, use_container_width=True, height=420)
         st.download_button("⬇️ Download Attendance (8 weeks)",
                            data=excel_bytes(_att_all, "Attendance"),
                            file_name="Driver_Attendance_8W.xlsx",
@@ -3698,6 +3906,13 @@ with tab3:
             lambda x: _BONUS if x == '✅ Yes' else 0)
         _bonus_df['Total Bonus (TZS)'] = _bonus_df['Availability Bonus'] + _bonus_df['DT Bonus']
 
+        # Add Driver ID for Excel sorting
+        if 'DRIVER ID' in _regional_df.columns:
+            _reg_did_map = (_regional_df.dropna(subset=['DRIVER ID'])
+                            .groupby('DRIVER NAME')['DRIVER ID'].first().to_dict())
+            _bonus_df.insert(0, 'DRIVER ID', _bonus_df['Rider Name'].map(_reg_did_map))
+            _bonus_df = _bonus_df.sort_values('DRIVER ID', na_position='last').reset_index(drop=True)
+
         # Summary metrics
         _b1, _b2, _b3, _b4 = st.columns(4)
         _b1.metric("👥 Eligible Riders",     f"{len(_bonus_df[_bonus_df['Total Bonus (TZS)']>0])}")
@@ -4313,17 +4528,54 @@ with tab5:
         _product_category_map = dict(zip(_cdf['Product'], _cdf['Category']))
         _cat_loaded = True
 
-    # ── KPI Summary ──
+    # ── KPI Summary — CURRENT WEEK ONLY ──
+    _pp_df['_pp_wk'] = _pp_df['DELIVERY DATE'].dt.to_period('W-SUN')
+    _pp_wks_sorted = sorted(_pp_df['_pp_wk'].dropna().unique(), reverse=True)
+    _pp_cur_wk  = _pp_wks_sorted[0] if _pp_wks_sorted else None
+    _pp_prev_wk = _pp_wks_sorted[1] if len(_pp_wks_sorted) >= 2 else None
+    _pp_cur = _pp_df[_pp_df['_pp_wk'] == _pp_cur_wk] if _pp_cur_wk else _pp_df.iloc[0:0]
+    _pp_prev = _pp_df[_pp_df['_pp_wk'] == _pp_prev_wk] if _pp_prev_wk else _pp_df.iloc[0:0]
+
+    def _pp_delta(cur, prev, invert=False):
+        if prev == 0: return None
+        diff = cur - prev
+        pct = diff / prev * 100
+        arrow = "▲" if diff > 0 else "▼"
+        col = ("inverse" if invert else "normal") if diff > 0 else ("normal" if invert else "inverse")
+        return f"{arrow} {abs(pct):.1f}% WoW", col
+
+    _pp_comp_cur = _pp_cur[_pp_cur['STATE'].isin(['Completed','Delivery Completed By Driver'])]
+    _pp_fail_cur = _pp_cur[_pp_cur['STATE'] == 'Delivery Failed By Driver']
+    _pp_rej_cur  = _pp_cur[_pp_cur['STATE'].str.contains('Reject', na=False)]
+    _pp_comp_prev= _pp_prev[_pp_prev['STATE'].isin(['Completed','Delivery Completed By Driver'])] if not _pp_prev.empty else _pp_df.iloc[0:0]
+
+    _pp_wk_lbl = f"Wk {_pp_cur_wk.week} ({_pp_cur_wk.start_time.strftime('%d %b')})" if _pp_cur_wk else "Current"
+    st.markdown(f"##### 📅 Showing: **{_pp_wk_lbl}** (current week)")
+
+    _pp_ord_delta = _pp_delta(len(_pp_cur), len(_pp_prev))
+    _pp_sales_delta = _pp_delta(_pp_comp_cur['SUBTOTAL'].sum(), _pp_comp_prev['SUBTOTAL'].sum() if not _pp_comp_prev.empty else 0)
+    _pp_rej_delta = _pp_delta(len(_pp_rej_cur), len(_pp_prev[_pp_prev['STATE'].str.contains('Reject', na=False)]) if not _pp_prev.empty else 0, invert=True)
+
+    _pk1,_pk2,_pk3,_pk4,_pk5 = st.columns(5)
+    _pk1.metric(f"📦 Total Orders",
+                f"{len(_pp_cur):,}",
+                delta=_pp_ord_delta[0] if _pp_ord_delta else None,
+                delta_color=_pp_ord_delta[1] if _pp_ord_delta else "off")
+    _pk2.metric("✅ Completed",        f"{len(_pp_comp_cur):,}")
+    _pk3.metric("❌ Failed",           f"{len(_pp_fail_cur)}")
+    _pk4.metric("🚫 Rejected",
+                f"{len(_pp_rej_cur)}",
+                delta=_pp_rej_delta[0] if _pp_rej_delta else None,
+                delta_color=_pp_rej_delta[1] if _pp_rej_delta else "off")
+    _pk5.metric("💰 Total Sales",
+                f"{_pp_comp_cur['SUBTOTAL'].sum()/1e6:.2f}M TZS",
+                delta=_pp_sales_delta[0] if _pp_sales_delta else None,
+                delta_color=_pp_sales_delta[1] if _pp_sales_delta else "off")
+
+    # Reassign for downstream use (apply filters to full data)
     _pp_comp = _pp_df[_pp_df['STATE'].isin(['Completed','Delivery Completed By Driver'])]
     _pp_fail = _pp_df[_pp_df['STATE'] == 'Delivery Failed By Driver']
     _pp_rej  = _pp_df[_pp_df['STATE'].str.contains('Reject', na=False)]
-
-    _pk1,_pk2,_pk3,_pk4,_pk5 = st.columns(5)
-    _pk1.metric("📦 Total Orders",    f"{len(_pp_df):,}")
-    _pk2.metric("✅ Completed",        f"{len(_pp_comp):,}")
-    _pk3.metric("❌ Failed",           f"{len(_pp_fail)}")
-    _pk4.metric("🚫 Rejected",         f"{len(_pp_rej)}")
-    _pk5.metric("💰 Total Sales",      f"{_pp_comp['SUBTOTAL'].sum()/1e6:.2f}M TZS")
 
     # ── Filters row ──
     st.markdown("---")
@@ -4401,6 +4653,166 @@ with tab5:
             use_container_width=True)
     else:
         st.info("No completed orders in selected period.")
+
+    # ────────────────────────────────────────────────────────────────
+    # DAY-OF-WEEK DRILLDOWN — Interactive daily performance explorer
+    # ────────────────────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown('<div class="section-header">📅 Daily Performance Drilldown</div>', unsafe_allow_html=True)
+    st.caption("Click any day to see full details — orders, revenue, delivery time, customer insights, and more")
+
+    # Build day-of-week data from latest week in selection
+    _pp_dow_df = _pp_df.copy()
+    _pp_dow_df['DELIVERY DATE'] = pd.to_datetime(_pp_dow_df['DELIVERY DATE'], errors='coerce')
+    _pp_dow_df['_dow_wk'] = _pp_dow_df['DELIVERY DATE'].dt.to_period('W-SUN')
+
+    # Week selector for drilldown
+    _pp_dow_wks = sorted(_pp_dow_df['_dow_wk'].dropna().unique(), reverse=True)
+    _pp_dow_wk_opts = [f"Wk {p.week} ({p.start_time.strftime('%d %b')})" for p in _pp_dow_wks[:12]]
+    _pp_dow_sel_str = st.selectbox(
+        "📅 Select week to drill into",
+        _pp_dow_wk_opts, index=0, key="pp_dow_week_sel"
+    )
+    _pp_dow_sel_wk = _pp_dow_wks[_pp_dow_wk_opts.index(_pp_dow_sel_str)]
+    _pp_dow_data   = _pp_dow_df[_pp_dow_df['_dow_wk'] == _pp_dow_sel_wk].copy()
+    _pp_dow_data['DayName'] = _pp_dow_data['DELIVERY DATE'].dt.day_name()
+    _pp_dow_data['HOUR']    = pd.to_datetime(_pp_dow_data.get('DELIVERY TIME', pd.NaT), errors='coerce').dt.hour
+
+    _days_ordered = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday']
+    _pp_dow_comp = _pp_dow_data[_pp_dow_data['STATE'].isin(['Completed','Delivery Completed By Driver'])]
+
+    # Build day summary
+    _pp_day_summary = []
+    for _day in _days_ordered:
+        _d_all  = _pp_dow_data[_pp_dow_data['DayName'] == _day]
+        _d_comp = _pp_dow_comp[_pp_dow_comp['DayName'] == _day]
+        if len(_d_all) == 0: continue
+        _pp_day_summary.append({
+            'Day': _day, 'Day_Short': _day[:3],
+            'Total Orders': len(_d_all),
+            'Completed': len(_d_comp),
+            'Sales (TZS)': _d_comp['SUBTOTAL'].sum() if not _d_comp.empty else 0,
+        })
+    _pp_day_df = pd.DataFrame(_pp_day_summary)
+
+    if not _pp_day_df.empty:
+        # ── Bar chart — clickable via selectbox ──
+        _fig_dow, _ax_dow = plt.subplots(figsize=(11, 4))
+        _bar_colors = ['#4d96ff' if d != _pp_day_df.loc[_pp_day_df['Total Orders'].idxmax(), 'Day_Short']
+                       else '#FF6B00' for d in _pp_day_df['Day_Short']]
+        _bars_dow = _ax_dow.bar(_pp_day_df['Day_Short'], _pp_day_df['Total Orders'],
+                                color=_bar_colors, alpha=0.88, edgecolor='white', linewidth=0.5)
+        for _b, _v in zip(_bars_dow, _pp_day_df['Total Orders']):
+            _ax_dow.text(_b.get_x() + _b.get_width()/2, _b.get_height() + 0.3,
+                         str(_v), ha='center', fontsize=9, fontweight='bold')
+        _ax_dow2 = _ax_dow.twinx()
+        _ax_dow2.plot(_pp_day_df['Day_Short'], _pp_day_df['Sales (TZS)'] / 1e6,
+                      marker='o', color='#6bcb77', lw=2, markersize=6, label='Sales (M TZS)')
+        _ax_dow.set_ylabel("Total Orders", color='#4d96ff')
+        _ax_dow2.set_ylabel("Sales (M TZS)", color='#6bcb77')
+        _ax_dow.set_title(f"Piki Party — Daily Orders & Sales | {_pp_dow_sel_str}",
+                          fontweight='bold', fontsize=11)
+        _ax_dow.grid(axis='y', alpha=0.2)
+        _ax_dow2.legend(loc='upper right', fontsize=8)
+        plt.tight_layout(pad=1.2)
+        st.pyplot(_fig_dow); plt.close()
+
+        # ── Day selector for drilldown ──
+        _pp_day_opts = _pp_day_df['Day'].tolist()
+        _pp_sel_day  = st.selectbox(
+            "👆 Select a day for detailed breakdown",
+            _pp_day_opts,
+            index=_pp_day_df['Total Orders'].idxmax(),
+            key="pp_dow_day_sel",
+            help="Select any day to see full details"
+        )
+
+        _dd = _pp_dow_data[_pp_dow_data['DayName'] == _pp_sel_day].copy()
+        _dd_comp = _dd[_dd['STATE'].isin(['Completed','Delivery Completed By Driver'])]
+        _dd_fail = _dd[_dd['STATE'] == 'Delivery Failed By Driver']
+        _dd_rej  = _dd[_dd['STATE'].str.contains('Reject', na=False)]
+        _dd_pick = _dd[_dd.get('DELIVERY TYPE', pd.Series([''] * len(_dd))).str.lower().str.contains('pickup', na=False)] if 'DELIVERY TYPE' in _dd.columns else pd.DataFrame()
+        _dd_late = _dd[_dd['HOUR'].isin([22,23,0,1,2,3])] if 'HOUR' in _dd.columns else pd.DataFrame()
+        _dd_high = _dd_comp[_dd_comp['SUBTOTAL'] >= _dd_comp['SUBTOTAL'].quantile(0.9)] if not _dd_comp.empty and 'SUBTOTAL' in _dd_comp.columns else pd.DataFrame()
+        _dd_uniq_cust = _dd['CUSTOMER ID'].nunique() if 'CUSTOMER ID' in _dd.columns else 0
+
+        # DT for this day
+        try:
+            _dd_stages = compute_delivery_stages(_dd_comp)
+            _dd_avg_dt = round(_dd_stages['Average Delivery Time'].dropna().mean(), 1) if not _dd_stages.empty and 'Average Delivery Time' in _dd_stages.columns else 0.0
+        except Exception:
+            _dd_avg_dt = 0.0
+
+        st.markdown(f"""
+        <div style="background:linear-gradient(135deg,#1a237e,#283593);color:white;
+                    border-radius:12px;padding:18px 22px;margin:8px 0 16px 0;">
+          <h3 style="margin:0 0 4px 0;font-size:1.3rem;">📅 {_pp_sel_day} — Full Day Report</h3>
+          <p style="margin:0;opacity:0.8;font-size:13px;">{_pp_dow_sel_str}</p>
+        </div>""", unsafe_allow_html=True)
+
+        _dd_c1,_dd_c2,_dd_c3,_dd_c4 = st.columns(4)
+        _dd_c1.metric("📦 Total Orders", len(_dd))
+        _dd_c2.metric("✅ Completed",    len(_dd_comp))
+        _dd_c3.metric("🚫 Rejected",    len(_dd_rej))
+        _dd_c4.metric("❌ Failed",       len(_dd_fail))
+
+        _dd_c5,_dd_c6,_dd_c7,_dd_c8 = st.columns(4)
+        _dd_c5.metric("💰 Revenue",      f"{_dd_comp['SUBTOTAL'].sum()/1e6:.2f}M TZS" if not _dd_comp.empty else "—")
+        _dd_c6.metric("⏱ Avg DT",       f"{_dd_avg_dt:.1f} min" if _dd_avg_dt else "—")
+        _dd_c7.metric("👥 Unique Customers", _dd_uniq_cust)
+        _dd_c8.metric("🌙 Late Night Orders", len(_dd_late))
+
+        _dd_c9,_dd_c10,_dd_c11,_dd_c12 = st.columns(4)
+        _dd_c9.metric("🛍️ Pickup Orders", len(_dd_pick) if not _dd_pick.empty else 0)
+        _dd_c10.metric("💎 High-Value Orders (top 10%)", len(_dd_high))
+        _dd_c11.metric("💵 Avg Order Value",
+                       f"{_dd_comp['SUBTOTAL'].mean()/1000:.0f}K TZS" if not _dd_comp.empty else "—")
+        _dd_c12.metric("📊 Completion Rate",
+                       f"{len(_dd_comp)/max(len(_dd),1)*100:.1f}%")
+
+        # Hourly breakdown for that day
+        if 'HOUR' in _dd.columns and not _dd.empty:
+            _dd_hourly = (_dd.groupby('HOUR').agg(
+                Orders=('ID','count'),
+                Completed=('STATE', lambda x: (x.isin(['Completed','Delivery Completed By Driver'])).sum()),
+                Revenue=('SUBTOTAL','sum')
+            ).reset_index().sort_values('HOUR'))
+            _dd_hourly['Hour_Label'] = _dd_hourly['HOUR'].apply(lambda h: f"{int(h):02d}:00")
+
+            with st.expander(f"🕐 Hourly Breakdown — {_pp_sel_day}", expanded=False):
+                _fh, _ah = plt.subplots(figsize=(10,3))
+                _ah.bar(_dd_hourly['Hour_Label'], _dd_hourly['Orders'],
+                        color='#4d96ff', alpha=0.8, label='Total')
+                _ah.bar(_dd_hourly['Hour_Label'], _dd_hourly['Completed'],
+                        color='#6bcb77', alpha=0.8, label='Completed')
+                _ah.set_title(f"Orders by Hour — {_pp_sel_day}", fontweight='bold')
+                _ah.set_ylabel("Orders"); _ah.grid(axis='y', alpha=0.2)
+                _ah.legend(fontsize=8); plt.xticks(rotation=45, fontsize=7.5)
+                plt.tight_layout(pad=1.2); st.pyplot(_fh); plt.close()
+                st.dataframe(_dd_hourly[['Hour_Label','Orders','Completed','Revenue']].rename(
+                    columns={'Hour_Label':'Hour','Revenue':'Revenue (TZS)'}
+                ), use_container_width=True)
+
+        # Top products that day
+        if not _dd_comp.empty and 'PRODUCTS' in _dd_comp.columns:
+            from collections import Counter
+            _dd_prod_cnt = Counter()
+            for _, _pr in _dd_comp.iterrows():
+                for _pn, _qty in extract_products(_pr.get('PRODUCTS','')):
+                    _dd_prod_cnt[standardize_product(_pn)] += _qty
+            if _dd_prod_cnt:
+                _dd_top_prod = pd.DataFrame(
+                    _dd_prod_cnt.most_common(10), columns=['Product','Qty']
+                )
+                with st.expander(f"📦 Top Products Sold — {_pp_sel_day}", expanded=False):
+                    _fp, _ap = plt.subplots(figsize=(9,3))
+                    _ap.barh(_dd_top_prod['Product'][::-1], _dd_top_prod['Qty'][::-1],
+                             color='#FF6B00', alpha=0.85)
+                    _ap.set_title(f"Top Products — {_pp_sel_day}", fontweight='bold', fontsize=10)
+                    _ap.set_xlabel("Quantity Sold"); _ap.grid(axis='x', alpha=0.2)
+                    plt.tight_layout(pad=1.2); st.pyplot(_fp); plt.close()
+    else:
+        st.info("No orders found for the selected week.")
 
     # ────────────────────────────────────────────────
     # PRODUCT ANALYSIS
