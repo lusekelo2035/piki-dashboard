@@ -115,6 +115,22 @@ st.markdown("""
 # CONSTANTS
 # ─────────────────────────────────────────────────
 FAILED_KPI       = 10          # max failed orders / week
+
+# ── Shared outlier exclusion limits for ALL delivery time calculations ──
+STAGE_OUTLIER_LIMITS = {
+    "Accepted by Business": (0, 30),   # flag if >30 min
+    "Assigned Time":        (0, 30),
+    "Accepted by Driver":   (0, 30),
+    "Driver to Business":   (0, 60),   # flag if >60 min
+    "Driver in Business":   (0, 90),   # flag if >90 min (vendor prep)
+    "Pickup to Customer":   (0, 60),   # flag if >60 min
+    "Average Delivery Time":(0, 150),  # exclude extreme outliers only
+}
+STAGE_OUTLIER_LABELS = (
+    "Accepted by Business >30 min · Assigned Time >30 min · Accepted by Driver >30 min · "
+    "Driver→Restaurant >60 min · Vendor Prep >90 min · Pickup→Customer >60 min · "
+    "Total Delivery Time >150 min"
+)
 GROWTH_RATE      = 0.012       # 1.2% weekly KPI
 KPI_START_YEAR   = 2026
 TARGET_RIDERS    = pd.DataFrame({
@@ -221,6 +237,7 @@ def total_target(dist_straight_km: float) -> float:
     return round(fixed + p2c_target(dist_straight_km), 1)
 
 
+@st.cache_data(show_spinner=False)
 def compute_delivery_stages(df):
     """
     Add all delivery stage columns to df (in-place-safe via copy).
@@ -315,6 +332,7 @@ def apply_growth_kpi(weekly):
         weekly.loc[i, 'Growth KPI Orders'] = weekly.loc[i-1, 'Growth KPI Orders'] * (1 + GROWTH_RATE)
     return weekly
 
+@st.cache_data(show_spinner=False)
 def add_distance(df):
     if not all(c in df.columns for c in ['CUSTOMER LATITUDE','CUSTOMER LONGITUDE',
                                           'BUSINESS LATITUDE','BUSINESS LONGITUDE']):
@@ -654,6 +672,41 @@ Use real numbers. Be concise."""
 # ─────────────────────────────────────────────────
 # SIDEBAR — Upload & Global Filters
 # ─────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════
+# PRE-COMPUTED DATA CACHE
+# Heavy transformations run once on raw data and are cached.
+# All tabs and sections reuse these — filter changes are FAST.
+# ══════════════════════════════════════════════════════════════
+@st.cache_data(show_spinner=False)
+def _precompute_stages(df_raw):
+    """Compute delivery stages + distance for entire raw dataset once."""
+    _s = compute_delivery_stages(df_raw)
+    _s = add_distance(_s)
+    if 'HOUR' not in _s.columns:
+        _s['HOUR'] = pd.to_datetime(_s.get('DELIVERY TIME', pd.NaT), errors='coerce').dt.hour.fillna(12).astype(int)
+    return _s
+
+
+@st.cache_data(show_spinner=False)
+def _apply_filters(df_staged, date_range, city_sel, biz_sel, hour_opt, custom_hours):
+    """Apply global sidebar filters to the pre-computed staged df."""
+    _d = df_staged.copy()
+    if len(date_range) == 2:
+        _d = _d[(_d['DELIVERY DATE'] >= pd.to_datetime(date_range[0])) &
+                (_d['DELIVERY DATE'] <= pd.to_datetime(date_range[1]))]
+    if city_sel:  _d = _d[_d['BUSINESS CITY'].isin(city_sel)]
+    if biz_sel:   _d = _d[_d['BUSINESS NAME'].isin(biz_sel)]
+    _d = _d[_d['HOUR'].isin(OPERATING_HOURS)]
+    if hour_opt == "Morning (7–11)":     _d = _d[_d['HOUR'].between(7, 11)]
+    elif hour_opt == "Afternoon (12–16)": _d = _d[_d['HOUR'].between(12, 16)]
+    elif hour_opt == "Evening (17–22)":   _d = _d[_d['HOUR'].between(17, 22)]
+    elif hour_opt == "Late Night (23–2)": _d = _d[(_d['HOUR'] >= 23) | (_d['HOUR'] <= 2)]
+    elif hour_opt == "Custom" and custom_hours:
+        _d = _d[_d['HOUR'].isin(custom_hours)]
+    return _d
+
+
 with st.sidebar:
     st.markdown(f'<img src="data:image/jpeg;base64,{PIKI_LOGO_B64}" style="width:100%;border-radius:8px;margin-bottom:8px;" />', unsafe_allow_html=True)
     st.title("📊 Piki Dashboard Report")
@@ -850,31 +903,16 @@ Rules: Rain_Risk_Pct 0-100, Delivery_Impact: Normal/Moderate/High Impact."""
                 st.error(f"Forecast error: {_we2}")
 
 # ─────────────────────────────────────────────────
+# PRE-COMPUTE STAGES ON FULL RAW DATA (CACHED)
+# This runs only once per data load. Filter changes
+# do NOT trigger recomputation — only slicing.
+# ─────────────────────────────────────────────────
+raw_staged = _precompute_stages(raw)   # cached — instant on re-runs
+
+# ─────────────────────────────────────────────────
 # APPLY GLOBAL FILTERS → produce `df`
 # ─────────────────────────────────────────────────
-df = raw.copy()
-
-if len(date_range) == 2:
-    df = df[(df['DELIVERY DATE'] >= pd.to_datetime(date_range[0])) &
-            (df['DELIVERY DATE'] <= pd.to_datetime(date_range[1]))]
-if city_sel:
-    df = df[df['BUSINESS CITY'].isin(city_sel)]
-if biz_sel:
-    df = df[df['BUSINESS NAME'].isin(biz_sel)]
-
-df['HOUR'] = df['DELIVERY TIME'].dt.hour
-df = df[df['HOUR'].isin(OPERATING_HOURS)]
-
-if hour_opt == "Morning (7–11)":
-    df = df[df['HOUR'].between(7, 11)]
-elif hour_opt == "Afternoon (12–16)":
-    df = df[df['HOUR'].between(12, 16)]
-elif hour_opt == "Evening (17–22)":
-    df = df[df['HOUR'].between(17, 22)]
-elif hour_opt == "Late Night (23–2)":
-    df = df[(df['HOUR'] >= 23) | (df['HOUR'] <= 2)]
-elif hour_opt == "Custom" and custom_hours:
-    df = df[df['HOUR'].isin(custom_hours)]
+df = _apply_filters(raw_staged, date_range, city_sel, biz_sel, hour_opt, custom_hours)
 
 # ─────────────────────────────────────────────────
 # HEADER
@@ -1326,6 +1364,160 @@ with tab1:
         st.session_state[_tr_ins_key] = None
         st.rerun()
 
+
+    # ══════════════════════════════════════════════════════════════
+    # DAY-OF-WEEK PERFORMANCE TRENDS — Last 8 Weeks
+    # ══════════════════════════════════════════════════════════════
+    st.markdown('<div class="section-header">📅 Day-of-Week Performance Trends</div>', unsafe_allow_html=True)
+    st.caption("How each day of the week has performed over the last 8 weeks — orders, sales, and completion rate per day")
+
+    _dow_df = _df_t1.copy()
+    _dow_df['DELIVERY DATE'] = pd.to_datetime(_dow_df['DELIVERY DATE'], errors='coerce')
+    _dow_df['_dow_wk'] = _dow_df['DELIVERY DATE'].dt.to_period('W-SUN')
+    _dow_all_weeks = sorted(_dow_df['_dow_wk'].dropna().unique(), reverse=True)[:8]
+    _dow_df = _dow_df[_dow_df['_dow_wk'].isin(_dow_all_weeks)].copy()
+    _dow_df['DayName'] = _dow_df['DELIVERY DATE'].dt.day_name()
+    _dow_df['DayNum']  = _dow_df['DELIVERY DATE'].dt.dayofweek  # 0=Mon
+    _dow_df['WkLabel'] = _dow_df['_dow_wk'].apply(lambda p: f"W{p.week} ({p.start_time.strftime('%d %b')})")
+
+    _days_order = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday']
+    _day_colors = {
+        'Monday':    '#4d96ff',
+        'Tuesday':   '#6bcb77',
+        'Wednesday': '#FF6B00',
+        'Thursday':  '#9b59b6',
+        'Friday':    '#e74c3c',
+        'Saturday':  '#f39c12',
+        'Sunday':    '#1abc9c',
+    }
+
+    if not _dow_df.empty:
+        # Build weekly × day pivot for orders
+        _dow_pivot = (_dow_df.groupby(['WkLabel','DayName','DayNum'])
+                      .agg(Orders=('ID','count'), Sales=('SUBTOTAL','sum'),
+                           Completed=('STATE', lambda x: x.isin(['Completed','Delivery Completed By Driver']).sum()))
+                      .reset_index()
+                      .sort_values(['DayNum']))
+        _dow_pivot['Completion%'] = (_dow_pivot['Completed'] / _dow_pivot['Orders'].replace(0,1) * 100).round(1)
+
+        # Week list in chronological order for x-axis
+        _dow_wk_labels = [f"W{p.week} ({p.start_time.strftime('%d %b')})"
+                          for p in sorted(_dow_all_weeks)]
+
+        # ── Compute day averages (used across both charts) ──
+        _day_avgs = []
+        for _day in _days_order:
+            _dv = _dow_pivot[_dow_pivot['DayName'] == _day]['Orders']
+            _day_avgs.append(round(_dv.mean(), 1) if not _dv.empty else 0)
+
+        # ── Assign one colour per week (up to 8 weeks) ──
+        _wk_palette = [
+            '#4d96ff','#FF6B00','#6bcb77','#e74c3c',
+            '#9b59b6','#f39c12','#1abc9c','#e67e22',
+        ]
+        _wk_color_map = {wk: _wk_palette[i % len(_wk_palette)]
+                         for i, wk in enumerate(_dow_wk_labels)}
+
+        # ── Chart 1: Grouped bars — X = Day, groups = weeks, colour = week ──
+        st.markdown("#### 📊 Orders by Day of Week — Last 8 Weeks")
+        st.caption("X-axis = day of week · Each bar = one week · Colour = week · Dashed line = 8-week average per day")
+
+        _n_wks  = len(_dow_wk_labels)
+        _n_days = len(_days_order)
+        _bar_w  = min(0.10, 0.75 / max(_n_wks, 1))
+        _x_base = np.arange(_n_days)
+
+        _fig_dow, _ax_dow = plt.subplots(figsize=(13, 5))
+
+        for _wi, _wk in enumerate(_dow_wk_labels):
+            _wk_data  = _dow_pivot[_dow_pivot['WkLabel'] == _wk]
+            _wk_map   = dict(zip(_wk_data['DayName'], _wk_data['Orders']))
+            _vals     = [_wk_map.get(d, 0) for d in _days_order]
+            _offset   = (_wi - _n_wks / 2 + 0.5) * _bar_w
+            _ax_dow.bar(
+                _x_base + _offset, _vals, width=_bar_w,
+                color=_wk_color_map[_wk], alpha=0.88,
+                label=_wk, edgecolor='white', linewidth=0.4
+            )
+
+        # 8-week average line per day (dashed)
+        for _xi, (_day, _avg) in enumerate(zip(_days_order, _day_avgs)):
+            _half = (_n_wks / 2) * _bar_w
+            _ax_dow.plot(
+                [_xi - _half, _xi + _half], [_avg, _avg],
+                color='#2c3e50', lw=1.8, linestyle='--', zorder=5
+            )
+            _ax_dow.text(
+                _xi + _half + 0.02, _avg, f"avg {_avg:.0f}",
+                va='center', fontsize=7.5, color='#2c3e50', fontweight='bold'
+            )
+
+        _ax_dow.set_xticks(_x_base)
+        _ax_dow.set_xticklabels(_days_order, fontsize=10, fontweight='bold')
+        _ax_dow.set_ylabel("Total Orders", fontsize=10)
+        _ax_dow.set_title("Daily Order Volume by Day of Week — Last 8 Weeks",
+                          fontweight='bold', fontsize=11)
+        _ax_dow.legend(
+            title="Week", ncol=min(_n_wks, 4), fontsize=8, title_fontsize=8,
+            loc='upper left', framealpha=0.85, bbox_to_anchor=(0, 1)
+        )
+        _ax_dow.grid(axis='y', alpha=0.18, linestyle='--')
+        _ax_dow.margins(x=0.03)
+        plt.tight_layout(pad=1.5)
+        st.pyplot(_fig_dow); plt.close()
+
+        # ── Chart 2: Average bar + latest-week delta ──
+        st.markdown("#### 📈 Day Average vs Latest Week")
+        st.caption("Left: 8-week average orders per day · Right: latest week vs average — green = above avg, red = below")
+
+        _dow_col1, _dow_col2 = st.columns(2)
+        _latest_wk_lbl = _dow_wk_labels[-1] if _dow_wk_labels else None
+
+        with _dow_col1:
+            _fig_avg, _ax_avg = plt.subplots(figsize=(6, 4))
+            _avg_bars = _ax_avg.bar(
+                [d[:3] for d in _days_order], _day_avgs,
+                color=[_wk_palette[i % len(_wk_palette)] for i in range(_n_days)],
+                alpha=0.88, edgecolor='white', linewidth=0.5
+            )
+            for _b, _v in zip(_avg_bars, _day_avgs):
+                if _v > 0:
+                    _ax_avg.text(_b.get_x() + _b.get_width()/2, _b.get_height() + 0.5,
+                                 f"{_v:.0f}", ha='center', va='bottom', fontsize=9, fontweight='bold')
+            _ax_avg.set_title("8-Week Avg Orders by Day", fontweight='bold', fontsize=10)
+            _ax_avg.set_ylabel("Avg Orders"); _ax_avg.grid(axis='y', alpha=0.2)
+            _ax_avg.set_ylim(bottom=0, top=max(_day_avgs) * 1.2 if max(_day_avgs) > 0 else 10)
+            plt.tight_layout(pad=1.2); st.pyplot(_fig_avg); plt.close()
+
+        with _dow_col2:
+            if _latest_wk_lbl:
+                _latest_data = _dow_pivot[_dow_pivot['WkLabel'] == _latest_wk_lbl]
+                _latest_map  = dict(zip(_latest_data['DayName'], _latest_data['Orders']))
+                _latest_vals = [_latest_map.get(d, 0) for d in _days_order]
+                _deltas      = [l - a for l, a in zip(_latest_vals, _day_avgs)]
+                _delta_cols  = ['#2e7d32' if d >= 0 else '#c62828' for d in _deltas]
+
+                _fig_delta, _ax_delta = plt.subplots(figsize=(6, 4))
+                _delta_bars = _ax_delta.bar(
+                    [d[:3] for d in _days_order], _deltas,
+                    color=_delta_cols, alpha=0.85, edgecolor='white', linewidth=0.5
+                )
+                for _b, _v in zip(_delta_bars, _deltas):
+                    _ypos = _b.get_height() + (0.3 if _v >= 0 else -0.9)
+                    _ax_delta.text(
+                        _b.get_x() + _b.get_width()/2, _ypos,
+                        f"{'+'if _v>=0 else ''}{_v:.0f}",
+                        ha='center', va='bottom', fontsize=9, fontweight='bold',
+                        color='#2e7d32' if _v >= 0 else '#c62828'
+                    )
+                _ax_delta.axhline(0, color='#333', lw=1.2)
+                _ax_delta.set_title("Latest Week vs 8-Wk Avg\n(" + _latest_wk_lbl + ")",
+                                    fontweight='bold', fontsize=10)
+                _ax_delta.set_ylabel("Δ Orders vs Average"); _ax_delta.grid(axis='y', alpha=0.2)
+                plt.tight_layout(pad=1.2); st.pyplot(_fig_delta); plt.close()
+
+    else:
+        st.info("Insufficient data for day-of-week analysis. Upload at least 2 weeks of data.")
 
     # ── Failed & Rejected Orders ──
     st.markdown('<div class="section-header">❌ Failed & Rejected Orders Analysis</div>', unsafe_allow_html=True)
@@ -1955,8 +2147,8 @@ with tab1:
 with tab2:
     st.markdown('<div class="section-header">⏰ Delivery Time Analysis</div>', unsafe_allow_html=True)
 
-    df2 = compute_delivery_stages(df)
-    df2 = add_distance(df2)
+    # Reuse already-computed staged data — just slice by filters (fast)
+    df2 = df.copy()  # df already has stages, distance, and all filters applied
     df2['ISO_Week'] = df2['DELIVERY DATE'].dt.isocalendar().week
     df2['ISO_Year'] = df2['DELIVERY DATE'].dt.isocalendar().year
 
@@ -1974,20 +2166,11 @@ with tab2:
     # ── KPI metrics — selected week, completed only, OUTLIERS EXCLUDED ──
     def _filter_clean_completed(frame):
         """Return only completed orders with all stages within valid operational ranges.
-        Excludes outliers that inflate average delivery time.
+        Uses global STAGE_OUTLIER_LIMITS for consistency across all sections.
         """
         _fc = (frame[frame["STATE"].isin(["Delivery Completed By Driver","Completed"])].copy()
                if "STATE" in frame.columns else frame.copy())
-        _stage_limits = {
-            "Accepted by Business": (0, 15),   # target 2, allow up to 15 before flagging
-            "Assigned Time":        (0, 15),
-            "Accepted by Driver":   (0, 15),
-            "Driver to Business":   (0, 30),   # target 8, allow up to 30
-            "Driver in Business":   (0, 45),   # target 12, allow up to 45
-            "Pickup to Customer":   (0, 45),   # target varies ~6-18, allow up to 45
-            "Average Delivery Time":(0, 120),  # exclude extreme outliers only
-        }
-        for _fcol, (_lo, _hi) in _stage_limits.items():
+        for _fcol, (_lo, _hi) in STAGE_OUTLIER_LIMITS.items():
             if _fcol in _fc.columns:
                 _fc = _fc[(_fc[_fcol] >= _lo) & (_fc[_fcol] <= _hi)]
         return _fc
@@ -2020,11 +2203,7 @@ with tab2:
     _problematic_count = _total_completed - _clean_count
 
     # Filter factors info
-    _filter_factors = (
-        "Accepted by Business >15 min · Assigned Time >15 min · Accepted by Driver >15 min · "
-        "Driver→Restaurant >30 min · Vendor Prep >45 min · Pickup→Customer >45 min · "
-        "Total Delivery Time >120 min"
-    )
+    _filter_factors = STAGE_OUTLIER_LABELS
 
     # Show order count transparency card before metrics
     _count_col = "normal" if _problematic_count == 0 else ("off" if _problematic_count / max(_total_completed,1) < 0.05 else "inverse")
@@ -2071,6 +2250,14 @@ with tab2:
 
     # ── Stage table — selected week only ──
     st.subheader(f"📊 Delivery Stage Avg by City — {sel_del_week}")
+    # Already using _comp which is the global-limits-filtered clean completed orders
+    _city_stage_total_raw = len(df2_week[df2_week['STATE'].isin(['Delivery Completed By Driver','Completed'])])
+    _city_stage_clean_n   = len(_comp)
+    _city_stage_excl_n    = _city_stage_total_raw - _city_stage_clean_n
+    st.caption(
+        f"✅ Based on **{_city_stage_clean_n:,} clean completed orders** "
+        f"({_city_stage_excl_n:,} excluded as problematic — {STAGE_OUTLIER_LABELS})"
+    )
     stage_cols = ['Accepted by Business','Assigned Time','Accepted by Driver',
                   'Driver to Business','Driver in Business','Pickup to Customer',
                   'Average Delivery Time']
@@ -2840,10 +3027,10 @@ with tab3:
     st.markdown('<div class="section-header">🏆 Driver Performance Review — Last 8 Weeks</div>', unsafe_allow_html=True)
 
     # ── Compute delivery stage metrics for completed orders ──
-    _dr_df = raw.copy()
+    # Reuse pre-computed staged data (raw_staged) — no recompute needed
+    _dr_df = raw_staged.copy()
     _dr_df['DELIVERY DATE'] = pd.to_datetime(_dr_df['DELIVERY DATE'], errors='coerce')
     _dr_df['Week'] = _dr_df['DELIVERY DATE'].dt.to_period('W-SUN').apply(lambda r: r.start_time)
-    _dr_df = compute_delivery_stages(_dr_df)
 
     # Working zone map
     _dr_zone = (_dr_df.groupby('DRIVER NAME')['BUSINESS CITY']
@@ -2999,11 +3186,11 @@ with tab3:
     _dr_comp = _dr_df_dist[_dr_df_dist['STATE'].isin(['Delivery Completed By Driver','Completed'])].copy()
 
     def _cat_issues(row):
-        checks = [('Accepted by Business',30),('Assigned Time',30),('Accepted by Driver',45),
-                  ('Driver to Business',45),('Driver in Business',90),('Pickup to Customer',45),
-                  ('Average Delivery Time',100)]
-        return ", ".join(c for c,l in checks
-                         if pd.isnull(row.get(c,0)) or row.get(c,0) < 0 or row.get(c,0) > l)
+        return ", ".join(
+            col for col, (_lo, _hi) in STAGE_OUTLIER_LIMITS.items()
+            if col in row.index and (pd.isnull(row.get(col, 0)) or
+                                     row.get(col, 0) < _lo or row.get(col, 0) > _hi)
+        )
 
     _dr_comp['Issues'] = _dr_comp.apply(_cat_issues, axis=1)
     _dr_comp_clean = _dr_comp[_dr_comp['Issues'] == ''].copy()
@@ -3520,9 +3707,24 @@ with tab3:
     if _dar_df4.empty:
         st.info("No Dar es Salaam data found.")
     else:
-        _dar4_stages = compute_delivery_stages(_dar_df4)
-        _dar4_stages = add_distance(_dar4_stages)
-        _dar4_comp = _dar4_stages[_dar4_stages['STATE'].isin(['Delivery Completed By Driver','Completed'])].copy()
+        # Slice from pre-computed raw_staged — no recomputation
+        _dar_filter_keys = set(_dar_df4['ID'].tolist()) if 'ID' in _dar_df4.columns else set()
+        _dar4_stages = (raw_staged[raw_staged['ID'].isin(_dar_filter_keys)].copy()
+                        if _dar_filter_keys else compute_delivery_stages(_dar_df4))
+        if _dar4_stages.empty:
+            _dar4_stages = compute_delivery_stages(_dar_df4)
+        _dar4_comp_raw = _dar4_stages[_dar4_stages['STATE'].isin(['Delivery Completed By Driver','Completed'])].copy()
+
+        # Apply global outlier exclusion to dar completed orders
+        _dar4_comp = _dar4_comp_raw.copy()
+        for _dc_col, (_dc_lo, _dc_hi) in STAGE_OUTLIER_LIMITS.items():
+            if _dc_col in _dar4_comp.columns:
+                _dar4_comp = _dar4_comp[(_dar4_comp[_dc_col] >= _dc_lo) & (_dar4_comp[_dc_col] <= _dc_hi)]
+
+        # Per-driver counts: total completed vs clean
+        _dar_ord_counted = _dar4_comp.groupby('DRIVER NAME')['ID'].count().rename('Orders Counted (clean)')
+        _dar_ord_total   = _dar4_comp_raw.groupby('DRIVER NAME')['ID'].count().rename('_raw_completed')
+        _dar_ord_excl    = (_dar_ord_total - _dar_ord_counted.reindex(_dar_ord_total.index, fill_value=0)).rename('Orders Excluded')
 
         # Per-order P2C target using distance model
         if 'DISTANCE (km)' in _dar4_comp.columns:
@@ -3634,8 +3836,19 @@ with tab3:
         _bonus_base['TOTAL BONUS (Tsh)'] = (_bonus_base['Accept Bonus (Tsh)'] + _bonus_base['Days Bonus (Tsh)']
                                             + _bonus_base['DT Bonus (Tsh)'] + _bonus_base['Time Bonus (Tsh)'])
 
+        # Add order counts (clean vs excluded) — insert early columns
+        _bonus_base['Orders Counted (clean)'] = _bonus_base['DRIVER NAME'].map(
+            _dar_ord_counted).fillna(0).astype(int)
+        _bonus_base['Orders Excluded'] = _bonus_base['DRIVER NAME'].map(
+            _dar_ord_excl).fillna(0).astype(int)
+
         # Add DRIVER ID and sort
         _bonus_base.insert(0, 'DRIVER ID', _bonus_base['DRIVER NAME'].map(_did_map))
+
+        # Reorder: DRIVER ID, DRIVER NAME, Orders Counted, Orders Excluded first
+        _early_cols = ['DRIVER ID','DRIVER NAME','Orders Counted (clean)','Orders Excluded']
+        _rest_cols  = [c for c in _bonus_base.columns if c not in _early_cols]
+        _bonus_base = _bonus_base[_early_cols + _rest_cols]
         _bonus_base = _bonus_base.sort_values('DRIVER ID', na_position='last').reset_index(drop=True)
 
         # Round numerics to 1 decimal
@@ -3840,8 +4053,20 @@ with tab3:
     _regional_df['DELIVERY DATE'] = pd.to_datetime(_regional_df['DELIVERY DATE'], errors='coerce')
     _regional_df['Week'] = _regional_df['DELIVERY DATE'].dt.to_period('W-SUN').apply(lambda r: r.start_time)
 
-    _bonus_comp = compute_delivery_stages(_regional_df)
-    _bonus_comp = _bonus_comp[_bonus_comp['STATE'].isin(['Delivery Completed By Driver','Completed'])].copy()
+    # Slice from pre-computed raw_staged — filter to regional IDs
+    _reg_ids = set(_regional_df['ID'].tolist()) if 'ID' in _regional_df.columns else set()
+    _bonus_comp_full = (raw_staged[raw_staged['ID'].isin(_reg_ids)].copy()
+                        if _reg_ids else compute_delivery_stages(_regional_df))
+    if _bonus_comp_full.empty:
+        _bonus_comp_full = compute_delivery_stages(_regional_df)
+    _bonus_comp = _bonus_comp_full[_bonus_comp_full['STATE'].isin(['Delivery Completed By Driver','Completed'])].copy()
+
+    # Ensure 'Week' column exists (raw_staged may not have it)
+    if 'Week' not in _bonus_comp.columns:
+        _bonus_comp['DELIVERY DATE'] = pd.to_datetime(_bonus_comp['DELIVERY DATE'], errors='coerce')
+        _bonus_comp['Week'] = _bonus_comp['DELIVERY DATE'].dt.to_period('W-SUN').apply(lambda r: r.start_time)
+    if 'Week' not in _bonus_comp_full.columns:
+        _bonus_comp_full['Week'] = _bonus_comp_full['DELIVERY DATE'].dt.to_period('W-SUN').apply(lambda r: r.start_time)
 
     # Bonus week selector
     _bonus_weeks_avail = sorted(_bonus_comp['Week'].dropna().unique(), reverse=True)
@@ -3854,9 +4079,16 @@ with tab3:
         (_regional_df['Week'] == _sel_bonus_week) &
         (_regional_df['BUSINESS CITY'].isin(REGIONAL_CITIES))
     ].copy()
-    _bonus_comp_reg = _bonus_comp[
-        (_bonus_comp['Week'] == _sel_bonus_week) &
-        (_bonus_comp['BUSINESS CITY'].isin(REGIONAL_CITIES))
+    # Apply global outlier filter to regional bonus completions
+    _bonus_comp_f = _bonus_comp.copy()
+    for _rcol, (_rlo, _rhi) in STAGE_OUTLIER_LIMITS.items():
+        if _rcol in _bonus_comp_f.columns:
+            _bonus_comp_f = _bonus_comp_f[(_bonus_comp_f[_rcol] >= _rlo) & (_bonus_comp_f[_rcol] <= _rhi)]
+    if 'Week' not in _bonus_comp_f.columns:
+        _bonus_comp_f['Week'] = _bonus_comp_f['DELIVERY DATE'].dt.to_period('W-SUN').apply(lambda r: r.start_time)
+    _bonus_comp_reg = _bonus_comp_f[
+        (_bonus_comp_f['Week'] == _sel_bonus_week) &
+        (_bonus_comp_f['BUSINESS CITY'].isin(REGIONAL_CITIES))
     ].copy()
 
     if _bonus_reg.empty:
