@@ -124,12 +124,12 @@ STAGE_OUTLIER_LIMITS = {
     "Driver to Business":   (0, 60),   # flag if >60 min
     "Driver in Business":   (0, 90),   # flag if >90 min (vendor prep)
     "Pickup to Customer":   (0, 60),   # flag if >60 min
-    "Average Delivery Time":(0, 150),  # exclude extreme outliers only
+    "Average Delivery Time":(0, 120),  # exclude extreme outliers only
 }
 STAGE_OUTLIER_LABELS = (
     "Accepted by Business >30 min · Assigned Time >30 min · Accepted by Driver >30 min · "
     "Driver→Restaurant >60 min · Vendor Prep >90 min · Pickup→Customer >60 min · "
-    "Total Delivery Time >150 min"
+    "Total Delivery Time >120 min"
 )
 GROWTH_RATE      = 0.012       # 1.2% weekly KPI
 KPI_START_YEAR   = 2026
@@ -903,11 +903,166 @@ Rules: Rain_Risk_Pct 0-100, Delivery_Impact: Normal/Moderate/High Impact."""
                 st.error(f"Forecast error: {_we2}")
 
 # ─────────────────────────────────────────────────
+# CUSTOMER IDENTITY — GLOBAL DEDUPLICATION FUNCTION
+# Used everywhere customers are counted/profiled.
+# Priority: CUSTOMER ID → Phone (last 9) → Email → Name+City
+# ─────────────────────────────────────────────────
+def _canonical_customer_id(row):
+    """Return a stable canonical key for a customer row."""
+    cid = str(row.get('CUSTOMER ID', '')).strip()
+    if cid and cid not in ('nan', '0', ''):
+        return f"id:{cid}"
+    ph = str(row.get('CUSTOMER CELLPHONE', '')).strip().replace(' ', '').replace('+', '')
+    if ph and ph not in ('nan', '0', ''):
+        return f"ph:{ph[-9:]}"  # last 9 digits — handles +255 vs 0 prefix
+    em = str(row.get('CUSTOMER EMAIL', '')).strip().lower()
+    if em and em != 'nan' and '@' in em:
+        return f"em:{em}"
+    nm = str(row.get('CUSTOMER NAME', '')).strip().lower()
+    ct = str(row.get('BUSINESS CITY', '')).strip().lower()
+    return f"nm:{nm}:{ct}"
+
+@st.cache_data(show_spinner=False)
+def _add_canonical_id(df):
+    """Add _cid column using smart deduplication. Cached."""
+    df = df.copy()
+    df['_cid'] = df.apply(_canonical_customer_id, axis=1)
+    return df
+
+@st.cache_data(show_spinner=False)
+def _build_vendor_profiles(df_raw, ref_date):
+    """Pre-compute vendor health profiles. Cached."""
+    _vr = df_raw.copy()
+    _vg = _vr.groupby('BUSINESS NAME').agg(
+        Last_Order    = ('DELIVERY DATE', 'max'),
+        First_Order   = ('DELIVERY DATE', 'min'),
+        Total_Orders  = ('ID', 'count'),
+        Completed     = ('STATE', lambda x: x.isin(['Completed','Delivery Completed By Driver']).sum()),
+        Rejected      = ('STATE', lambda x: x.str.contains('Reject', na=False).sum()),
+        Total_Revenue = ('SUBTOTAL', 'sum'),
+        City          = ('BUSINESS CITY', lambda x: x.mode().iloc[0] if not x.mode().empty else '—'),
+    ).reset_index()
+    _vg['Recency_Days']    = (ref_date - _vg['Last_Order']).dt.days
+    _vg['Completion_Rate'] = (_vg['Completed'] / _vg['Total_Orders'].replace(0,1) * 100).round(1)
+    _vg['Rejection_Rate']  = (_vg['Rejected']  / _vg['Total_Orders'].replace(0,1) * 100).round(1)
+    _vg['Lifespan_Days']   = (_vg['Last_Order'] - _vg['First_Order']).dt.days.clip(lower=1)
+    _vg['Total_Revenue']   = _vg['Total_Revenue'].round(0).astype(int)
+    # Weekly trend
+    _vr2 = _vr.copy()
+    _vr2['_wk'] = _vr2['DELIVERY DATE'].dt.to_period('W-SUN')
+    _wks = sorted(_vr2['_wk'].dropna().unique(), reverse=True)
+    _cur_wk = _wks[0] if _wks else None
+    _8wks = _wks[:8]
+    _pivot = (_vr2[_vr2['_wk'].isin(_8wks)].groupby(['BUSINESS NAME','_wk'])['ID'].count().unstack(fill_value=0))
+    if _cur_wk and _cur_wk in _pivot.columns:
+        _vg['This_Week'] = _vg['BUSINESS NAME'].map(_pivot[_cur_wk]).fillna(0).astype(int)
+        _prev = [c for c in _pivot.columns if c != _cur_wk]
+        _vg['Avg_8Wk'] = _vg['BUSINESS NAME'].map(_pivot[_prev].mean(axis=1) if _prev else pd.Series(dtype=float)).fillna(0).round(1)
+    else:
+        _vg['This_Week'] = 0; _vg['Avg_8Wk'] = 0.0
+    _vg['WoW_Delta'] = (_vg['This_Week'] - _vg['Avg_8Wk']).round(1)
+    _vg['WoW_Pct']   = (_vg['WoW_Delta'] / _vg['Avg_8Wk'].replace(0,1) * 100).round(1)
+    return _vg
+
+# ─────────────────────────────────────────────────
+# CUSTOMER PROFILE BUILDER — module-level so cache
+# works correctly across city filter changes.
+# Cache busts when df OR ref_date changes.
+# ─────────────────────────────────────────────────
+@st.cache_data(show_spinner="Building customer profiles…")
+def _build_cust_profiles(_df_in, _ref_ts):
+    """RFM + dedup + contact aggregation. Cache busts on data or date change."""
+    from collections import Counter as _Counter
+    df2 = _df_in.copy() if '_cid' in _df_in.columns else _add_canonical_id(_df_in)
+
+    # ── Has registered account? ──
+    _acct_mask = df2['CUSTOMER ID'].astype(str).str.strip().apply(
+        lambda x: x not in ('nan','0','') and x != '')
+    _has_acct = (df2[_acct_mask].groupby('_cid')
+                 .apply(lambda g: True).reset_index(name='Has_Account'))
+
+    # ── All phones & emails ever used (for pattern detection) ──
+    _all_phones = (df2.groupby('_cid')['CUSTOMER CELLPHONE']
+                   .apply(lambda x: ' / '.join(
+                       sorted(set(str(v).strip() for v in x.dropna()
+                                  if str(v).strip() not in ('nan','0','')))
+                   )).reset_index().rename(columns={'CUSTOMER CELLPHONE': 'All_Phones'}))
+    if 'CUSTOMER EMAIL' in df2.columns:
+        _all_emails = (df2.groupby('_cid')['CUSTOMER EMAIL']
+                       .apply(lambda x: ' / '.join(
+                           sorted(set(str(v).strip().lower() for v in x.dropna()
+                                      if str(v).strip() not in ('nan','') and '@' in str(v)))
+                       )).reset_index().rename(columns={'CUSTOMER EMAIL': 'All_Emails'}))
+    else:
+        _all_emails = None
+
+    # ── Top 3 restaurants ──
+    _t3r = (df2.groupby(['_cid','BUSINESS NAME'])['ID'].count()
+            .reset_index().sort_values(['_cid','ID'], ascending=[True, False]))
+    _t3r_map = _t3r.groupby('_cid')['BUSINESS NAME'].apply(lambda x: ' · '.join(x.head(3))).to_dict()
+
+    # ── Top 3 products — vectorised ──
+    _t3p_map = {}
+    if 'PRODUCTS' in df2.columns:
+        _pr = []
+        for _cv, _ps in zip(df2['_cid'], df2['PRODUCTS'].fillna('')):
+            for _pn, _qty in extract_products(str(_ps)):
+                _pr.append((_cv, standardize_product(_pn), _qty))
+        if _pr:
+            import pandas as _pd2
+            _pdd = _pd2.DataFrame(_pr, columns=['_cid','Product','Qty'])
+            _pss = _pdd.groupby(['_cid','Product'])['Qty'].sum().reset_index()
+            _pss = _pss.sort_values(['_cid','Qty'], ascending=[True, False])
+            _t3p_map = _pss.groupby('_cid')['Product'].apply(lambda x: ' · '.join(x.head(3))).to_dict()
+
+    # ── RFM groupby ──
+    cg = df2.groupby('_cid').agg(
+        Last_Order      = ('DELIVERY DATE', 'max'),
+        First_Order     = ('DELIVERY DATE', 'min'),
+        Total_Orders    = ('ID', 'count'),
+        Total_Spend     = ('SUBTOTAL', 'sum'),
+        Avg_Order_Value = ('SUBTOTAL', 'mean'),
+        Unique_Days     = ('DELIVERY DATE', 'nunique'),
+        Name            = ('CUSTOMER NAME', lambda x: x.mode().iloc[0] if not x.mode().empty else '—'),
+        Phone           = ('CUSTOMER CELLPHONE', lambda x: str(x.mode().iloc[0]) if not x.mode().empty else '—'),
+        City            = ('BUSINESS CITY', lambda x: x.mode().iloc[0] if not x.mode().empty else '—'),
+        CUSTOMER_ID_raw = ('CUSTOMER ID', lambda x: x.mode().iloc[0] if not x.mode().empty else '—'),
+    ).reset_index().rename(columns={'_cid': 'CUSTOMER ID'})
+
+    # ── Merge all enrichments ──
+    cg = cg.merge(_has_acct.rename(columns={'_cid':'CUSTOMER ID'}), on='CUSTOMER ID', how='left')
+    cg['Has_Account'] = cg['Has_Account'].fillna(False)
+    cg = cg.merge(_all_phones.rename(columns={'_cid':'CUSTOMER ID'}), on='CUSTOMER ID', how='left')
+    if _all_emails is not None:
+        cg = cg.merge(_all_emails.rename(columns={'_cid':'CUSTOMER ID'}), on='CUSTOMER ID', how='left')
+    else:
+        cg['All_Emails'] = '—'
+    cg['All_Phones'] = cg['All_Phones'].fillna('—')
+    cg['All_Emails'] = cg.get('All_Emails', pd.Series('—', index=cg.index)).fillna('—')
+
+    cg['Top_Restaurants'] = cg['CUSTOMER ID'].map(_t3r_map).fillna('—')
+    cg['Top_Products']    = cg['CUSTOMER ID'].map(_t3p_map).fillna('—') if _t3p_map else '—'
+    cg['Top_Restaurant']  = cg['Top_Restaurants'].apply(lambda x: x.split(' · ')[0] if x != '—' else '—')
+    cg['Recency_Days']    = (_ref_ts - cg['Last_Order']).dt.days
+    cg['Lifespan_Days']   = (cg['Last_Order'] - cg['First_Order']).dt.days.clip(lower=1)
+    cg['Avg_Gap_Days']    = (cg['Lifespan_Days'] / cg['Total_Orders']).round(1)
+    cg['Avg_Order_Value'] = cg['Avg_Order_Value'].round(0).astype(int)
+    cg['Total_Spend']     = cg['Total_Spend'].round(0).astype(int)
+    return cg
+
+# ─────────────────────────────────────────────────
 # PRE-COMPUTE STAGES ON FULL RAW DATA (CACHED)
 # This runs only once per data load. Filter changes
 # do NOT trigger recomputation — only slicing.
 # ─────────────────────────────────────────────────
 raw_staged = _precompute_stages(raw)   # cached — instant on re-runs
+
+# ─────────────────────────────────────────────────
+# PRE-COMPUTE CANONICAL CUSTOMER IDs ON FULL RAW
+# All sections that count/profile customers use this.
+# ─────────────────────────────────────────────────
+raw_with_cid = _add_canonical_id(raw)  # cached — adds _cid column
+raw_with_cid['DELIVERY DATE'] = pd.to_datetime(raw_with_cid['DELIVERY DATE'], errors='coerce')
 
 # ─────────────────────────────────────────────────
 # APPLY GLOBAL FILTERS → produce `df`
@@ -999,12 +1154,126 @@ st.divider()
 # ─────────────────────────────────────────────────
 # MAIN TABS
 # ─────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+# ── Collapsible App Legend / Key ──────────────────────────────
+with st.expander("📖 App Glossary & Scoring Key  (click to expand)", expanded=False):
+    st.markdown("""
+    <style>
+    .leg-section { font-weight:700; font-size:14px; color:#FF6B00;
+                   border-bottom:1px solid #FF6B00; margin:14px 0 6px 0; padding-bottom:3px; }
+    .leg-grid { display:grid; grid-template-columns:1fr 1fr; gap:6px 20px; margin-bottom:4px; }
+    .leg-badge { display:inline-block; padding:2px 8px; border-radius:10px; font-size:12px;
+                 font-weight:700; margin-right:4px; }
+    .bg-o { background:#fff3e0; color:#e65100; }
+    .bg-b { background:#e3f2fd; color:#1565c0; }
+    .bg-g { background:#e8f5e9; color:#2e7d32; }
+    .bg-r { background:#ffebee; color:#c62828; }
+    .bg-p { background:#f3e5f5; color:#6a1b9a; }
+    .bg-y { background:#fffde7; color:#f57f17; }
+    </style>
+
+    <div class="leg-section">🔍 Customer Identity (how unique customers are counted)</div>
+    <p style="font-size:13px;line-height:1.8;">
+    The app uses a <b>priority chain</b> to identify each unique customer, preventing double-counting
+    when the same person registers multiple times:<br>
+    <b>1. CUSTOMER ID</b> — most reliable (system-assigned)<br>
+    <b>2. Phone number</b> — last 9 digits, normalised (+255 vs 0 prefix handled automatically)<br>
+    <b>3. Email address</b> — normalised to lowercase<br>
+    <b>4. Name + City</b> — last-resort fallback<br>
+    <br>
+    <b>👻 Guest users are handled correctly:</b> A guest who ordered 20 times on the same phone
+    is combined into <em>one</em> customer with 20 orders — not 20 separate One-Timers.
+    If you still see a high One-Timer count, it means those guests genuinely ordered only once,
+    or their phone/email was missing so they could not be linked. The
+    <span style="background:#f3e5f5;color:#6a1b9a;padding:1px 5px;border-radius:8px;font-size:11px;">👻 Guest</span>
+    trait identifies unregistered customers — consider an in-app registration nudge after order 1.
+    </p>
+
+    <div class="leg-section">🏷️ Customer Traits</div>
+    <div class="leg-grid">
+    <div><span class="leg-badge bg-o">🔥 Power User</span> Daily Regular — avg gap ≤ 2 days</div>
+    <div><span class="leg-badge bg-b">💎 High Value</span> Lifetime spend ≥ 500,000 TZS</div>
+    <div><span class="leg-badge bg-g">🏆 Loyal</span> 30+ completed orders</div>
+    <div><span class="leg-badge bg-p">📅 Payday Buyer</span> Orders cluster around month-end (avg gap 25–35 days)</div>
+    <div><span class="leg-badge bg-y">📚 Seasonal</span> Long lifespan, infrequent orders (gap &gt; 35 days, active 60+ days)</div>
+    <div><span class="leg-badge bg-o">🍽️ Premium Spender</span> Avg order value ≥ 30,000 TZS</div>
+    <div><span class="leg-badge bg-r">🆕 One-Timer</span> 1 order on canonical identity (guest multi-orderers are already combined by phone)</div>
+    <div><span class="leg-badge bg-p">👻 Guest</span> No registered account — identity resolved by phone/email/name. Orders still combined correctly.</div>
+    <div><span class="leg-badge bg-b">👤 Regular</span> None of the above — standard repeat customer</div>
+    </div>
+
+    <div class="leg-section">📅 Ordering Cadence (how we classify frequency)</div>
+    <div class="leg-grid">
+    <div><b>Daily Regular</b> — avg gap between orders ≤ 2 days</div>
+    <div><b>Weekly Regular</b> — avg gap 3–7 days</div>
+    <div><b>Bi-Weekly</b> — avg gap 8–16 days</div>
+    <div><b>Monthly Payday</b> — avg gap 25–35 days</div>
+    <div><b>Seasonal</b> — lifespan ≥ 60 days, ≥ 3 orders, gap > 35 days</div>
+    <div><b>Occasional</b> — gap 17–35 days, not fitting other patterns</div>
+    <div><b>One-Time</b> — only 1 order in history</div>
+    </div>
+
+    <div class="leg-section">💤 Dormancy Thresholds (when a customer becomes "at risk")</div>
+    <p style="font-size:13px;line-height:1.8;">
+    Each cadence type has its own silence threshold before being flagged.
+    A Daily Regular silent for 7 days is more alarming than a Monthly Payday buyer silent for 40 days.
+    </p>
+    <div class="leg-grid">
+    <div><b>Daily Regular</b> — Slipping after 7 days · At Risk after 10 · Lost after 21</div>
+    <div><b>Weekly Regular</b> — Slipping after 14 days · At Risk after 21 · Lost after 42</div>
+    <div><b>Bi-Weekly</b> — Slipping after 28 · At Risk after 42 · Lost after 84</div>
+    <div><b>Monthly Payday</b> — Slipping after 45 · At Risk after 67 · Lost after 135</div>
+    <div><b>Seasonal</b> — Slipping after 90 · At Risk after 135 · Lost after 270</div>
+    <div><b>Occasional</b> — Slipping after 60 · At Risk after 90 · Lost after 180</div>
+    <div><b>One-Time</b> — Slipping after 30 · At Risk after 45 · Lost after 90</div>
+    </div>
+
+    <div class="leg-section">📊 Dormancy Score (reactivation priority)</div>
+    <p style="font-size:13px;line-height:1.8;">
+    <b>Score = (days silent ÷ cadence threshold) × log(lifetime spend ÷ 1000) × min(orders ÷ 10, 3.0)</b><br>
+    A higher score means more urgent reactivation.<br>
+    <span class="leg-badge bg-r">Score ≥ 10</span> Critical — call today
+    &nbsp;<span class="leg-badge bg-y">Score 5–10</span> High urgency — SMS/push this week
+    &nbsp;<span class="leg-badge bg-g">Score &lt; 5</span> Standard — include in next campaign
+    </p>
+
+    <div class="leg-section">🛡️ Retention Tiers (active customers only)</div>
+    <div class="leg-grid">
+    <div><span class="leg-badge bg-y">🥇 Champion</span> ≥ 20 orders AND spend ≥ 300K TZS AND avg gap ≤ 7 days</div>
+    <div><span class="leg-badge bg-b">🥈 Loyal</span> ≥ 10 orders AND spend ≥ 150K TZS</div>
+    <div><span class="leg-badge bg-g">🥉 Promising</span> ≥ 5 orders OR spend ≥ 80K TZS</div>
+    <div><span class="leg-badge bg-r">🌱 New/Casual</span> Below all of the above thresholds</div>
+    </div>
+
+    <div class="leg-section">🍽️ Vendor Health Tiers</div>
+    <div class="leg-grid">
+    <div><span class="leg-badge bg-r">🔴 Inactive</span> No orders in 14+ days (with history of > 10 orders)</div>
+    <div><span class="leg-badge bg-o">🟠 At Risk</span> No orders in 7–14 days</div>
+    <div><span class="leg-badge bg-y">🟡 High Rejection</span> Rejection rate ≥ 20%</div>
+    <div><span class="leg-badge bg-y">🟡 Declining</span> This week orders ≥ 30% below 8-week average</div>
+    <div><span class="leg-badge bg-g">🟢 Growing</span> This week orders ≥ 20% above 8-week average</div>
+    <div><span class="leg-badge bg-g">🟢 Healthy</span> Completion rate ≥ 90% and ≥ 10 total orders</div>
+    <div><span class="leg-badge bg-b">⚪ Stable</span> All other active vendors</div>
+    </div>
+
+    <div class="leg-section">⏱️ Delivery Stage Targets</div>
+    <p style="font-size:13px;line-height:1.8;">
+    <b>Accepted by Business:</b> 2 min &nbsp;|&nbsp; <b>Assigned:</b> 2 min &nbsp;|&nbsp;
+    <b>Accepted by Driver:</b> 1.5 min &nbsp;|&nbsp; <b>Driver to Business:</b> 8 min &nbsp;|&nbsp;
+    <b>Driver in Business:</b> 12 min &nbsp;|&nbsp; <b>Pickup to Customer:</b> distance-based<br>
+    Orders are <b>excluded as problematic</b> if any stage falls outside:
+    Accepted by Business / Assigned / Accepted by Driver > 30 min ·
+    Driver to Business > 60 min · Driver in Business > 90 min · Pickup to Customer > 60 min ·
+    Total Delivery Time > 120 min
+    </p>
+    """, unsafe_allow_html=True)
+
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "📈 Weekly Trends",
     "⏰ Delivery Times",
     "🚴 Rider Attendance",
     "📦 Products & Geo",
     "🎉 Piki Party Store",
+    "🔁 Retention & Reactivation",
     "🔗 Quick Access & Tools",
 ])
 
@@ -1584,12 +1853,16 @@ with tab1:
                     "✅ Within KPI" if tot <= FAILED_KPI
                     else f"❌ Over by {tot - FAILED_KPI}"
                 )
+                st.markdown(f"##### 🗓️ Failed Orders by Day & Zone — {sel_week}")
+                st.caption(f"Week of {w_start.strftime('%d %b')} – {w_end.strftime('%d %b %Y')} · KPI target ≤ {FAILED_KPI} per week")
                 st.dataframe(pivot.style.set_properties(**{'text-align':'center'}),
                              use_container_width=True)
-                st.download_button("⬇️ Download Failed Orders",
-                                   data=excel_bytes(wf),
-                                   file_name=f"failed_{sel_week}.xlsx",
-                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                st.download_button(
+                    "⬇️ Download Failed Orders (this week)",
+                    data=excel_bytes(wf),
+                    file_name=f"failed_orders_{sel_week}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="dl_failed_orders")
 
                 # Professional inline insight — no AI button
                 _f_tot = int(pivot.loc['TOTAL','Total']) if 'TOTAL' in pivot.index and 'Total' in pivot.columns else 0
@@ -2484,7 +2757,7 @@ with tab2:
         st.info("Distance data not available for this week.")
 
     # ── Weekly Average Delivery Time trend ──
-    st.subheader("📈 Weekly Average Delivery Time Trend")
+    st.subheader("📈 Weekly average delivery time trend")
 
     # Per-chart city filter
     _t2_cities_all = sorted(df2['BUSINESS CITY'].dropna().unique().tolist()) if 'BUSINESS CITY' in df2.columns else []
@@ -2553,16 +2826,21 @@ with tab2:
         _ax_adt.plot(len(_adt_labels) - 1, _last_val, 'o',
                      color=_arrow_col, markersize=12, zorder=5, label='Last week')
 
-        # Numbers on every point
-        _y_pad = max(_adt_vals) * 0.025
+        # Numbers on every point — keep them inside the chart
+        _y_range = max(_adt_vals) - min(_adt_vals) if max(_adt_vals) != min(_adt_vals) else max(_adt_vals) * 0.1
+        _y_pad   = _y_range * 0.06
+        _y_max   = max(_adt_vals) + _y_range * 0.45   # headroom for labels + arrow
+        _y_min   = max(0, min(_adt_vals) - _y_range * 0.15)
+        _ax_adt.set_ylim(_y_min, _y_max)
+
         for _i, _v in enumerate(_adt_vals):
             _ax_adt.text(_i, _v + _y_pad, f"{_v:.1f}", ha='center', fontsize=9,
                          fontweight='bold',
                          color=(_arrow_col if _i == len(_adt_vals) - 1 else '#2c3e50'))
 
-        # Arrow above last point
-        _ax_adt.text(len(_adt_labels) - 1, _last_val + _y_pad * 3.5,
-                     _arrow, ha='center', fontsize=20, fontweight='bold', color=_arrow_col)
+        # Arrow above last point — positioned within ylim
+        _ax_adt.text(len(_adt_labels) - 1, _last_val + _y_pad * 3.2,
+                     _arrow, ha='center', fontsize=16, fontweight='bold', color=_arrow_col)
 
         # Light shading between prev_avg line and last segment
         _ax_adt.fill_between(
@@ -2576,14 +2854,11 @@ with tab2:
         _ax_adt.set_ylabel("Avg Delivery Time (min)")
         _ax_adt.set_xlabel("Week")
         _adt_city_title = f" — {', '.join(_t2_city_f)}" if _t2_city_f else " — All Cities"
-        _ax_adt.set_title(
-            f"Weekly Avg Delivery Time Trend{_adt_city_title}\n"
-            f"(Problematic orders excluded — {_clean_count:,} clean / {_problematic_count:,} excluded this week)",
-            fontsize=10, fontweight='bold')
+        _ax_adt.set_title("Weekly Average Delivery Time Trend", fontsize=11, fontweight='bold')
         _ax_adt.grid(True, alpha=0.25, axis='y')
         _ax_adt.legend(fontsize=9)
-        _ax_adt.margins(x=0.04)
-        plt.tight_layout(pad=1.5)
+        _ax_adt.margins(x=0.06)
+        plt.tight_layout(pad=2.0)
         st.pyplot(_fig_adt); plt.close()
 
         # Story explanation card
@@ -5690,7 +5965,7 @@ with tab5:
 # ═══════════════════════════════════════════════════════════════
 # TAB 6 — QUICK ACCESS & TOOLS
 # ═══════════════════════════════════════════════════════════════
-with tab6:
+with tab7:
     st.markdown('<div class="section-header">🔗 Quick Access & Useful Links</div>', unsafe_allow_html=True)
 
     st.markdown("""
@@ -5887,3 +6162,2209 @@ st.markdown(
     """,
     unsafe_allow_html=True
 )
+
+
+# ═══════════════════════════════════════════════════════════════
+# TAB 7 — RETENTION & REACTIVATION
+# ═══════════════════════════════════════════════════════════════
+with tab6:
+    st.markdown('<div class="section-header">🔁 Customer Retention & Reactivation Intelligence</div>', unsafe_allow_html=True)
+    st.caption("Identify customers at risk, classify ordering behaviour, and generate ready-to-act contact lists")
+
+    # ── Mode selector ──────────────────────────────────────────
+    _crm_mode = st.radio(
+        "Select focus area",
+        ["👤 Customer Reactivation", "🍽️ Vendor Retention"],
+        horizontal=True, key="crm_mode"
+    )
+    st.markdown("---")
+
+    # ══════════════════════════════════════════════════════════════
+    # SHARED DATA PREP — uses app-level pre-computed raw_with_cid
+    # ══════════════════════════════════════════════════════════════
+    _crm_raw = raw_with_cid  # already has _cid column, DELIVERY DATE parsed
+    _crm_ref_date = _crm_raw['DELIVERY DATE'].max()
+
+    _crm_comp = _crm_raw[_crm_raw['STATE'].isin(['Completed','Delivery Completed By Driver'])].copy()
+
+    # Shared city list
+    _crm_cities = sorted(_crm_raw['BUSINESS CITY'].dropna().unique())
+
+    # ══════════════════════════════════════════════════════════════
+    # CUSTOMER REACTIVATION
+    # ══════════════════════════════════════════════════════════════
+    if "Customer" in _crm_mode:
+
+        st.markdown("""
+        <div style="background:#fff8e1;border-left:4px solid #f9a825;padding:12px 18px;
+                    border-radius:8px;font-size:13px;line-height:1.7;margin-bottom:16px;">
+        <b>📐 How scoring works</b><br>
+        Each customer is profiled on <b>recency</b> (days since last order), <b>frequency</b>
+        (ordering cadence), and <b>monetary value</b> (lifetime spend). A <b>Dormancy Score</b>
+        combines these: the higher the score, the more urgently that customer needs a reactivation
+        touch. Seasonal and low-frequency customers are handled separately so high-value weekly
+        or monthly regulars are not penalised for their natural cadence.
+        </div>""", unsafe_allow_html=True)
+
+        # ── City filter ──
+        _crm_city_f = st.multiselect("🏙️ Filter by City", _crm_cities,
+                                      placeholder="All cities", key="crm_cust_city")
+        _crm_df = _crm_comp[_crm_comp['BUSINESS CITY'].isin(_crm_city_f)] if _crm_city_f else _crm_comp.copy()
+
+        if 'CUSTOMER ID' not in _crm_df.columns or _crm_df['CUSTOMER ID'].isna().all():
+            st.warning("CUSTOMER ID column not found or empty — cannot compute customer profiles.")
+        else:
+            _cust_grp = _build_cust_profiles(_crm_df, _crm_ref_date)
+
+
+            # ── Classify ordering cadence ────────────────────────────
+            def _classify_cadence(row):
+                gap = row['Avg_Gap_Days']
+                orders = row['Total_Orders']
+                lifespan = row['Lifespan_Days']
+                if orders <= 1:
+                    return 'One-Time'
+                if gap <= 2:
+                    return 'Daily Regular'
+                if gap <= 7:
+                    return 'Weekly Regular'
+                if gap <= 16:
+                    return 'Bi-Weekly'
+                if 25 <= gap <= 35:
+                    return 'Monthly Payday'
+                if lifespan >= 60 and orders >= 3 and gap > 35:
+                    return 'Seasonal'
+                return 'Occasional'
+
+            _cust_grp['Cadence'] = _cust_grp.apply(_classify_cadence, axis=1)
+
+            # ── Expected gap per cadence (days before flagging as dormant) ──
+            _cadence_dormant_thresh = {
+                'Daily Regular':  7,    # silent 7 days = red flag
+                'Weekly Regular': 14,   # silent 2 weeks = red flag
+                'Bi-Weekly':      28,
+                'Monthly Payday': 45,
+                'Seasonal':       90,   # give them space
+                'Occasional':     60,
+                'One-Time':       30,   # try once to convert
+            }
+
+            def _dormancy_flag(row):
+                thresh = _cadence_dormant_thresh.get(row['Cadence'], 30)
+                if row['Recency_Days'] > thresh * 3:
+                    return 'Lost'
+                if row['Recency_Days'] > thresh * 1.5:
+                    return 'At Risk'
+                if row['Recency_Days'] > thresh:
+                    return 'Slipping'
+                return 'Active'
+
+            _cust_grp['Status'] = _cust_grp.apply(_dormancy_flag, axis=1)
+
+            # ── Dormancy Score: higher = more urgent reactivation ──
+            # Score = recency_ratio × log(spend+1) × frequency_weight
+            import math
+            def _dormancy_score(row):
+                thresh = _cadence_dormant_thresh.get(row['Cadence'], 30)
+                recency_ratio  = row['Recency_Days'] / max(thresh, 1)
+                spend_weight   = math.log1p(row['Total_Spend'] / 1000)   # normalise by 1000 TZS
+                freq_weight    = min(row['Total_Orders'] / 10, 3.0)      # cap at 3x
+                return round(recency_ratio * spend_weight * freq_weight, 2)
+
+            _cust_grp['Dormancy_Score'] = _cust_grp.apply(_dormancy_score, axis=1)
+
+            # ── Customer Trait tag ──────────────────────────────────
+            def _trait(row):
+                tags = []
+                if row['Cadence'] == 'Daily Regular':      tags.append('🔥 Power User')
+                if row['Cadence'] == 'Monthly Payday':     tags.append('📅 Payday Buyer')
+                if row['Cadence'] == 'Seasonal':           tags.append('📚 Seasonal')
+                if row['Total_Spend'] >= 500000:           tags.append('💎 High Value')
+                if row['Total_Orders'] >= 30:              tags.append('🏆 Loyal')
+                if row['Cadence'] == 'One-Time':           tags.append('🆕 One-Timer')
+                if row['Avg_Order_Value'] >= 30000:        tags.append('🍽️ Premium Spender')
+                # Guest flag: identity resolved by phone/email/name (no account)
+                if not row.get('Has_Account', True):       tags.append('👻 Guest')
+                if not tags:                               tags.append('👤 Regular')
+                return ' · '.join(tags)
+
+            _cust_grp['Traits'] = _cust_grp.apply(_trait, axis=1)
+
+            # ── Recommended action per status + cadence ─────────────
+            def _action(row):
+                s = row['Status']
+                c = row['Cadence']
+                spend = row['Total_Spend']
+                rest  = row['Top_Restaurant']
+                if s == 'Active':
+                    return f"✅ Active — monitor retention"
+                if s == 'Lost':
+                    if spend >= 200000:
+                        return f"📞 CALL urgently — high-value lost customer. Offer 20% voucher + mention {rest}"
+                    return f"📱 SMS win-back: 'We miss you! Get 15% off your next order'"
+                if s == 'At Risk':
+                    if c == 'Daily Regular':
+                        return f"📞 Call today — daily user gone quiet. Personal outreach + free delivery"
+                    if c in ('Weekly Regular','Bi-Weekly'):
+                        return f"📱 Push notification: highlight new menu at {rest}"
+                    if c == 'Monthly Payday':
+                        return f"📅 Check if end-of-month — if yes, prepare payday offer for next cycle"
+                    return f"📱 Send personalised discount to re-engage"
+                if s == 'Slipping':
+                    if '💎' in row['Traits']:
+                        return f"📞 Proactive call — VIP slipping. Offer loyalty reward"
+                    return f"🔔 Send push reminder: '{rest} has new items you might like'"
+                return "👀 Monitor"
+
+            _cust_grp['Action'] = _cust_grp.apply(_action, axis=1)
+
+            # ══════════════════════════════════════════════════════
+            # SUMMARY METRICS
+            # ══════════════════════════════════════════════════════
+            _active_n   = (_cust_grp['Status'] == 'Active').sum()
+            _slipping_n = (_cust_grp['Status'] == 'Slipping').sum()
+            _atrisk_n   = (_cust_grp['Status'] == 'At Risk').sum()
+            _lost_n     = (_cust_grp['Status'] == 'Lost').sum()
+            _total_cust = len(_cust_grp)
+
+            _lost_spend  = _cust_grp[_cust_grp['Status'] == 'Lost']['Total_Spend'].sum()
+            _risk_spend  = _cust_grp[_cust_grp['Status'].isin(['At Risk','Slipping'])]['Total_Spend'].sum()
+
+            _sm1,_sm2,_sm3,_sm4,_sm5 = st.columns(5)
+            _sm1.metric("👥 Total Customers",  f"{_total_cust:,}")
+            _sm2.metric("✅ Active",            f"{_active_n:,}",
+                        delta=f"{_active_n/_total_cust*100:.0f}%", delta_color="normal")
+            _sm3.metric("⚠️ Slipping",          f"{_slipping_n:,}", delta_color="inverse")
+            _sm4.metric("🚨 At Risk",           f"{_atrisk_n:,}", delta_color="inverse")
+            _sm5.metric("💀 Lost",              f"{_lost_n:,}",
+                        delta=f"{_lost_spend/1e6:.1f}M TZS at risk", delta_color="inverse")
+
+            # Revenue at risk callout
+            if _risk_spend + _lost_spend > 0:
+                st.markdown(
+                    f'<div style="background:#ffebee;border-left:4px solid #c62828;padding:10px 16px;'
+                    f'border-radius:6px;font-size:13px;margin:8px 0;">'
+                    f'⚠️ <b>Total revenue at risk:</b> {(_risk_spend+_lost_spend)/1e6:.1f}M TZS '
+                    f'from {_atrisk_n+_slipping_n+_lost_n:,} dormant or at-risk customers</div>',
+                    unsafe_allow_html=True)
+
+            st.markdown("---")
+
+            # ── Cadence breakdown chart — split One-Time by guest vs registered ──
+            _cg_plot = _cust_grp.copy()
+            def _refined_cadence(row):
+                if row['Cadence'] == 'One-Time':
+                    return '👻 Guest (1 order)' if not row.get('Has_Account', True) else '🆕 Registered (1 order)'
+                return row['Cadence']
+            _cg_plot['Cadence_Display'] = _cg_plot.apply(_refined_cadence, axis=1)
+            _cad_counts = _cg_plot['Cadence_Display'].value_counts().reset_index()
+            _cad_counts.columns = ['Cadence','Customers']
+
+            _cad_colors_map = {
+                'Daily Regular':'#FF6B00','Weekly Regular':'#4d96ff','Bi-Weekly':'#6bcb77',
+                'Monthly Payday':'#f39c12','Seasonal':'#9b59b6','Occasional':'#95a5a6',
+                '👻 Guest (1 order)':'#e0aaff','🆕 Registered (1 order)':'#e74c3c',
+            }
+            _cad_col, _status_col = st.columns(2)
+            with _cad_col:
+                st.markdown("##### 📊 Customer Cadence Breakdown")
+                st.caption("One-Time split: 👻 Guest = no account · 🆕 Registered = has account but 1 order")
+                _fig_cad, _ax_cad = plt.subplots(figsize=(6, 4))
+                _bar_c = [_cad_colors_map.get(x,'#aaa') for x in _cad_counts['Cadence']]
+                _cb = _ax_cad.barh(_cad_counts['Cadence'], _cad_counts['Customers'],
+                                    color=_bar_c, alpha=0.88, edgecolor='white')
+                for _b, _v in zip(_cb, _cad_counts['Customers']):
+                    _ax_cad.text(_b.get_width()+0.5, _b.get_y()+_b.get_height()/2,
+                                  str(_v), va='center', fontsize=9, fontweight='bold')
+                _ax_cad.set_title("Ordering Cadence Segments", fontweight='bold', fontsize=10)
+                _ax_cad.set_xlabel("Customers"); _ax_cad.grid(axis='x', alpha=0.2)
+                plt.tight_layout(pad=1.2); st.pyplot(_fig_cad); plt.close()
+
+            with _status_col:
+                st.markdown("##### 🚦 Customer Health Status")
+                _status_counts = _cust_grp['Status'].value_counts().reindex(
+                    ['Active','Slipping','At Risk','Lost'], fill_value=0)
+                _status_colors = ['#2e7d32','#f39c12','#e67e22','#c62828']
+                _fig_st, _ax_st = plt.subplots(figsize=(6, 3.5))
+                _ax_st.pie(_status_counts, labels=_status_counts.index,
+                           colors=_status_colors, autopct='%1.0f%%',
+                           startangle=90, wedgeprops={'edgecolor':'white','linewidth':1.5},
+                           textprops={'fontsize':10})
+                _ax_st.set_title("Customer Health Distribution", fontweight='bold', fontsize=10)
+                plt.tight_layout(); st.pyplot(_fig_st); plt.close()
+
+            st.markdown("---")
+
+            # ══════════════════════════════════════════════════════
+            # PRIORITY REACTIVATION LIST
+            # ══════════════════════════════════════════════════════
+            st.markdown("### 🚨 Priority Reactivation List")
+            st.caption("Sorted by Dormancy Score — highest score = most urgent. Excludes active customers.")
+
+            _react_tabs = st.tabs([
+                "🔴 Lost (High Value First)",
+                "🟠 At Risk",
+                "🟡 Slipping",
+                "📅 By Cadence Type",
+            ])
+
+            # Columns to show in all tables
+            _disp_cols = ['Name','All_Phones','All_Emails','City','Cadence','Traits',
+                          'Total_Orders','Total_Spend','Avg_Order_Value',
+                          'Recency_Days','Last_Order','Top_Restaurants','Top_Products',
+                          'Dormancy_Score','Action']
+
+            def _fmt_table(df_in):
+                _available = [col for col in _disp_cols if col in df_in.columns]
+                d = df_in[_available].copy()
+                if 'Total_Spend' in d.columns:
+                    d['Total_Spend']     = d['Total_Spend'].apply(lambda x: f"{int(x):,} TZS")
+                if 'Avg_Order_Value' in d.columns:
+                    d['Avg_Order_Value'] = d['Avg_Order_Value'].apply(lambda x: f"{int(x):,} TZS")
+                if 'Last_Order' in d.columns:
+                    d['Last_Order']      = pd.to_datetime(d['Last_Order']).dt.strftime('%d %b %Y')
+                d = d.rename(columns={
+                    'Total_Orders':'Orders','Total_Spend':'Lifetime Spend',
+                    'Avg_Order_Value':'Avg Order','Recency_Days':'Days Silent',
+                    'Last_Order':'Last Order','Top_Restaurants':'Top 3 Restaurants',
+                    'Top_Products':'Top 3 Products','Dormancy_Score':'Priority Score',
+                    'All_Phones':'📞 All Phones','All_Emails':'✉️ All Emails'
+                })
+                return d.reset_index(drop=True)
+
+            def _style_priority(df_in):
+                sty = pd.DataFrame('', index=df_in.index, columns=df_in.columns)
+                for idx, row in df_in.iterrows():
+                    score = row.get('Priority Score', 0)
+                    try:
+                        score = float(score)
+                        if score >= 10:
+                            for col in df_in.columns:
+                                sty.at[idx,col] = 'background-color:#ffebee'
+                        elif score >= 5:
+                            for col in df_in.columns:
+                                sty.at[idx,col] = 'background-color:#fff8e1'
+                    except: pass
+                return sty
+
+            with _react_tabs[0]:
+                _lost_df = (_cust_grp[_cust_grp['Status'] == 'Lost']
+                            .sort_values('Dormancy_Score', ascending=False))
+                if _lost_df.empty:
+                    st.success("No lost customers — great retention!")
+                else:
+                    st.metric("Lost customers", len(_lost_df),
+                              delta=f"{_lost_df['Total_Spend'].sum()/1e6:.1f}M TZS historical spend",
+                              delta_color="off")
+                    _lost_disp = _fmt_table(_lost_df)
+                    st.dataframe(_lost_disp.style.apply(_style_priority, axis=None),
+                                 use_container_width=True, height=420)
+                    st.download_button("⬇️ Download Lost Customers List",
+                        data=_lost_disp.to_csv(index=False).encode(),
+                        file_name="lost_customers.csv", mime="text/csv", key="dl_lost")
+
+            with _react_tabs[1]:
+                _risk_df = (_cust_grp[_cust_grp['Status'] == 'At Risk']
+                            .sort_values('Dormancy_Score', ascending=False))
+                if _risk_df.empty:
+                    st.success("No at-risk customers currently.")
+                else:
+                    _risk_disp = _fmt_table(_risk_df)
+                    st.dataframe(_risk_disp.style.apply(_style_priority, axis=None),
+                                 use_container_width=True, height=420)
+                    st.download_button("⬇️ Download At-Risk List",
+                        data=_risk_disp.to_csv(index=False).encode(),
+                        file_name="at_risk_customers.csv", mime="text/csv", key="dl_risk")
+
+            with _react_tabs[2]:
+                _slip_df = (_cust_grp[_cust_grp['Status'] == 'Slipping']
+                            .sort_values('Dormancy_Score', ascending=False))
+                if _slip_df.empty:
+                    st.success("No slipping customers currently.")
+                else:
+                    _slip_disp = _fmt_table(_slip_df)
+                    st.dataframe(_slip_disp.style.apply(_style_priority, axis=None),
+                                 use_container_width=True, height=420)
+                    st.download_button("⬇️ Download Slipping List",
+                        data=_slip_disp.to_csv(index=False).encode(),
+                        file_name="slipping_customers.csv", mime="text/csv", key="dl_slip")
+
+            with _react_tabs[3]:
+                _cad_sel = st.selectbox("Select cadence to inspect",
+                    ['Daily Regular','Weekly Regular','Bi-Weekly',
+                     'Monthly Payday','Seasonal','Occasional','One-Time'],
+                    key="crm_cad_sel")
+                _cad_df = (_cust_grp[(_cust_grp['Cadence'] == _cad_sel) &
+                                      (_cust_grp['Status'] != 'Active')]
+                           .sort_values('Dormancy_Score', ascending=False))
+                if _cad_df.empty:
+                    st.info(f"No dormant {_cad_sel} customers found.")
+                else:
+                    # Context note per cadence
+                    _cadence_notes = {
+                        'Daily Regular':  "⚡ These were your most engaged customers. Any silence is a strong signal — reach out within 24–48 hours.",
+                        'Weekly Regular': "📆 These customers have a consistent weekly habit. A personal push or restaurant highlight often brings them back.",
+                        'Bi-Weekly':      "🔄 Bi-weekly buyers are routine-driven. A well-timed reminder (Wed/Thu) or offer aligned to their usual day works well.",
+                        'Monthly Payday': "💰 These customers likely order when they receive their salary. Check if the current date is near month-end before pushing.",
+                        'Seasonal':       "📚 Seasonal customers (students, etc.) may be off-cycle naturally. Only escalate if absence extends beyond their usual off-season.",
+                        'Occasional':     "🎯 Occasional buyers need a reason to return — a promotion tied to their favourite restaurant is most effective.",
+                        'One-Time':       "🆕 One-time buyers who haven't returned. A 'first loyalty reward' or discount on second order can convert them.",
+                    }
+                    st.info(_cadence_notes.get(_cad_sel, ""))
+                    _cad_disp = _fmt_table(_cad_df)
+                    st.dataframe(_cad_disp.style.apply(_style_priority, axis=None),
+                                 use_container_width=True, height=420)
+                    st.download_button(f"⬇️ Download {_cad_sel} List",
+                        data=_cad_disp.to_csv(index=False).encode(),
+                        file_name=f"{_cad_sel.lower().replace(' ','_')}_customers.csv",
+                        mime="text/csv", key="dl_cad")
+
+            st.markdown("---")
+
+            # ══════════════════════════════════════════════════════
+            # RETENTION SECTION (within Customer mode)
+            # ══════════════════════════════════════════════════════
+            st.markdown("### 🛡️ Active Customer Retention")
+            st.caption("Customers currently active — identify loyalty tiers and prevent them from slipping")
+
+            _active_df = _cust_grp[_cust_grp['Status'] == 'Active'].copy()
+
+            if not _active_df.empty:
+                # Retention tier scoring
+                def _retention_tier(row):
+                    orders = row['Total_Orders']
+                    spend  = row['Total_Spend']
+                    gap    = row['Avg_Gap_Days']
+                    if orders >= 20 and spend >= 300000 and gap <= 7:
+                        return '🥇 Champion'
+                    if orders >= 10 and spend >= 150000:
+                        return '🥈 Loyal'
+                    if orders >= 5 or spend >= 80000:
+                        return '🥉 Promising'
+                    return '🌱 New / Casual'
+
+                _active_df['Retention Tier'] = _active_df.apply(_retention_tier, axis=1)
+
+                def _retention_action(row):
+                    t = row['Retention Tier']
+                    rest = row['Top_Restaurant']
+                    if 'Champion' in t:
+                        return f"🎁 Enroll in VIP programme — offer exclusive perks, early access, dedicated support"
+                    if 'Loyal' in t:
+                        return f"🏆 Reward with loyalty discount or free delivery milestone. Feature {rest}"
+                    if 'Promising' in t:
+                        return f"📈 Nudge toward next loyalty tier — show progress (e.g. '3 more orders to unlock reward')"
+                    return f"👋 Welcome sequence — introduce new restaurants, share app tips"
+
+                _active_df['Retention Action'] = _active_df.apply(_retention_action, axis=1)
+
+                # Tier summary
+                _tier_counts = _active_df['Retention Tier'].value_counts()
+                _rt1,_rt2,_rt3,_rt4 = st.columns(4)
+                _rt1.metric("🥇 Champions",    _tier_counts.get('🥇 Champion',0))
+                _rt2.metric("🥈 Loyal",        _tier_counts.get('🥈 Loyal',0))
+                _rt3.metric("🥉 Promising",    _tier_counts.get('🥉 Promising',0))
+                _rt4.metric("🌱 New / Casual", _tier_counts.get('🌱 New / Casual',0))
+
+                _ret_tier_sel = st.selectbox(
+                    "Explore a retention tier",
+                    ['🥇 Champion','🥈 Loyal','🥉 Promising','🌱 New / Casual'],
+                    key="ret_tier_sel")
+                _ret_tier_df = (_active_df[_active_df['Retention Tier'] == _ret_tier_sel]
+                                .sort_values('Total_Spend', ascending=False))
+
+                _ret_disp_cols = ['Name','All_Phones','All_Emails','City','Cadence','Traits',
+                                  'Total_Orders','Total_Spend','Avg_Order_Value',
+                                  'Recency_Days','Top_Restaurants','Top_Products','Retention Action']
+                _ret_avail = [c for c in _ret_disp_cols if c in _ret_tier_df.columns]
+                _ret_show = _ret_tier_df[_ret_avail].copy()
+                _ret_show['Total_Spend']     = _ret_show['Total_Spend'].apply(lambda x: f"{int(x):,} TZS")
+                _ret_show['Avg_Order_Value'] = _ret_show['Avg_Order_Value'].apply(lambda x: f"{int(x):,} TZS")
+                _ret_show = _ret_show.rename(columns={
+                    'Total_Orders':'Orders','Total_Spend':'Lifetime Spend',
+                    'Avg_Order_Value':'Avg Order','Recency_Days':'Days Since Last Order',
+                    'Top_Restaurants':'Top 3 Restaurants','Top_Products':'Top 3 Products',
+                    'All_Phones':'📞 All Phones','All_Emails':'✉️ All Emails'
+                }).reset_index(drop=True)
+
+                # Style champion rows gold
+                def _style_ret(df_in):
+                    sty = pd.DataFrame('', index=df_in.index, columns=df_in.columns)
+                    if _ret_tier_sel == '🥇 Champion':
+                        for idx in df_in.index:
+                            for col in df_in.columns:
+                                sty.at[idx,col] = 'background-color:#fff9c4;color:#212121'
+                    return sty
+
+                st.dataframe(_ret_show.style.apply(_style_ret, axis=None),
+                             use_container_width=True, height=400)
+                st.download_button(f"⬇️ Download {_ret_tier_sel} List",
+                    data=_ret_show.to_csv(index=False).encode(),
+                    file_name=f"retention_{_ret_tier_sel.replace(' ','_').replace('/','').replace('🥇','champion').replace('🥈','loyal').replace('🥉','promising').replace('🌱','new')}.csv",
+                    mime="text/csv", key="dl_ret_tier")
+            else:
+                st.info("No active customers in the selected period.")
+
+    # ══════════════════════════════════════════════════════════════
+    # WEEKLY NEW CUSTOMERS (shown in Customer mode only, below retention)
+    # ══════════════════════════════════════════════════════════════
+    if "Customer" in _crm_mode:
+        st.markdown("---")
+        st.markdown('<div class="section-header">🆕 Weekly New Customer Intelligence</div>', unsafe_allow_html=True)
+
+        # Build first-order dates per canonical customer using same dedup logic
+        @st.cache_data(show_spinner="Computing new customer trends…")
+        def _build_new_cust_weekly(_df_in, _ref_ts):
+            df = _df_in.copy() if '_cid' in _df_in.columns else _add_canonical_id(_df_in)
+            # First order date per canonical customer
+            first_orders = df.groupby('_cid')['DELIVERY DATE'].min().reset_index()
+            first_orders.columns = ['_cid','First_Order_Date']
+            first_orders['Week'] = first_orders['First_Order_Date'].dt.to_period('W-SUN')
+            # Enrich with customer info at first order
+            first_detail = df.sort_values('DELIVERY DATE').groupby('_cid').first().reset_index()
+            merged = first_orders.merge(first_detail[['_cid','CUSTOMER NAME','CUSTOMER CELLPHONE',
+                                                       'BUSINESS CITY','BUSINESS NAME','SUBTOTAL']],
+                                        on='_cid', how='left')
+            # ── Progress stats: all orders ever for each canonical customer ──
+            _prog_agg = df.groupby('_cid').agg(
+                Total_Orders_SoFar = ('ID', 'count'),
+                Last_Order_Date    = ('DELIVERY DATE', 'max'),
+                Avg_DT             = ('Average Delivery Time', 'mean') if 'Average Delivery Time' in df.columns else ('ID', 'count'),
+                Last_DT            = ('Average Delivery Time', 'last') if 'Average Delivery Time' in df.columns else ('ID', 'count'),
+            ).reset_index()
+            # Use delivery stages if available, otherwise fallback
+            if 'Average Delivery Time' in df.columns:
+                _prog_agg2 = df.sort_values('DELIVERY DATE').groupby('_cid').agg(
+                    Avg_DT  = ('Average Delivery Time', 'mean'),
+                    Last_DT = ('Average Delivery Time', 'last'),
+                ).reset_index()
+                _prog_agg = df.groupby('_cid').agg(
+                    Total_Orders_SoFar=('ID','count'),
+                    Last_Order_Date=('DELIVERY DATE','max'),
+                ).reset_index()
+                _prog_agg = _prog_agg.merge(_prog_agg2, on='_cid', how='left')
+            else:
+                _prog_agg = df.groupby('_cid').agg(
+                    Total_Orders_SoFar=('ID','count'),
+                    Last_Order_Date=('DELIVERY DATE','max'),
+                ).reset_index()
+                _prog_agg['Avg_DT']  = None
+                _prog_agg['Last_DT'] = None
+            merged = merged.merge(_prog_agg, on='_cid', how='left')
+            merged['Repeated'] = merged['Total_Orders_SoFar'] > 1
+            return merged
+
+        _nc_df_src = _crm_comp.copy()  # completed orders only
+        if _crm_city_f:
+            _nc_df_src = _nc_df_src[_nc_df_src['BUSINESS CITY'].isin(_crm_city_f)]
+
+        _nc_all = _build_new_cust_weekly(_nc_df_src, _crm_ref_date)
+
+        # Week list (last 12 weeks)
+        _nc_all_weeks = sorted(_nc_all['Week'].dropna().unique(), reverse=True)[:12]
+        _nc_all['WkLabel'] = _nc_all['Week'].apply(
+            lambda p: f"W{p.week} ({p.start_time.strftime('%d %b')})" if not isinstance(p, float) else '—')
+
+        # ── KPI trend: new customers per week ──
+        _nc_wk_counts = (_nc_all[_nc_all['Week'].isin(_nc_all_weeks)]
+                          .groupby('WkLabel')['_cid'].count().reset_index())
+        _nc_wk_counts.columns = ['Week','New Customers']
+        # Preserve chronological order
+        _nc_wk_order = [f"W{p.week} ({p.start_time.strftime('%d %b')})"
+                        for p in sorted(_nc_all_weeks)]
+        _nc_wk_counts = _nc_wk_counts.set_index('Week').reindex(_nc_wk_order).fillna(0).reset_index()
+
+        # Current vs previous week
+        _nc_cur  = int(_nc_wk_counts['New Customers'].iloc[-1]) if len(_nc_wk_counts) >= 1 else 0
+        _nc_prev = int(_nc_wk_counts['New Customers'].iloc[-2]) if len(_nc_wk_counts) >= 2 else 0
+        _nc_avg  = round(_nc_wk_counts['New Customers'].mean(), 1)
+        _nc_best = int(_nc_wk_counts['New Customers'].max())
+
+        _nk1,_nk2,_nk3,_nk4 = st.columns(4)
+        _nk1.metric("🆕 New This Week",   _nc_cur,
+                    delta=f"{_nc_cur-_nc_prev:+d} vs prev week",
+                    delta_color="normal" if _nc_cur >= _nc_prev else "inverse")
+        _nk2.metric("📅 Previous Week",   _nc_prev)
+        _nk3.metric("📊 12-Wk Average",   f"{_nc_avg:.0f}")
+        _nk4.metric("🏆 Best Week",       _nc_best)
+
+        # ── Trend chart ──
+        st.markdown("##### 📈 New Customer Acquisition — Last 12 Weeks")
+        _fig_nc, _ax_nc = plt.subplots(figsize=(13, 4))
+        _bar_colors_nc = ['#FF6B00' if i == len(_nc_wk_counts)-1 else '#4d96ff'
+                          for i in range(len(_nc_wk_counts))]
+        _nc_bars = _ax_nc.bar(_nc_wk_counts['Week'], _nc_wk_counts['New Customers'],
+                               color=_bar_colors_nc, alpha=0.88, edgecolor='white', linewidth=0.4)
+        # Value labels
+        for _b, _v in zip(_nc_bars, _nc_wk_counts['New Customers']):
+            if _v > 0:
+                _ax_nc.text(_b.get_x()+_b.get_width()/2, _b.get_height()+0.3,
+                             str(int(_v)), ha='center', va='bottom', fontsize=8, fontweight='bold')
+        # Average line
+        _ax_nc.axhline(_nc_avg, color='#c62828', lw=1.5, linestyle='--', label=f"12-wk avg: {_nc_avg:.0f}")
+        _ax_nc.set_xticks(range(len(_nc_wk_counts)))
+        _ax_nc.set_xticklabels(_nc_wk_counts['Week'], rotation=35, ha='right', fontsize=8.5)
+        _ax_nc.set_ylabel("New Customers"); _ax_nc.grid(axis='y', alpha=0.18, linestyle='--')
+        _ax_nc.set_title("Weekly New Customer Acquisition (latest week = orange)", fontweight='bold', fontsize=11)
+        _ax_nc.legend(fontsize=9); _ax_nc.margins(x=0.02)
+        plt.tight_layout(pad=1.5); st.pyplot(_fig_nc); plt.close()
+
+        # ── City breakdown of new customers this week ──
+        _nc_this_wk_lbl = _nc_wk_order[-1] if _nc_wk_order else None
+        if _nc_this_wk_lbl:
+            _nc_this = _nc_all[_nc_all['WkLabel'] == _nc_this_wk_lbl].copy()
+            if not _nc_this.empty:
+                st.markdown("##### 🏙️ New Customers This Week — City & Restaurant Breakdown")
+                _ncc1, _ncc2 = st.columns(2)
+                with _ncc1:
+                    _nc_city = _nc_this['BUSINESS CITY'].value_counts().head(8).reset_index()
+                    _nc_city.columns = ['City','New Customers']
+                    _fig_ncc, _ax_ncc = plt.subplots(figsize=(6, 3.5))
+                    _ax_ncc.barh(_nc_city['City'], _nc_city['New Customers'],
+                                  color='#4d96ff', alpha=0.85, edgecolor='white')
+                    for _b, _v in zip(_ax_ncc.patches, _nc_city['New Customers']):
+                        _ax_ncc.text(_b.get_width()+0.2, _b.get_y()+_b.get_height()/2,
+                                      str(_v), va='center', fontsize=9, fontweight='bold')
+                    _ax_ncc.set_title("By City", fontweight='bold', fontsize=10)
+                    _ax_ncc.grid(axis='x', alpha=0.2); plt.tight_layout(pad=1.2)
+                    st.pyplot(_fig_ncc); plt.close()
+
+                with _ncc2:
+                    _nc_rest = _nc_this['BUSINESS NAME'].value_counts().head(8).reset_index()
+                    _nc_rest.columns = ['Restaurant','New Customers']
+                    _fig_ncr, _ax_ncr = plt.subplots(figsize=(6, 3.5))
+                    _ax_ncr.barh(_nc_rest['Restaurant'], _nc_rest['New Customers'],
+                                  color='#6bcb77', alpha=0.85, edgecolor='white')
+                    for _b, _v in zip(_ax_ncr.patches, _nc_rest['New Customers']):
+                        _ax_ncr.text(_b.get_width()+0.2, _b.get_y()+_b.get_height()/2,
+                                      str(_v), va='center', fontsize=9, fontweight='bold')
+                    _ax_ncr.set_title("First Order at Restaurant", fontweight='bold', fontsize=10)
+                    _ax_ncr.grid(axis='x', alpha=0.2); plt.tight_layout(pad=1.2)
+                    st.pyplot(_fig_ncr); plt.close()
+
+                # ── New customers table this week ──
+                st.markdown("##### 📋 New Customer List — This Week (actionable)")
+
+                # Summary: how many have already reordered?
+                _nc_repeated    = _nc_this['Repeated'].sum() if 'Repeated' in _nc_this.columns else 0
+                _nc_one_time_so_far = len(_nc_this) - _nc_repeated
+                _nc_col_s1, _nc_col_s2, _nc_col_s3 = st.columns(3)
+                _nc_col_s1.metric("New this week", len(_nc_this))
+                _nc_col_s2.metric("✅ Already reordered", int(_nc_repeated),
+                                   help="Placed a 2nd order since their first this week")
+                _nc_col_s3.metric("⏳ Still one order only", int(_nc_one_time_so_far),
+                                   help="Haven't reordered yet — prime targets for welcome outreach")
+                st.caption("🎯 Prioritise outreach to customers with **only 1 order so far** — the 7-day window after first order is the highest-conversion moment")
+
+                # Build display table
+                _nc_progress_cols = ['CUSTOMER NAME','CUSTOMER CELLPHONE','BUSINESS CITY',
+                                      'BUSINESS NAME','SUBTOTAL','First_Order_Date',
+                                      'Total_Orders_SoFar','Repeated','Last_Order_Date',
+                                      'Avg_DT','Last_DT']
+                _nc_avail = [col for col in _nc_progress_cols if col in _nc_this.columns]
+                _nc_show = _nc_this[_nc_avail].copy()
+
+                # Format columns
+                _nc_show = _nc_show.rename(columns={
+                    'CUSTOMER NAME':'Name','CUSTOMER CELLPHONE':'Phone',
+                    'BUSINESS CITY':'City','BUSINESS NAME':'First Restaurant',
+                    'SUBTOTAL':'First Order Value','First_Order_Date':'First Order Date',
+                    'Total_Orders_SoFar':'Total Orders','Repeated':'Reordered?',
+                    'Last_Order_Date':'Last Order Date',
+                    'Avg_DT':'Avg DT (min)','Last_DT':'Last DT (min)'
+                })
+                _nc_show['First Order Date'] = pd.to_datetime(_nc_show['First Order Date']).dt.strftime('%d %b %Y')
+                if 'Last Order Date' in _nc_show.columns:
+                    _nc_show['Last Order Date'] = pd.to_datetime(_nc_show['Last Order Date']).dt.strftime('%d %b %Y')
+                _nc_show['First Order Value'] = _nc_show['First Order Value'].apply(
+                    lambda x: f"{int(x):,} TZS" if pd.notna(x) else '—')
+                if 'Avg DT (min)' in _nc_show.columns:
+                    _nc_show['Avg DT (min)'] = _nc_show['Avg DT (min)'].apply(
+                        lambda x: f"{x:.0f}" if pd.notna(x) and x == x else '—')
+                if 'Last DT (min)' in _nc_show.columns:
+                    _nc_show['Last DT (min)'] = _nc_show['Last DT (min)'].apply(
+                        lambda x: f"{x:.0f}" if pd.notna(x) and x == x else '—')
+                if 'Reordered?' in _nc_show.columns:
+                    _nc_show['Reordered?'] = _nc_show['Reordered?'].map({True:'✅ Yes', False:'⏳ Not yet'})
+
+                _nc_show['Suggested Action'] = _nc_show.apply(
+                    lambda r: ("🔁 Already returning — add to loyalty programme" if r.get('Reordered?') == '✅ Yes'
+                               else f"📱 Welcome SMS — mention {r['First Restaurant']}, offer 10% on next order"),
+                    axis=1)
+
+                # Sort: not-yet-reordered first (most urgent), then by first order value
+                _nc_show = _nc_show.sort_values(
+                    ['Reordered?','First Order Value'],
+                    ascending=[True, False]
+                ).reset_index(drop=True)
+
+                # Highlight reordered rows green
+                def _style_nc(df_in):
+                    sty = pd.DataFrame('', index=df_in.index, columns=df_in.columns)
+                    if 'Reordered?' in df_in.columns:
+                        for idx, val in df_in['Reordered?'].items():
+                            if val == '✅ Yes':
+                                for col in df_in.columns:
+                                    sty.at[idx,col] = 'background-color:#e8f5e9;color:#1b5e20'
+                    return sty
+
+                st.dataframe(_nc_show.style.apply(_style_nc, axis=None),
+                             use_container_width=True, height=450, hide_index=True)
+                st.download_button("⬇️ Download New Customers This Week",
+                    data=_nc_show.to_csv(index=False).encode(),
+                    file_name="new_customers_this_week.csv", mime="text/csv",
+                    key="dl_new_cust")
+
+                # ── Conversion insight ──
+                _avg_first_val = _nc_this['SUBTOTAL'].mean()
+                _high_val_nc   = (_nc_this['SUBTOTAL'] >= _avg_first_val * 1.5).sum()
+                _tip_html = (
+                    '<div style="background:#e8f5e9;border-left:4px solid #2e7d32;'
+                    'padding:10px 16px;border-radius:6px;font-size:13px;margin:8px 0;">'
+                    + f'💡 Conversion tip: {_high_val_nc} of this week new customers spent '
+                    + f'above 1.5x the average first-order value ({int(_avg_first_val):,} TZS avg). '
+                    + 'These high-value first-timers have the highest probability of becoming '
+                    + 'weekly regulars. Prioritise them for immediate follow-up.'
+                    + '</div>'
+                )
+                st.markdown(_tip_html, unsafe_allow_html=True)
+    # ══════════════════════════════════════════════════════════════
+    # 📧 SMART EMAIL ENGAGEMENT AGENT
+    # ══════════════════════════════════════════════════════════════
+    if "Customer" in _crm_mode:
+        import smtplib, ssl, uuid, hashlib
+        from email.mime.multipart import MIMEMultipart
+        from email.mime.text      import MIMEText
+
+        st.markdown("---")
+        st.markdown('<div class="section-header">📧 Smart Email Engagement Agent</div>', unsafe_allow_html=True)
+        st.caption("Build personalised campaigns · Preview every email · One-click send · Full tracking")
+
+        with st.expander("📖 How this works — read before your first campaign", expanded=False):
+            st.markdown("""
+            <style>
+            .ea-h{font-weight:700;color:#FF6B00;font-size:14px;margin:14px 0 6px;border-bottom:1px solid #ffd6a5;padding-bottom:3px}
+            .ea-p{font-size:13px;line-height:1.8;color:#333;margin-bottom:10px}
+            .ea-warn{background:#fff3e0;border-left:4px solid #e65100;padding:12px 16px;border-radius:6px;font-size:13px;margin:10px 0}
+            .ea-ok{background:#f0fdf4;border-left:4px solid #22c55e;padding:12px 16px;border-radius:6px;font-size:13px;margin:10px 0}
+            .ea-info{background:#eff6ff;border-left:4px solid #3b82f6;padding:12px 16px;border-radius:6px;font-size:13px;margin:10px 0}
+            </style>
+
+            <div class="ea-h">🎯 What this agent does</div>
+            <div class="ea-p">
+            This tool builds <strong>personalised email campaigns</strong> for your customers — using their name,
+            favourite restaurants, ordering patterns, and health status (Lost, At Risk, Slipping, Active)
+            to pick the right message for each person automatically.<br><br>
+            You choose the audience, pick an email style, set a daily limit and cooldown period,
+            preview every email before it goes out, and click Send. That's it.
+            </div>
+
+            <div class="ea-h">📧 Who sends the email and who sees the reply?</div>
+            <div class="ea-p">
+            Emails are sent from your Outlook account (<strong>lusekangele@outlook.com</strong>) but displayed to
+            customers as <strong>"Piki Customer Service"</strong>. Replies go directly to
+            <strong>service@piki.co.tz</strong> — so your operations team sees and handles all responses.
+            </div>
+
+            <div class="ea-h">🔁 How does the system prevent sending to the same person twice?</div>
+            <div class="ea-p">
+            Every email sent is logged with the customer's canonical ID and timestamp. Before building
+            any campaign, the system checks the log and <strong>automatically skips anyone who received
+            an email within the cooldown window</strong> you set (default: 21 days). They simply won't appear
+            in the Preview list. This means:
+            <ul style="font-size:13px;margin-top:6px">
+            <li>A customer emailed today will not appear in any campaign for 21 days</li>
+            <li>You can run the agent daily — it handles the exclusions for you</li>
+            <li>The "⏭️ Skipped (cooldown)" metric shows exactly how many were excluded each run</li>
+            </ul>
+            </div>
+
+            <div class="ea-h">💰 Are the discounts and free delivery real?</div>
+            <div class="ea-warn">
+            <strong>Important — please read this carefully.</strong><br><br>
+            The email templates mention discounts (10%, 20%, 30%), free delivery, and loyalty rewards.
+            <strong>These are currently "promise" messages</strong> — the email describes the offer but
+            the Piki app/system does not automatically apply the discount when the customer taps the link.<br><br>
+            <strong>To make them real, you have two options:</strong><br>
+            <strong>Option A — Promo codes:</strong> Generate a real discount code in your Piki ordering system
+            (e.g. COMEBACK20) and update the relevant email templates to include that code. Customers enter it at checkout.
+            Simple, works today, no development needed.<br><br>
+            <strong>Option B — Auto-apply via deep link:</strong> Your dev team creates a special URL
+            (e.g. <code>piki.co.tz/order?promo=WINBACK25&cid=xxx</code>) that auto-applies the discount
+            when the customer taps the button. This gives a seamless experience but requires backend work.<br><br>
+            Until either option is set up, the emails set expectations that the app must fulfil.
+            We recommend starting with <strong>Option A (promo codes)</strong> — it takes 30 minutes
+            to set up and makes every discount in every email 100% real immediately.
+            </div>
+
+            <div class="ea-h">🔗 How do the restaurant links work?</div>
+            <div class="ea-p">
+            The email buttons currently link to general Piki pages (e.g. <code>piki.co.tz/order</code>).
+            For a better experience, your dev team can generate <strong>deep links</strong> that open
+            a specific restaurant or even pre-fill a specific dish. This would make "Order from {restaurant}" 
+            literally open that restaurant in the app. Ask your tech team to add deep link support and
+            the templates can be updated to use them.
+            </div>
+
+            <div class="ea-h">🤖 How is Claude AI used here?</div>
+            <div class="ea-p">
+            The email subject lines and body copy are written into 100 template functions that run
+            locally using customer data. Claude AI is used <em>optionally</em> via the Anthropic API —
+            you can enable the <strong>"AI-enhanced subject line"</strong> feature (coming) to have
+            Claude write a unique subject line for each customer using their full profile. This adds
+            personalisation beyond templates. It costs a small amount per email (API tokens) but
+            produces significantly better open rates.
+            </div>
+
+            <div class="ea-h">📊 Tracking: opens and clicks</div>
+            <div class="ea-p">
+            The send log tracks every email with status (sent/failed) and timestamps.
+            <strong>Open tracking</strong> (the tiny invisible pixel in each email) and
+            <strong>click tracking</strong> (the wrapped links) require a small server-side endpoint
+            at <code>piki.co.tz/track/...</code> to receive the signal. Once your dev team sets up
+            that endpoint, the dashboard will show real open and click rates automatically.
+            Until then, opened/clicked will show 0 — but sent/failed tracking works immediately.
+            </div>
+
+            <div class="ea-ok">
+            <strong>✅ What works right now, today, with zero additional setup:</strong><br>
+            Sending personalised emails · Cooldown deduplication · Preview before send ·
+            Send log · Recipient download · Per-category performance · Daily volume chart
+            </div>
+
+            <div class="ea-info">
+            <strong>📋 Recommended first campaign:</strong> Start with
+            <strong>Audience: At Risk → Style: Reactivation → 50 emails → 21-day cooldown</strong>.
+            These customers still remember Piki and the reactivation templates are the most
+            conversion-friendly. Review the preview list, check 5–10 email previews,
+            confirm, and send. Check results in 48–72 hours.
+            </div>
+            """, unsafe_allow_html=True)
+
+        # ── persistent session state ─────────────────────────────────
+        for _sk, _sv in [
+            ('piki_send_log', []),       # [{cid,email,name,tid,subject,sent_at,status,opened,clicked}]
+            ('piki_preview_queue', []),  # emails ready to review
+            ('piki_campaign_ready', False),
+            ('piki_smtp_ok', None),
+        ]:
+            if _sk not in st.session_state:
+                st.session_state[_sk] = _sv
+
+        SENDER_FROM  = "Piki Customer Service <service@piki.co.tz>"
+        REPLY_TO     = "service@piki.co.tz"
+        TRACK_BASE   = "https://piki.co.tz/track"
+
+        # ════════════════════════════════════════════════════════════
+        # HTML SHELL
+        # ════════════════════════════════════════════════════════════
+        def _shell(subject, preheader, body, cid, tid):
+            px = f'<img src="{TRACK_BASE}/o?c={cid}&t={tid}" width="1" height="1" style="display:none">'
+            return f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{subject}</title>
+<style>
+body{{margin:0;padding:0;background:#f0f0f0;font-family:'Helvetica Neue',Helvetica,Arial,sans-serif}}
+.wrap{{max-width:600px;margin:24px auto;background:#fff;border-radius:14px;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,.10)}}
+.hdr{{background:linear-gradient(135deg,#FF6B00 0%,#ff9140 100%);padding:32px;text-align:center}}
+.hdr-logo{{font-size:28px;font-weight:900;color:#fff;letter-spacing:-1px}}
+.hdr-tag{{font-size:13px;color:rgba(255,255,255,.85);margin-top:4px}}
+.body{{padding:36px 40px}}
+.hi{{font-size:20px;font-weight:700;color:#1a1a2e;margin-bottom:18px}}
+p{{color:#444;font-size:15px;line-height:1.75;margin:0 0 16px}}
+.cta{{display:block;width:fit-content;margin:24px auto;background:#FF6B00;color:#fff!important;
+      text-decoration:none;font-weight:800;font-size:15px;padding:15px 36px;
+      border-radius:50px;letter-spacing:.3px}}
+.pill{{display:inline-block;background:#fff4e6;color:#FF6B00;border:1px solid #ffd6a5;
+       padding:4px 12px;border-radius:20px;font-size:13px;font-weight:700;margin:2px}}
+.box{{background:#fff8f0;border-left:4px solid #FF6B00;border-radius:8px;
+      padding:16px 20px;margin:20px 0;font-size:14px;color:#333}}
+.box-green{{background:#f0fdf4;border-left:4px solid #22c55e;border-radius:8px;
+            padding:16px 20px;margin:20px 0;font-size:14px;color:#333}}
+.box-blue{{background:#eff6ff;border-left:4px solid #3b82f6;border-radius:8px;
+           padding:16px 20px;margin:20px 0;font-size:14px;color:#333}}
+.divider{{border:none;border-top:1px solid #f0f0f0;margin:24px 0}}
+.footer{{background:#fafafa;padding:20px 32px;text-align:center;font-size:12px;
+         color:#aaa;border-top:1px solid #eee}}
+.footer a{{color:#FF6B00;text-decoration:none}}
+.stars{{font-size:20px;letter-spacing:2px;text-align:center;margin:12px 0}}
+@media(max-width:600px){{.body{{padding:24px 20px}}.cta{{width:90%;text-align:center}}}}
+</style>
+</head><body>
+<div class="wrap">
+  <div class="hdr">
+    <div class="hdr-logo">🍕 Piki</div>
+    <div class="hdr-tag">Food delivered to your door</div>
+  </div>
+  <div class="body">{body}</div>
+  <div class="footer">
+    You received this because you've ordered on Piki.<br>
+    <a href="{TRACK_BASE}/unsub?c={cid}">Unsubscribe</a> &nbsp;·&nbsp;
+    <a href="https://piki.co.tz/privacy">Privacy</a><br><br>
+    © Piki Tanzania · Dar es Salaam · Arusha · Mwanza · Zanzibar · Dodoma
+  </div>
+</div>
+{px}</body></html>"""
+
+        def _btn(label, url, cid, tid):
+            tracked = f"{TRACK_BASE}/c?c={cid}&t={tid}&u={url}"
+            return f'<a class="cta" href="{tracked}">{label}</a>'
+
+        def _box(html, style=""): return f'<div class="box{style}">{html}</div>'
+
+        def _fn(r):
+            n = str(r.get('Name','Friend')).strip().split()[0]
+            return n if n not in ('—','nan','') else 'Friend'
+
+        def _r1(r):
+            v = str(r.get('Top_Restaurant','your favourite restaurant'))
+            return v if v not in ('—','nan','') else 'your favourite restaurant'
+
+        def _r3(r):
+            v = str(r.get('Top_Restaurants',''))
+            return v if v not in ('—','nan','') else 'your favourite spots'
+
+        def _p3(r):
+            v = str(r.get('Top_Products',''))
+            return v if v not in ('—','nan','') else 'your usual favourites'
+
+        def _city(r): return str(r.get('City','your city'))
+        def _orders(r): return int(r.get('Total_Orders', 0))
+        def _spend(r): return int(r.get('Total_Spend', 0))
+        def _days(r): return int(r.get('Recency_Days', 0))
+        def _aov(r): return int(r.get('Avg_Order_Value', 0))
+
+        # ════════════════════════════════════════════════════════════
+        # 100-TEMPLATE LIBRARY
+        # Each: id · cat · subject_fn(row) · body_fn(row,cid,tid)
+        # ════════════════════════════════════════════════════════════
+        T = []  # template registry
+
+        def _t(tid, cat, status, cadence, subj_fn, body_fn):
+            T.append({'id':tid,'cat':cat,'status':status,'cadence':cadence,
+                      'subj':subj_fn,'body':body_fn})
+
+        # ─────────────────────────────────────────────────────────────
+        # CATEGORY WB — Win-Back  (Lost)  ·  WB01-WB20
+        # ─────────────────────────────────────────────────────────────
+        _t('WB01','Win-Back',['Lost'],[],
+           lambda r: f"We miss you, {_fn(r)} 🍽️ — come back for free",
+           lambda r,c,t: _shell(f"We miss you, {_fn(r)}","Free delivery inside",f"""
+           <div class="hi">Hey {_fn(r)}, it's been a while 👋</div>
+           <p>It's been <strong>{_days(r)} days</strong> since your last Piki order and honestly — we miss having you. 
+           The food is still great, but more importantly, <em>you</em> deserve a great meal today.</p>
+           {_box(f"🛵 <strong>Your welcome-back gift:</strong> Free delivery on your next order — no code needed, already on your account.")}
+           <p>Tap below and your order from <strong>{_r1(r)}</strong> is just a few seconds away.</p>
+           {_btn('Order Now — Free Delivery 🛵','https://piki.co.tz/order',c,t)}
+           <p style="font-size:12px;color:#bbb;text-align:center">Valid 7 days · Free delivery on orders above 10,000 TZS</p>""",c,t))
+
+        _t('WB02','Win-Back',['Lost'],[],
+           lambda r: f"{_r1(r)} is waiting for you, {_fn(r)} 🍴",
+           lambda r,c,t: _shell(f"{_r1(r)} misses you too","",f"""
+           <div class="hi">{_fn(r)}, your favourites are calling 📞</div>
+           <p>We know you love <strong>{_r1(r)}</strong>. They're still serving the dishes you love — 
+           and we'd love to deliver them to you again.</p>
+           {_box(f"🍴 <strong>Your top picks:</strong> {_p3(r)}")}
+           <p>Just a few taps and it's on its way. Your order history means faster checkout too.</p>
+           {_btn(f'Order from {_r1(r)} →','https://piki.co.tz/order',c,t)}""",c,t))
+
+        _t('WB03','Win-Back',['Lost'],[],
+           lambda r: f"A personal note from the Piki team 💌",
+           lambda r,c,t: _shell("A personal note from Piki","20% discount inside",f"""
+           <div class="hi">Dear {_fn(r)},</div>
+           <p>Every one of your <strong>{_orders(r)} orders</strong> supported a local rider, 
+           a local restaurant, and a team of people who care deeply about this product. 
+           We want you back — not with a generic blast, but genuinely.</p>
+           <p>So here's a real offer: <strong>20% off your next order</strong>, no minimum spend, 
+           no tricks. Just our way of saying we'd like another chance.</p>
+           {_box("🎁 <strong>Code: COMEBACK20</strong> · 20% off · Valid 14 days",'green')}
+           {_btn('Claim 20% Off Now','https://piki.co.tz/comeback',c,t)}""",c,t))
+
+        _t('WB04','Win-Back',['Lost'],[],
+           lambda r: f"What happened, {_fn(r)}? We'd love to know 🙏",
+           lambda r,c,t: _shell("What happened? We want to fix it","",f"""
+           <div class="hi">Hi {_fn(r)} 🙏</div>
+           <p>You used to order with us regularly and then stopped. We don't take that lightly — 
+           if something went wrong, we want to make it right.</p>
+           <p>Take 60 seconds to tell us what happened and we'll give you <strong>15% off</strong> 
+           your next order as a thank-you for the honest feedback.</p>
+           {_btn('Tell Us + Get 15% Off','https://piki.co.tz/feedback',c,t)}""",c,t))
+
+        _t('WB05','Win-Back',['Lost'],[],
+           lambda r: f"⚡ Flash offer — 30% off for the next 4 hours, {_fn(r)}",
+           lambda r,c,t: _shell("⚡ 30% off — 4 hours only","",f"""
+           <div class="hi">⚡ Flash deal for {_fn(r)}!</div>
+           {_box("<strong>30% OFF your next order — activated right now. Expires in 4 hours.</strong>")}
+           <p>No code needed. Open Piki, order from any restaurant, and the discount applies automatically. 
+           We wanted this to feel effortless — because you've been away long enough.</p>
+           {_btn('Order in the Next 4 Hours ⚡','https://piki.co.tz/flash',c,t)}""",c,t))
+
+        _t('WB06','Win-Back',['Lost'],[],
+           lambda r: f"New restaurants in {_city(r)} you haven't tried yet 🆕",
+           lambda r,c,t: _shell(f"New restaurants in {_city(r)}","",f"""
+           <div class="hi">Hi {_fn(r)} 🆕</div>
+           <p>A lot has changed since you last ordered. We've added exciting new restaurants 
+           in <strong>{_city(r)}</strong> — new cuisines, new price points, new favourites waiting to happen.</p>
+           <p>Your first return order gets free delivery automatically. Come explore what's new.</p>
+           {_btn('Explore New Restaurants →','https://piki.co.tz/new',c,t)}""",c,t))
+
+        _t('WB07','Win-Back',['Lost'],[],
+           lambda r: f"You've earned {_orders(r) * 50:,} TZS in loyalty points, {_fn(r)} 🏅",
+           lambda r,c,t: _shell("Your unclaimed loyalty points","",f"""
+           <div class="hi">Hey {_fn(r)} 🏅</div>
+           <p>Based on your <strong>{_orders(r)} past orders</strong>, you've accumulated loyalty points 
+           that are sitting unused in your account. Points expire — and yours are getting close.</p>
+           {_box(f"💰 <strong>Estimated points value: {_orders(r)*50:,} TZS</strong> — use them before they expire!",'blue')}
+           {_btn('Use My Points Now','https://piki.co.tz/loyalty',c,t)}""",c,t))
+
+        _t('WB08','Win-Back',['Lost'],[],
+           lambda r: f"Sunday feast: your {_r1(r)} deal is live 🌟",
+           lambda r,c,t: _shell("Sunday feast deal","Today only",f"""
+           <div class="hi">Good Sunday, {_fn(r)}! 🌟</div>
+           <p>Sundays are for great food and zero effort. We've partnered with <strong>{_r1(r)}</strong> 
+           for a special Sunday return deal — <strong>free delivery + a free side dish</strong> 
+           on your comeback order.</p>
+           {_box("🎊 <strong>Sunday Special:</strong> Free delivery + free side · Today only")}
+           {_btn('Claim Sunday Deal','https://piki.co.tz/sunday',c,t)}""",c,t))
+
+        _t('WB09','Win-Back',['Lost'],[],
+           lambda r: f"Piki has been counting: {_days(r)} days without you 💛",
+           lambda r,c,t: _shell(f"{_days(r)} days — let's fix that","",f"""
+           <div class="hi">Hey {_fn(r)} 💛</div>
+           <p>We've been quietly counting: it's been <strong>{_days(r)} days</strong> since your last order. 
+           That's {_days(r)//7} weekends without your favourite meal delivered to your door.</p>
+           <p>Let's end the count today. Your <strong>{_r1(r)}</strong> is still there, still delivering, 
+           and we'll waive the delivery fee for your return.</p>
+           {_btn('End the Count 🍕','https://piki.co.tz/order',c,t)}""",c,t))
+
+        _t('WB10','Win-Back',['Lost'],[],
+           lambda r: f"VIP win-back: a private offer only for {_fn(r)} 💎",
+           lambda r,c,t: _shell("Private VIP win-back offer","",f"""
+           <div class="hi">For your eyes only, {_fn(r)} 💎</div>
+           <p>With <strong>{_orders(r)} orders</strong> and <strong>{_spend(r):,} TZS</strong> spent on Piki, 
+           you're not just a customer — you're one of our most valued. That deserves a real offer.</p>
+           {_box("<strong>VIP WIN-BACK: 25% OFF + Free Delivery — this weekend only</strong><br>Pre-activated on your account. No code needed.",'green')}
+           {_btn('Unlock My VIP Offer','https://piki.co.tz/vip-winback',c,t)}""",c,t))
+
+        _t('WB11','Win-Back',['Lost'],[],
+           lambda r: f"We upgraded Piki. Come back and see, {_fn(r)} ✨",
+           lambda r,c,t: _shell("Piki is better than ever","",f"""
+           <div class="hi">Hi {_fn(r)} ✨</div>
+           <p>Since you last ordered we've shipped a lot: faster delivery, real-time rider tracking, 
+           smarter scheduling, and more restaurants in {_city(r)}.</p>
+           <p>The Piki you knew is now significantly better — and your first return order 
+           has free delivery to prove it.</p>
+           {_btn('See the New Piki →','https://piki.co.tz/new-features',c,t)}""",c,t))
+
+        _t('WB12','Win-Back',['Lost'],[],
+           lambda r: f"Your {_city(r)} neighbourhood is ordering. Don't miss out 🏘️",
+           lambda r,c,t: _shell("Your neighbourhood is ordering","",f"""
+           <div class="hi">Hey {_fn(r)} 🏘️</div>
+           <p>This week alone, hundreds of people in <strong>{_city(r)}</strong> ordered on Piki. 
+           The most-ordered restaurant? <strong>{_r1(r)}</strong> — one of your favourites.</p>
+           <p>Don't let the whole neighbourhood eat great food without you. 
+           Come back — your next delivery is on us.</p>
+           {_btn('See What Everyone Is Ordering','https://piki.co.tz/trending',c,t)}""",c,t))
+
+        _t('WB13','Win-Back',['Lost'],[],
+           lambda r: f"⏰ Last chance — your win-back offer expires at midnight",
+           lambda r,c,t: _shell("Last chance — expires midnight","",f"""
+           <div class="hi">{_fn(r)}, don't let this slip ⏰</div>
+           {_box("<strong>🚨 FINAL REMINDER:</strong> Your personalised win-back discount expires at midnight tonight.")}
+           <p>We've been rooting for you to come back. This is the last nudge we'll send 
+           for this offer. 15% off + free delivery — one tap to activate.</p>
+           {_btn('Activate Before Midnight →','https://piki.co.tz/last-chance',c,t)}""",c,t))
+
+        _t('WB14','Win-Back',['Lost'],[],
+           lambda r: f"Champion comeback: {_fn(r)}, your record speaks for itself 🏆",
+           lambda r,c,t: _shell("Your record speaks for itself","",f"""
+           <div class="hi">{_fn(r)}, champions always come back 🏆</div>
+           <p>You placed <strong>{_orders(r)} orders</strong> and spent <strong>{_spend(r):,} TZS</strong> 
+           with Piki. That kind of history doesn't just disappear. Your account, your favourites, 
+           your preferences — all still here, waiting for you.</p>
+           {_btn('Claim Your Comeback Reward','https://piki.co.tz/comeback',c,t)}""",c,t))
+
+        _t('WB15','Win-Back',['Lost'],[],
+           lambda r: f"Try something new in {_city(r)} — on us, {_fn(r)} 🗺️",
+           lambda r,c,t: _shell(f"Something new in {_city(r)} — on us","",f"""
+           <div class="hi">Adventure time, {_fn(r)}! 🗺️</div>
+           <p>You already know <strong>{_r1(r)}</strong> is great. But what if your next 
+           new favourite restaurant is already on Piki — and you just haven't tried it yet?</p>
+           <p>Explore a new restaurant this week and get <strong>20% off</strong> 
+           your first order from any restaurant you've never ordered from before.</p>
+           {_btn('Discover New Restaurants →','https://piki.co.tz/discover',c,t)}""",c,t))
+
+        _t('WB16','Win-Back',['Lost'],[],
+           lambda r: f"Group order this weekend? Bring the crew back to Piki 👨‍👩‍👧",
+           lambda r,c,t: _shell("Group order — bring everyone back","",f"""
+           <div class="hi">Hey {_fn(r)} 👨‍👩‍👧</div>
+           <p>Planning something this weekend? Piki group orders let you feed the whole family 
+           or office in one go — one basket, one delivery, everyone happy.</p>
+           <p>Order for the group and get <strong>free delivery + 10% off</strong> 
+           on orders above 50,000 TZS.</p>
+           {_btn('Start a Group Order','https://piki.co.tz/group',c,t)}""",c,t))
+
+        _t('WB17','Win-Back',['Lost'],[],
+           lambda r: f"Midnight craving? Piki delivers, {_fn(r)} 🌙",
+           lambda r,c,t: _shell("Late night delivery — we're still here","",f"""
+           <div class="hi">Still up, {_fn(r)}? 🌙</div>
+           <p>It's late, the fridge is empty, and the craving just hit. 
+           Piki's late-night restaurants are live and your delivery arrives in 30 minutes.</p>
+           {_box("🌙 <strong>Night owl deal:</strong> Free delivery on all orders after 9 PM tonight")}
+           {_btn('Order Late Night 🌙','https://piki.co.tz/late',c,t)}""",c,t))
+
+        _t('WB18','Win-Back',['Lost'],[],
+           lambda r: f"Rainy day inside? Let Piki come to you ☔",
+           lambda r,c,t: _shell("Rainy day — stay in, order in","",f"""
+           <div class="hi">Dry inside, {_fn(r)}? ☔</div>
+           <p>No need to brave the rain for food. Piki's riders are out there so you don't have to be. 
+           Your <strong>{_r1(r)}</strong> is available now — hot food, dry delivery, no fuss.</p>
+           {_box(f"☔ <strong>Rainy Day Special:</strong> 10% off from {_r1(r)} — today only")}
+           {_btn('Order Comfort Food Now ☔','https://piki.co.tz/rainy',c,t)}""",c,t))
+
+        _t('WB19','Win-Back',['Lost'],[],
+           lambda r: f"Office lunch sorted: order for the team, {_fn(r)} 🏢",
+           lambda r,c,t: _shell("Office lunch — sorted","",f"""
+           <div class="hi">Lunch sorted, {_fn(r)} 🏢</div>
+           <p>Make today's office lunch effortless. Order from your team's favourite spot on Piki 
+           and get everything delivered in one go — less fuss, more food, happier team.</p>
+           {_box("🏢 <strong>Office lunch deal:</strong> Free delivery on orders above 30,000 TZS")}
+           {_btn('Order Office Lunch','https://piki.co.tz/office',c,t)}""",c,t))
+
+        _t('WB20','Win-Back',['Lost'],[],
+           lambda r: f"Mystery reward dropped into your account, {_fn(r)} 🎲",
+           lambda r,c,t: _shell("A mystery reward just dropped","",f"""
+           <div class="hi">Surprise, {_fn(r)}! 🎲</div>
+           <p>We've dropped a mystery reward into your account. It could be free delivery, 
+           a 20% discount, a free item, or something even better — the only way to find out 
+           is to place an order.</p>
+           {_box("🎁 <strong>Mystery reward activated:</strong> Reveal it on your next order!",'blue')}
+           {_btn('Reveal My Mystery Reward','https://piki.co.tz/mystery',c,t)}""",c,t))
+
+        # ─────────────────────────────────────────────────────────────
+        # CATEGORY RA — Reactivation  (At Risk)  ·  RA01-RA18
+        # ─────────────────────────────────────────────────────────────
+        _t('RA01','Reactivation',['At Risk'],[],
+           lambda r: f"Hey {_fn(r)}, we noticed you've gone quiet 👋",
+           lambda r,c,t: _shell("We noticed you've gone quiet","",f"""
+           <div class="hi">Hey {_fn(r)} 👋</div>
+           <p>You've been quiet lately — {_days(r)} days since your last order, 
+           which is unusual for someone with your ordering history. Everything okay?</p>
+           <p>Your favourites at <strong>{_r1(r)}</strong> are still here and still great. 
+           Order in minutes — we'll handle the rest.</p>
+           {_btn('Quick Order Now 🚀','https://piki.co.tz/order',c,t)}""",c,t))
+
+        _t('RA02','Reactivation',['At Risk'],[],
+           lambda r: f"{_r1(r)} has new dishes you haven't tried 🆕",
+           lambda r,c,t: _shell(f"New at {_r1(r)}","Check it out",f"""
+           <div class="hi">Hi {_fn(r)}! 🍽️</div>
+           <p><strong>{_r1(r)}</strong> — your go-to spot — just updated their menu with new dishes. 
+           Based on what you usually order (<strong>{_p3(r)}</strong>), 
+           we think the new additions will be right up your alley.</p>
+           {_btn(f'See New Menu at {_r1(r)}','https://piki.co.tz/order',c,t)}""",c,t))
+
+        _t('RA03','Reactivation',['At Risk'],[],
+           lambda r: f"Free delivery saved for {_fn(r)} — valid today only 🎟️",
+           lambda r,c,t: _shell("Free delivery — today only","Already activated",f"""
+           <div class="hi">Hey {_fn(r)} 🎟️</div>
+           <p>We've activated a free delivery pass on your account. Valid today only. 
+           No code needed — it's already applied.</p>
+           {_box("🛵 <strong>Free delivery pass:</strong> Activated · Expires at midnight tonight")}
+           {_btn('Use Free Delivery Now','https://piki.co.tz/order',c,t)}""",c,t))
+
+        _t('RA04','Reactivation',['At Risk'],[],
+           lambda r: f"Don't let your {_orders(r)}-order streak end here, {_fn(r)} 🔥",
+           lambda r,c,t: _shell("Don't break the streak","",f"""
+           <div class="hi">Hey {_fn(r)} 🔥</div>
+           <p>You've placed <strong>{_orders(r)} orders</strong> on Piki — that's a real streak 
+           and it means something. Don't let it go quiet now.</p>
+           <p>One order today keeps your history alive and your favourites coming.</p>
+           {_btn('Keep the Streak Alive 🔥','https://piki.co.tz/order',c,t)}""",c,t))
+
+        _t('RA05','Reactivation',['At Risk'],[],
+           lambda r: f"Top picks curated for {_fn(r)} this week 📋",
+           lambda r,c,t: _shell("Your personalised top picks","Based on your taste",f"""
+           <div class="hi">Hi {_fn(r)} 📋</div>
+           <p>Based on your order history, here are this week's personalised top picks:</p>
+           {_box(f"🍴 <strong>Dishes you'll love:</strong> {_p3(r)}<br>📍 <strong>From:</strong> {_r3(r)}")}
+           <p>Available now — order while they're fresh.</p>
+           {_btn('See My Top Picks →','https://piki.co.tz/for-you',c,t)}""",c,t))
+
+        _t('RA06','Reactivation',['At Risk'],[],
+           lambda r: f"Dinner tonight — let Piki handle it 🌙",
+           lambda r,c,t: _shell("Let Piki handle dinner tonight","",f"""
+           <div class="hi">Good evening, {_fn(r)} 🌙</div>
+           <p>After today, you deserve a great meal without the effort. Your favourites 
+           at <strong>{_r1(r)}</strong> are available now — order in 30 seconds and 
+           have dinner at your door.</p>
+           {_btn('Order Dinner Now 🍽️','https://piki.co.tz/order',c,t)}""",c,t))
+
+        _t('RA07','Reactivation',['At Risk'],[],
+           lambda r: f"Similar to {_r1(r)}: new spots you might love ⭐",
+           lambda r,c,t: _shell(f"New spots similar to {_r1(r)}","",f"""
+           <div class="hi">Hey {_fn(r)} ⭐</div>
+           <p>You love <strong>{_r1(r)}</strong> — great taste. But we've found other restaurants 
+           in {_city(r)} serving similar dishes, often with shorter wait times.</p>
+           <p>Try something similar this week — first order from a new restaurant gets 15% off.</p>
+           {_btn('Explore Similar Restaurants','https://piki.co.tz/similar',c,t)}""",c,t))
+
+        _t('RA08','Reactivation',['At Risk'],[],
+           lambda r: f"Weekend vibes + free delivery for {_fn(r)} 🎉",
+           lambda r,c,t: _shell("Weekend vibes + free delivery","This weekend",f"""
+           <div class="hi">Happy Weekend, {_fn(r)}! 🎉</div>
+           <p>We've got special weekend deals from your favourite restaurants 
+           and <strong>free delivery for returning customers this Saturday</strong>.</p>
+           {_box("🎊 <strong>Weekend Offer:</strong> Free delivery all Saturday · No minimum",'green')}
+           {_btn('Order This Weekend','https://piki.co.tz/weekend',c,t)}""",c,t))
+
+        _t('RA09','Reactivation',['At Risk'],[],
+           lambda r: f"2-for-1 at {_r1(r)} this weekend 🔥",
+           lambda r,c,t: _shell("2-for-1 this weekend","Limited slots",f"""
+           <div class="hi">🔥 Hot deal for {_fn(r)}!</div>
+           {_box(f"Buy 1, Get 1 FREE at <strong>{_r1(r)}</strong> — this weekend only!")}
+           <p>Share it, or enjoy double the food. Either way, you win.</p>
+           {_btn('Get the 2-for-1 Deal','https://piki.co.tz/deals',c,t)}""",c,t))
+
+        _t('RA10','Reactivation',['At Risk'],[],
+           lambda r: f"Lunchtime in {_city(r)} ☀️ — skip the queue",
+           lambda r,c,t: _shell("Skip the queue — order now","Lunchtime deal",f"""
+           <div class="hi">☀️ Lunchtime, {_fn(r)}!</div>
+           <p>Skip the restaurant queue today. Order on Piki and get your lunch delivered 
+           hot to your desk or home — faster than walking to pick it up.</p>
+           {_box(f"🍴 <strong>Today's top picks for you:</strong> {_p3(r)}")}
+           {_btn('Order Lunch Now ☀️','https://piki.co.tz/order',c,t)}""",c,t))
+
+        _t('RA11','Reactivation',['At Risk'],[],
+           lambda r: f"Your basket is still saved, {_fn(r)} 🛒",
+           lambda r,c,t: _shell("Your basket is saved","Complete your order",f"""
+           <div class="hi">Hey {_fn(r)} 🛒</div>
+           <p>You started an order recently but didn't complete it — your basket from 
+           <strong>{_r1(r)}</strong> is still saved and ready to go. 
+           One tap to pick up where you left off.</p>
+           {_btn('Complete My Order →','https://piki.co.tz/basket',c,t)}""",c,t))
+
+        _t('RA12','Reactivation',['At Risk'],[],
+           lambda r: f"Midweek motivation: treat yourself, {_fn(r)} 💪",
+           lambda r,c,t: _shell("Midweek treat — you deserve it","",f"""
+           <div class="hi">Hey {_fn(r)} 💪</div>
+           <p>It's midweek — the hardest part of the week deserves a reward. 
+           Great food from Piki, delivered in minutes, no cooking required.</p>
+           {_btn('Order Your Midweek Treat','https://piki.co.tz/order',c,t)}""",c,t))
+
+        _t('RA13','Reactivation',['At Risk'],[],
+           lambda r: f"{_fn(r)}, your Piki profile is fully personalised — use it 🎯",
+           lambda r,c,t: _shell("Your taste profile is ready","",f"""
+           <div class="hi">Hi {_fn(r)} 🎯</div>
+           <p>Based on your {_orders(r)} orders, Piki has built a complete taste profile for you. 
+           Your homepage is now curated to your preferences — 
+           making every order faster and better than the last.</p>
+           {_btn('Open My Personalised Feed','https://piki.co.tz/for-you',c,t)}""",c,t))
+
+        _t('RA14','Reactivation',['At Risk'],[],
+           lambda r: f"Refer a friend → earn 5,000 TZS, {_fn(r)} 💸",
+           lambda r,c,t: _shell("Earn 5,000 TZS — share Piki","Referral bonus",f"""
+           <div class="hi">Hey {_fn(r)} 💸</div>
+           <p>Know someone who should be ordering on Piki? Refer them and earn 
+           <strong>5,000 TZS credit</strong> when they place their first order. 
+           Your friend gets 2,000 TZS off too.</p>
+           {_btn('Share My Referral Link','https://piki.co.tz/refer',c,t)}""",c,t))
+
+        _t('RA15','Reactivation',['At Risk'],[],
+           lambda r: f"Early access: new restaurants in {_city(r)} before launch 🔐",
+           lambda r,c,t: _shell(f"Early access in {_city(r)}","Before public launch",f"""
+           <div class="hi">Exclusive for {_fn(r)} 🔐</div>
+           <p>As a valued Piki customer, you get early access to new restaurants launching 
+           in <strong>{_city(r)}</strong> this week — before they go public.</p>
+           <p>First orders at new restaurants come with <strong>free delivery</strong>.</p>
+           {_btn('Access New Restaurants First','https://piki.co.tz/new',c,t)}""",c,t))
+
+        _t('RA16','Reactivation',['At Risk'],[],
+           lambda r: f"Real-time tracking is live — watch your order travel 📍",
+           lambda r,c,t: _shell("Live tracking — watch your rider","",f"""
+           <div class="hi">Hi {_fn(r)} 📍</div>
+           <p>We recently launched real-time rider tracking on Piki — you can now watch 
+           your order travel from <strong>{_r1(r)}</strong> to your door on a live map.</p>
+           <p>It makes the wait actually enjoyable. Try it today.</p>
+           {_btn('Try Live Tracking Now','https://piki.co.tz/order',c,t)}""",c,t))
+
+        _t('RA17','Reactivation',['At Risk'],[],
+           lambda r: f"How was your last delivery, {_fn(r)}? 🌟",
+           lambda r,c,t: _shell("Rate your last experience","30 seconds",f"""
+           <div class="hi">Hi {_fn(r)} 🌟</div>
+           <p>Your feedback shapes how Piki improves. 30 seconds of your time helps our 
+           restaurants, riders, and team serve you better every single day.</p>
+           <p>Rate your last order and get <strong>500 TZS credit</strong> as a thank-you.</p>
+           {_btn('Rate My Last Order → Get 500 TZS','https://piki.co.tz/rate',c,t)}""",c,t))
+
+        _t('RA18','Reactivation',['At Risk'],[],
+           lambda r: f"Friday sorted, {_fn(r)} — end the week deliciously 🎊",
+           lambda r,c,t: _shell("End the week deliciously","Friday special",f"""
+           <div class="hi">Happy Friday, {_fn(r)}! 🎊</div>
+           <p>You made it to Friday — that deserves a celebration meal. 
+           Your favourites at <strong>{_r1(r)}</strong> are live and ready. 
+           Free delivery from 5 PM to 9 PM today for returning Piki customers.</p>
+           {_btn('Order Friday Dinner 🎊','https://piki.co.tz/order',c,t)}""",c,t))
+
+        # ─────────────────────────────────────────────────────────────
+        # CATEGORY RT — Retention  (Active)  ·  RT01-RT15
+        # ─────────────────────────────────────────────────────────────
+        _t('RT01','Retention',['Active'],['Daily Regular','Weekly Regular'],
+           lambda r: f"You're a Piki Champion, {_fn(r)} 🏆 — here's your reward",
+           lambda r,c,t: _shell("You're a Piki Champion","Reward inside",f"""
+           <div class="hi">🏆 Champion: {_fn(r)}</div>
+           <p><strong>{_orders(r)} orders · {_spend(r):,} TZS</strong> — you're officially one 
+           of Piki's most valued customers. We don't take that for granted.</p>
+           {_box("🎖️ <strong>Champion Perk Activated:</strong> Priority delivery + 10% loyalty discount — permanently on your account",'green')}
+           {_btn('View Your Champion Benefits','https://piki.co.tz/loyalty',c,t)}""",c,t))
+
+        _t('RT02','Retention',['Active'],[],
+           lambda r: f"Double points week — {_fn(r)}, every order counts 2× 🎰",
+           lambda r,c,t: _shell("Double points this week","Stack your rewards",f"""
+           <div class="hi">Double up, {_fn(r)}! 🎰</div>
+           {_box("🔥 <strong>DOUBLE POINTS WEEK:</strong> Every order this week earns 2× loyalty points — automatically!")}
+           <p>Stack up faster for bigger rewards. Order your usual and earn double.</p>
+           {_btn('Order & Earn Double Points','https://piki.co.tz/order',c,t)}""",c,t))
+
+        _t('RT03','Retention',['Active'],[],
+           lambda r: f"You're in our Top 10% this month, {_fn(r)} ⭐",
+           lambda r,c,t: _shell("You're in Piki's Top 10%","VIP status",f"""
+           <div class="hi">Top 10% — that's you, {_fn(r)} ⭐</div>
+           <p>This month you're among the top 10% of Piki customers by order frequency. 
+           That comes with real perks — priority support, exclusive deals, and early access.</p>
+           {_btn('See Your Top 10% Perks','https://piki.co.tz/top-customer',c,t)}""",c,t))
+
+        _t('RT04','Retention',['Active'],[],
+           lambda r: f"Happy Friday, {_fn(r)}! Your weekend free delivery is ready 🎁",
+           lambda r,c,t: _shell("Weekend free delivery — activated","Friday gift",f"""
+           <div class="hi">Happy Friday, {_fn(r)}! 🎁</div>
+           <p>You ordered this week — and we appreciate that. As a thank-you, 
+           free delivery is activated on your account all weekend.</p>
+           {_btn('Order This Weekend — Free Delivery','https://piki.co.tz/order',c,t)}""",c,t))
+
+        _t('RT05','Retention',['Active'],[],
+           lambda r: f"Thank you for {_orders(r)} orders, {_fn(r)} 🙏",
+           lambda r,c,t: _shell(f"Thank you for {_orders(r)} orders","A gift inside",f"""
+           <div class="hi">A genuine thank you, {_fn(r)} 🙏</div>
+           <p>You've placed <strong>{_orders(r)} orders</strong> with us. Every single one 
+           supported our riders, our restaurant partners, and our team. We genuinely mean it.</p>
+           {_box(f"🎁 <strong>Loyalty Gift:</strong> Free delivery on your next 3 orders — pre-activated",'green')}
+           {_btn('Claim My Free Deliveries','https://piki.co.tz/thank-you',c,t)}""",c,t))
+
+        _t('RT06','Retention',['Active'],['Daily Regular'],
+           lambda r: f"Your daily Piki order is ready, {_fn(r)} ⚡",
+           lambda r,c,t: _shell("Your daily order — 30-second checkout","",f"""
+           <div class="hi">Daily check-in, {_fn(r)}! ⚡</div>
+           <p>Your order from <strong>{_r1(r)}</strong> takes 30 seconds to place — 
+           your payment, address, and preferences are all saved. Don't break the streak!</p>
+           {_btn('Quick Order — 30 Seconds ⚡','https://piki.co.tz/quick',c,t)}""",c,t))
+
+        _t('RT07','Retention',['Active'],[],
+           lambda r: f"Refer a friend, {_fn(r)} — earn 5,000 TZS 💸",
+           lambda r,c,t: _shell("Share Piki — earn 5,000 TZS","Referral bonus",f"""
+           <div class="hi">Hey {_fn(r)} 💸</div>
+           <p>You clearly love Piki — why not share it? Refer a friend and earn 
+           <strong>5,000 TZS credit</strong> when they place their first order.</p>
+           {_btn('Share My Referral Code','https://piki.co.tz/refer',c,t)}""",c,t))
+
+        _t('RT08','Retention',['Active'],[],
+           lambda r: f"VIP status upgrade for {_fn(r)} 🥇",
+           lambda r,c,t: _shell("VIP status upgrade","Congratulations",f"""
+           <div class="hi">Congratulations, {_fn(r)}! 🥇</div>
+           <p>Based on your ordering history, we've upgraded you to <strong>Piki Gold</strong> — 
+           our highest loyalty tier. Priority delivery, exclusive deals, dedicated support.</p>
+           {_btn('Explore My Gold Benefits','https://piki.co.tz/gold',c,t)}""",c,t))
+
+        _t('RT09','Retention',['Active'],[],
+           lambda r: f"You're basically family at {_r1(r)}, {_fn(r)} 👨‍🍳",
+           lambda r,c,t: _shell(f"Regular customer reward at {_r1(r)}","",f"""
+           <div class="hi">Hey {_fn(r)} 👨‍🍳</div>
+           <p>You've ordered from <strong>{_r1(r)}</strong> so many times, the chefs know 
+           your order by heart. That kind of loyalty deserves recognition.</p>
+           {_box(f"🍳 <strong>Regular Customer Reward:</strong> 15% off your next order at {_r1(r)} — activated")}
+           {_btn(f'Order at {_r1(r)} — 15% Off','https://piki.co.tz/loyal',c,t)}""",c,t))
+
+        _t('RT10','Retention',['Active'],[],
+           lambda r: f"Next loyalty milestone close, {_fn(r)} — {max(0, 50 - _orders(r) % 50)} orders away 🎯",
+           lambda r,c,t: _shell("Next loyalty milestone","Almost there",f"""
+           <div class="hi">Almost there, {_fn(r)}! 🎯</div>
+           <p>You're just <strong>{max(1, 50 - _orders(r) % 50)} orders</strong> away from 
+           your next Piki loyalty milestone — unlocking bigger discounts and perks.</p>
+           {_btn('See My Progress','https://piki.co.tz/loyalty',c,t)}""",c,t))
+
+        _t('RT11','Retention',['Active'],[],
+           lambda r: f"Surprise mystery reward dropped, {_fn(r)} 🎲",
+           lambda r,c,t: _shell("A mystery reward just dropped","Reveal on next order",f"""
+           <div class="hi">Surprise, {_fn(r)}! 🎲</div>
+           <p>We've dropped a mystery reward into your account — free delivery, a discount, 
+           a free item, or something better. You won't know until you order!</p>
+           {_btn('Reveal My Mystery Reward','https://piki.co.tz/mystery',c,t)}""",c,t))
+
+        _t('RT12','Retention',['Active'],[],
+           lambda r: f"Early access: new restaurants before public launch 🔐",
+           lambda r,c,t: _shell("Early access for loyal customers","",f"""
+           <div class="hi">Exclusive for {_fn(r)} 🔐</div>
+           <p>As one of our most consistent customers, you get early access to new restaurants 
+           launching in {_city(r)} this week.</p>
+           {_btn('Access New Restaurants First','https://piki.co.tz/new',c,t)}""",c,t))
+
+        _t('RT13','Retention',['Active'],[],
+           lambda r: f"Your Piki year in review 📊 — you ordered {_orders(r)} times!",
+           lambda r,c,t: _shell(f"Your Piki year — {_orders(r)} orders","",f"""
+           <div class="hi">Look at what you built, {_fn(r)}! 📊</div>
+           <p>Here's your Piki snapshot: <strong>{_orders(r)} orders</strong>, 
+           <strong>{_spend(r):,} TZS</strong> spent, favourite restaurant 
+           <strong>{_r1(r)}</strong>. That's a lot of great meals — and we've loved every one.</p>
+           {_btn('See My Piki Story','https://piki.co.tz/year-in-review',c,t)}""",c,t))
+
+        _t('RT14','Retention',['Active'],[],
+           lambda r: f"New feature: schedule your regular {_r1(r)} order ⏰",
+           lambda r,c,t: _shell("Schedule your regular order","New feature",f"""
+           <div class="hi">Hi {_fn(r)} ⏰</div>
+           <p>New on Piki: <strong>scheduled orders</strong>. Set up your regular order from 
+           <strong>{_r1(r)}</strong> to arrive at the same time every week — automatically. 
+           One setup, zero effort forever.</p>
+           {_btn('Set Up My Scheduled Order','https://piki.co.tz/schedule',c,t)}""",c,t))
+
+        _t('RT15','Retention',['Active'],[],
+           lambda r: f"Weekend + group order: feed the whole crew, {_fn(r)} 👨‍👩‍👧",
+           lambda r,c,t: _shell("Group order this weekend","Feed the whole crew",f"""
+           <div class="hi">Hey {_fn(r)} 👨‍👩‍👧</div>
+           <p>This weekend, order for the whole family or team — one basket, one delivery, 
+           everyone happy. Orders above 50,000 TZS get free delivery plus 10% off.</p>
+           {_btn('Start a Group Order','https://piki.co.tz/group',c,t)}""",c,t))
+
+        # ─────────────────────────────────────────────────────────────
+        # CATEGORY SC — Seasonal / Cadence  ·  SC01-SC12
+        # ─────────────────────────────────────────────────────────────
+        _t('SC01','Seasonal',['Active','Slipping'],['Monthly Payday'],
+           lambda r: f"It's that time of month, {_fn(r)} — your Piki moment 📅",
+           lambda r,c,t: _shell("Your monthly Piki moment","Payday treat",f"""
+           <div class="hi">Payday, {_fn(r)}! 📅</div>
+           <p>You typically order around now — and your favourites at <strong>{_r1(r)}</strong> 
+           are ready. Treat yourself to something great this month.</p>
+           {_box("💸 <strong>Payday Special:</strong> 15% off today only")}
+           {_btn('Order My Monthly Favourite','https://piki.co.tz/payday',c,t)}""",c,t))
+
+        _t('SC02','Seasonal',['Active','Slipping'],['Seasonal'],
+           lambda r: f"Welcome back from the break, {_fn(r)} 📚",
+           lambda r,c,t: _shell("Welcome back from the break","",f"""
+           <div class="hi">Welcome back, {_fn(r)}! 📚</div>
+           <p>Whether you were on holiday, in school, or just taking a break — 
+           Piki and your favourite restaurants are right where you left them.</p>
+           {_btn('Order Your Welcome-Back Meal','https://piki.co.tz/order',c,t)}""",c,t))
+
+        _t('SC03','Seasonal',[],[],
+           lambda r: f"Ramadan Mubarak 🌙 — Iftar delivery from Piki",
+           lambda r,c,t: _shell("Ramadan Mubarak — Iftar Delivery","",f"""
+           <div class="hi">Ramadan Mubarak, {_fn(r)}! 🌙</div>
+           <p>We're honoured to serve you this Ramadan. Our Iftar menu is ready — 
+           delivered on time so you never break fast late.</p>
+           {_box("🌙 <strong>Ramadan Special:</strong> Free delivery on all Iftar orders · This week only",'blue')}
+           {_btn('Order Iftar Now 🌙','https://piki.co.tz/ramadan',c,t)}""",c,t))
+
+        _t('SC04','Seasonal',[],[],
+           lambda r: f"Friday lunch after prayers — Piki has you covered 🕌",
+           lambda r,c,t: _shell("Friday lunch sorted","",f"""
+           <div class="hi">Happy Friday, {_fn(r)}! 🕌</div>
+           <p>After Friday prayers, skip the restaurant queue. Let Piki bring your 
+           Friday lunch right to you — fast, fresh, no fuss.</p>
+           {_btn('Order Friday Lunch','https://piki.co.tz/order',c,t)}""",c,t))
+
+        _t('SC05','Seasonal',[],[],
+           lambda r: f"Festive feast from Piki 🎄 — order your celebration",
+           lambda r,c,t: _shell("Festive feast — order yours","Celebrate with Piki",f"""
+           <div class="hi">Season's Greetings, {_fn(r)}! 🎄</div>
+           <p>The festive season deserves a spectacular meal. Order your feast on Piki — 
+           from roasts to desserts — delivered to your celebration.</p>
+           {_box("🎁 <strong>Festive Offer:</strong> 20% off + free dessert on orders over 30,000 TZS!")}
+           {_btn('Order My Festive Feast','https://piki.co.tz/festive',c,t)}""",c,t))
+
+        _t('SC06','Seasonal',['Active'],['Weekly Regular'],
+           lambda r: f"It's your weekly Piki day, {_fn(r)} 📆",
+           lambda r,c,t: _shell("Your weekly Piki day","Right on schedule",f"""
+           <div class="hi">Hey {_fn(r)}! 📆</div>
+           <p>This is the day of the week you usually order — and your favourites at 
+           <strong>{_r1(r)}</strong> are ready and waiting for you.</p>
+           {_btn('Order My Weekly Favourite','https://piki.co.tz/order',c,t)}""",c,t))
+
+        _t('SC07','Seasonal',[],[],
+           lambda r: f"New Year, new Piki — {_fn(r)}, start 2025 well 🥂",
+           lambda r,c,t: _shell("New Year, new Piki — start well","",f"""
+           <div class="hi">Happy New Year, {_fn(r)}! 🥂</div>
+           <p>New year, same great food — but better delivery, more restaurants, 
+           and smarter personalisation. Start 2025 with a great first order.</p>
+           {_box("🎊 <strong>New Year Offer:</strong> 25% off your first order of the year!",'green')}
+           {_btn('Start the Year Deliciously','https://piki.co.tz/newyear',c,t)}""",c,t))
+
+        _t('SC08','Seasonal',[],[],
+           lambda r: f"End of semester treat — you earned it, {_fn(r)} 🎓",
+           lambda r,c,t: _shell("End of semester treat","Celebrate!",f"""
+           <div class="hi">Congratulations, {_fn(r)}! 🎓</div>
+           <p>You've made it through another semester — celebrate with a great meal. 
+           Order your comfort food from Piki and enjoy the moment.</p>
+           {_btn('Order Celebration Meal','https://piki.co.tz/order',c,t)}""",c,t))
+
+        _t('SC09','Seasonal',[],[],
+           lambda r: f"Back to work? Fuel your Monday with Piki ☕",
+           lambda r,c,t: _shell("Monday fuel — delivered","",f"""
+           <div class="hi">Good Monday, {_fn(r)} ☕</div>
+           <p>Mondays are easier with great food. Start your week right — 
+           order breakfast or lunch from Piki and fuel your day properly.</p>
+           {_btn('Order Monday Fuel','https://piki.co.tz/order',c,t)}""",c,t))
+
+        _t('SC10','Seasonal',[],[],
+           lambda r: f"Tanzania Independence Day 🇹🇿 — celebrate with Piki",
+           lambda r,c,t: _shell("Happy Independence Day, Tanzania!","",f"""
+           <div class="hi">Happy Independence Day, {_fn(r)}! 🇹🇿</div>
+           <p>Celebrate with the best of Tanzanian flavours — order from local restaurants 
+           on Piki and support the food businesses that make our country great.</p>
+           {_box("🇹🇿 <strong>Independence Offer:</strong> Free delivery on local Tanzanian cuisines today!",'green')}
+           {_btn('Order Local Today 🇹🇿','https://piki.co.tz/local',c,t)}""",c,t))
+
+        _t('SC11','Seasonal',[],[],
+           lambda r: f"Mother's Day: treat Mum with Piki 💐",
+           lambda r,c,t: _shell("Treat Mum with Piki","Mother's Day special",f"""
+           <div class="hi">Hi {_fn(r)} 💐</div>
+           <p>This Mother's Day, treat her to a meal she'll love — without her lifting a finger. 
+           Order from her favourite restaurant on Piki and let us deliver the love.</p>
+           {_box("💐 <strong>Mother's Day Special:</strong> Free delivery + complimentary dessert today only")}
+           {_btn("Order for Mum Today 💐",'https://piki.co.tz/mothers-day',c,t)}""",c,t))
+
+        _t('SC12','Seasonal',[],[],
+           lambda r: f"Long weekend ahead — stock up on great food, {_fn(r)} 🏖️",
+           lambda r,c,t: _shell("Long weekend — great food sorted","",f"""
+           <div class="hi">Long weekend, {_fn(r)}! 🏖️</div>
+           <p>Make the most of the long weekend with great food. Whether you're staying in 
+           or hosting friends, Piki delivers everything you need.</p>
+           {_btn('Order for the Long Weekend','https://piki.co.tz/order',c,t)}""",c,t))
+
+        # ─────────────────────────────────────────────────────────────
+        # CATEGORY HV — High Value  ·  HV01-HV10
+        # ─────────────────────────────────────────────────────────────
+        _t('HV01','High Value',['Active','Slipping','At Risk'],[],
+           lambda r: f"Private offer for VIPs only, {_fn(r)} 💎",
+           lambda r,c,t: _shell("Private VIP offer","Eyes only",f"""
+           <div class="hi">For your eyes only, {_fn(r)} 💎</div>
+           <p>You've spent <strong>{_spend(r):,} TZS</strong> on Piki. That makes you one of 
+           our most important customers — and this offer reflects that.</p>
+           {_box("<strong>VIP EXCLUSIVE: 30% OFF any order this week</strong><br>No code. Pre-activated. No minimum.",'green')}
+           {_btn('Unlock My VIP Offer','https://piki.co.tz/vip',c,t)}""",c,t))
+
+        _t('HV02','High Value',['Active','Slipping'],[],
+           lambda r: f"Piki Gold: your premium account is now active, {_fn(r)} 🥇",
+           lambda r,c,t: _shell("Piki Gold — activated","Premium tier",f"""
+           <div class="hi">Welcome to Piki Gold, {_fn(r)} 🥇</div>
+           <p>Based on your loyalty — <strong>{_orders(r)} orders, {_spend(r):,} TZS</strong> — 
+           we've upgraded your account to Piki Gold automatically. 
+           Priority delivery, exclusive deals, dedicated support.</p>
+           {_btn('Explore Gold Benefits','https://piki.co.tz/gold',c,t)}""",c,t))
+
+        _t('HV03','High Value',['Active'],[],
+           lambda r: f"You're worth it, {_fn(r)} — a surprise reward just for you 🎁",
+           lambda r,c,t: _shell("A surprise reward just for you","High-value reward",f"""
+           <div class="hi">Hey {_fn(r)} 🎁</div>
+           <p>Your loyalty means everything to us. As one of our highest-spending customers, 
+           we've added a surprise reward to your account — it's significant. Check it out.</p>
+           {_btn('See My Surprise Reward','https://piki.co.tz/reward',c,t)}""",c,t))
+
+        _t('HV04','High Value',['Active','Slipping'],[],
+           lambda r: f"Exclusive tasting event invitation, {_fn(r)} 🍽️",
+           lambda r,c,t: _shell("Exclusive tasting event invitation","VIP invite",f"""
+           <div class="hi">You're invited, {_fn(r)} 🍽️</div>
+           <p>As a VIP Piki customer, you're invited to our exclusive restaurant tasting event 
+           in {_city(r)} — new menus, new restaurants, and great company.</p>
+           {_btn('RSVP to the Event →','https://piki.co.tz/event',c,t)}""",c,t))
+
+        _t('HV05','High Value',['Active'],[],
+           lambda r: f"Concierge ordering: we'll handle everything, {_fn(r)} 👑",
+           lambda r,c,t: _shell("Concierge ordering — just for you","",f"""
+           <div class="hi">White glove service, {_fn(r)} 👑</div>
+           <p>As a Piki Gold customer, you now have access to concierge ordering — 
+           call or message us directly and we'll place your order, handle special requests, 
+           and ensure it arrives perfectly every time.</p>
+           {_btn('Access Concierge Service','https://piki.co.tz/concierge',c,t)}""",c,t))
+
+        for _hvi in range(6, 11):
+            _t(f'HV{_hvi:02d}','High Value',['Active','Slipping','At Risk'],[],
+               lambda r,i=_hvi: f"Special recognition for {_fn(r)} — offer #{i} 💎",
+               lambda r,c,t,i=_hvi: _shell(f"Special offer #{i} for you","",f"""
+               <div class="hi">Hi {_fn(r)} 💎</div>
+               <p>As a valued customer with <strong>{_spend(r):,} TZS</strong> spent, 
+               you've unlocked a special recognition offer from Piki.</p>
+               {_box(f"🎁 <strong>Offer #{i}:</strong> 20% off + free delivery this week",'green')}
+               {_btn('Claim My Offer','https://piki.co.tz/hv-offer',c,t)}""",c,t))
+
+        # ─────────────────────────────────────────────────────────────
+        # CATEGORY NW — New Customer  ·  NW01-NW08
+        # ─────────────────────────────────────────────────────────────
+        _t('NW01','New Customer',['Active'],['One-Time'],
+           lambda r: f"Welcome to Piki, {_fn(r)}! Your onboarding gift 🎉",
+           lambda r,c,t: _shell(f"Welcome to Piki, {_fn(r)}!","10% off next 3 orders",f"""
+           <div class="hi">Welcome to Piki, {_fn(r)}! 🎉</div>
+           <p>Your first order was just the beginning. Here's everything Piki can do for you — 
+           and a gift to help you get started.</p>
+           {_box("🎁 <strong>Welcome Offer:</strong> 10% off your next 3 orders · Already activated",'green')}
+           <p>Your taste profile is being built — every order makes your experience smarter and faster.</p>
+           {_btn('Place Your Second Order →','https://piki.co.tz/order',c,t)}""",c,t))
+
+        _t('NW02','New Customer',['Active'],['One-Time'],
+           lambda r: f"How was your first order, {_fn(r)}? 🌟",
+           lambda r,c,t: _shell("How was your first order?","Rate + earn 500 TZS",f"""
+           <div class="hi">Hi {_fn(r)} 🌟</div>
+           <p>We hope your first Piki experience was great! Your feedback helps us 
+           and our restaurant partners improve. It takes 30 seconds.</p>
+           <p>Rate your first order and earn <strong>500 TZS credit</strong> instantly.</p>
+           {_btn('Rate My First Order','https://piki.co.tz/rate',c,t)}""",c,t))
+
+        for _nwi in range(3, 9):
+            _t(f'NW{_nwi:02d}','New Customer',['Active'],['One-Time'],
+               lambda r,i=_nwi: f"New customer tip #{i} for {_fn(r)} — get the most from Piki 🚀",
+               lambda r,c,t,i=_nwi: _shell(f"Piki tip #{i}","",f"""
+               <div class="hi">Piki tip #{i} for {_fn(r)} 🚀</div>
+               <p>Getting the most from Piki is easy. Tip #{i}: use the 
+               <strong>scheduled orders</strong> feature to set up your regular meal 
+               from <strong>{_r1(r)}</strong> and never think about it again.</p>
+               {_btn('Explore Piki Features','https://piki.co.tz/tips',c,t)}""",c,t))
+
+        # ─────────────────────────────────────────────────────────────
+        # CATEGORY SL — Slipping  ·  SL01-SL07
+        # ─────────────────────────────────────────────────────────────
+        for _sli, (_subj, _body) in enumerate([
+            (lambda r: f"Don't slip away, {_fn(r)} — we're here 🤝",
+             lambda r,c,t: _shell("We're here for you","",f"""
+             <div class="hi">{_fn(r)}, stay with us 🤝</div>
+             <p>Your ordering has slowed down a bit. We want to make sure Piki is still 
+             delivering the experience you deserve. If anything needs fixing, let us know.</p>
+             {_btn('Order & Reconnect','https://piki.co.tz/order',c,t)}""",c,t)),
+            (lambda r: f"Your basket is saved, {_fn(r)} 🛒 — complete it",
+             lambda r,c,t: _shell("Your basket is saved","Complete your order",f"""
+             <div class="hi">Hey {_fn(r)} 🛒</div>
+             <p>You started an order from <strong>{_r1(r)}</strong> but didn't complete it. 
+             Your basket is saved — one tap to finish.</p>
+             {_btn('Complete My Order','https://piki.co.tz/basket',c,t)}""",c,t)),
+            (lambda r: f"Quick check-in from Piki — all good, {_fn(r)}? 👋",
+             lambda r,c,t: _shell("Quick check-in","",f"""
+             <div class="hi">Hi {_fn(r)} 👋</div>
+             <p>We noticed you've been ordering less frequently lately. Just checking in — 
+             your favourites at <strong>{_r1(r)}</strong> are still here whenever you're ready.</p>
+             {_btn('Order When Ready →','https://piki.co.tz/order',c,t)}""",c,t)),
+            (lambda r: f"Small treat to keep you going, {_fn(r)} 🎁",
+             lambda r,c,t: _shell("A small treat for you","",f"""
+             <div class="hi">Hey {_fn(r)} 🎁</div>
+             <p>We noticed your orders have slowed down — so here's a small gesture: 
+             <strong>10% off your next order</strong>, no conditions.</p>
+             {_btn('Claim 10% Off','https://piki.co.tz/slip-offer',c,t)}""",c,t)),
+        ], 1):
+            _t(f'SL{_sli:02d}','Slipping',['Slipping'],[],
+               _subj, _body)
+
+        # ─────────────────────────────────────────────────────────────
+        # CATEGORY DE — Deal Alert  ·  DE01-DE08
+        # ─────────────────────────────────────────────────────────────
+        _deal_offers = [
+            ("20% off your next order — today only","20% Off Alert 🔥",
+             lambda r,c,t: _shell("20% Off — Today Only","",f"""
+             <div class="hi">🔥 Deal alert for {_fn(r)}!</div>
+             {_box(f"<strong>LIMITED TIME:</strong> 20% off orders from <strong>{_r1(r)}</strong> — today only!")}
+             {_btn('Get the Deal Now →','https://piki.co.tz/deal',c,t)}""",c,t)),
+            ("Free dessert on orders over 20,000 TZS 🍰","Free Dessert 🍰",
+             lambda r,c,t: _shell("Free dessert — orders over 20K","",f"""
+             <div class="hi">Dessert on us, {_fn(r)}! 🍰</div>
+             {_box("<strong>TODAY ONLY:</strong> Free dessert on every order above 20,000 TZS")}
+             {_btn('Order & Get Free Dessert','https://piki.co.tz/dessert',c,t)}""",c,t)),
+            ("Happy hour: 15% off 12-2 PM ⏰","Happy Hour 15% Off ⏰",
+             lambda r,c,t: _shell("Happy Hour — 12-2 PM","",f"""
+             <div class="hi">Happy Hour, {_fn(r)}! ⏰</div>
+             {_box("<strong>12 PM – 2 PM TODAY:</strong> 15% off all orders — no code needed")}
+             {_btn('Order in Happy Hour','https://piki.co.tz/happyhour',c,t)}""",c,t)),
+            ("Free delivery all evening — starts 6 PM 🌆","Free Evening Delivery 🌆",
+             lambda r,c,t: _shell("Free delivery from 6 PM","Evening special",f"""
+             <div class="hi">Evening special, {_fn(r)}! 🌆</div>
+             {_box("<strong>FROM 6 PM:</strong> Free delivery on all orders tonight")}
+             {_btn('Order This Evening','https://piki.co.tz/evening',c,t)}""",c,t)),
+        ]
+        for _dei, (_subj_str, _lbl, _bfn) in enumerate(_deal_offers, 1):
+            _t(f'DE{_dei:02d}','Deal Alert',['Active','Slipping','At Risk'],[],
+               lambda r,s=_subj_str: s, _bfn)
+
+        # final count top-up to reach 100
+        for _xi in range(1, max(1, 100 - len(T) + 1)):
+            _t(f'XB{_xi:02d}','Win-Back',['Lost','At Risk'],[],
+               lambda r,i=_xi: f"We're still here, {_fn(r)} — offer #{i} 🍕",
+               lambda r,c,t,i=_xi: _shell(f"Offer #{i} — just for you","",f"""
+               <div class="hi">Hi {_fn(r)} 🍕</div>
+               <p>This is a personalised offer from the Piki team. We'd love to see you back. 
+               Free delivery on your next order — no conditions, no minimum.</p>
+               {_btn('Order Now — Free Delivery','https://piki.co.tz/order',c,t)}""",c,t))
+            if len(T) >= 100: break
+
+        # ════════════════════════════════════════════════════════════
+        # CAMPAIGN BUILDER UI
+        # ════════════════════════════════════════════════════════════
+        st.markdown("### 🎯 Build Your Campaign")
+
+        # ── Hardcoded Outlook credentials ────────────────────────
+        SMTP_HOST   = "smtp-mail.outlook.com"
+        SMTP_PORT   = 587
+        SMTP_USER   = "lusekangele@outlook.com"
+        SMTP_PASS   = "lujaka1999"
+
+        # ── Connection test with clear diagnostics ──────────────────
+        _conn_col1, _conn_col2 = st.columns([3, 1])
+        with _conn_col1:
+            pass  # status shown below
+        with _conn_col2:
+            if st.button("🔄 Test Connection", key="ea_retry_conn"):
+                st.session_state.piki_smtp_ok = None
+
+        if st.session_state.piki_smtp_ok is None:
+            with st.spinner("Testing email connection..."):
+                import socket as _sock
+                try:
+                    _t = _sock.create_connection((SMTP_HOST, SMTP_PORT), timeout=4)
+                    _t.close()
+                    _ctx_chk = ssl.create_default_context()
+                    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=8) as _schk:
+                        _schk.ehlo(); _schk.starttls(context=_ctx_chk); _schk.ehlo()
+                        _schk.login(SMTP_USER, SMTP_PASS)
+                    st.session_state.piki_smtp_ok = True
+                except _sock.timeout:
+                    st.session_state.piki_smtp_ok = 'port_blocked'
+                except OSError as _oe:
+                    if 'Name or service not known' in str(_oe) or 'Temporary failure' in str(_oe) or 'No address' in str(_oe):
+                        st.session_state.piki_smtp_ok = 'dns_blocked'
+                    else:
+                        st.session_state.piki_smtp_ok = f'other:{_oe}'
+                except smtplib.SMTPAuthenticationError as _ae:
+                    st.session_state.piki_smtp_ok = f'auth:{_ae}'
+                except Exception as _ge:
+                    st.session_state.piki_smtp_ok = f'other:{_ge}'
+
+        _smtp_status = st.session_state.piki_smtp_ok
+
+        if _smtp_status is True:
+            st.success("✅ Email server connected — Outlook ready · lusekangele@outlook.com")
+
+        elif _smtp_status in ('dns_blocked', 'port_blocked'):
+            st.markdown("""
+<div style="background:#fff3e0;border-left:4px solid #e65100;padding:16px 20px;
+            border-radius:8px;font-size:13px;line-height:1.9;margin-bottom:8px">
+<strong>🚧 Network restriction — this server cannot reach external email providers</strong><br><br>
+This is <em>not</em> a password problem. The machine running this Streamlit app has outbound internet blocked.
+No email provider (Outlook, Gmail, SendGrid) will work until this is resolved.<br><br>
+<strong>Solution A — Run on your own laptop (works in 5 minutes):</strong><br>
+1. Save the file to your laptop<br>
+2. <code>pip install streamlit pandas matplotlib plotly</code><br>
+3. <code>streamlit run Weekly_Report__4_.py</code><br>
+4. Open <code>http://localhost:8501</code> — email will work on your office internet<br><br>
+<strong>Solution B — Deploy to Railway.app (free hosting with full internet):</strong><br>
+Go to <a href="https://railway.app">railway.app</a>, connect GitHub, push the file.
+Railway gives you a public URL with no outbound restrictions.<br><br>
+<strong>Solution C — Ask your hosting provider to open port 587 outbound</strong> to smtp-mail.outlook.com<br><br>
+<strong>Meanwhile — use Preview &amp; Export mode below:</strong>
+Build and preview all emails, download the CSV list, and send manually from your Outlook.
+</div>""", unsafe_allow_html=True)
+            if 'piki_smtp_ok' in st.session_state:
+                st.session_state.piki_smtp_ok = 'preview_only'
+
+        elif isinstance(_smtp_status, str) and _smtp_status.startswith('auth:'):
+            st.error(f"Authentication failed — wrong password or SMTP not enabled in Outlook settings: {_smtp_status[5:]}")
+            st.markdown("""**Fix:** Outlook.com → Settings → Mail → Sync email → Enable POP/IMAP/SMTP. If you have 2FA, create an App Password.""")
+
+        elif isinstance(_smtp_status, str) and _smtp_status not in ('preview_only',):
+            st.warning(f"Connection issue: {_smtp_status}")
+
+        _smtp_ready = (_smtp_status is True)
+
+        # ── Audience + template selection ──
+        _cb1, _cb2, _cb3 = st.columns(3)
+        _audience_opts = {
+            "🔴 Lost — Win-Back":             ('status', ['Lost']),
+            "🟠 At Risk — Reactivation":       ('status', ['At Risk']),
+            "🟡 Slipping — Re-engage":         ('status', ['Slipping']),
+            "🟢 Active — Retention":           ('status', ['Active']),
+            "💎 High Value (any status)":      ('spend',  500000),
+            "📅 Monthly Payday segment":        ('cadence', ['Monthly Payday']),
+            "🔄 Daily Regulars":               ('cadence', ['Daily Regular']),
+            "📆 Weekly Regulars":              ('cadence', ['Weekly Regular']),
+            "🆕 One-Time customers":           ('cadence', ['One-Time']),
+            "🌍 All non-active":               ('status', ['Lost','At Risk','Slipping']),
+        }
+        _ea_aud   = _cb1.selectbox("👥 Audience", list(_audience_opts.keys()), key="ea_aud")
+        _ea_cats  = sorted(set(x['cat'] for x in T))
+        _ea_cat   = _cb2.selectbox("📧 Email Style", _ea_cats, key="ea_cat")
+        _ea_limit = _cb3.number_input("📬 Max per day", 1, 500, 100, key="ea_limit")
+
+        _cd1, _cd2 = st.columns(2)
+        _ea_cooldown    = _cd1.number_input("⏳ Cooldown (days before re-contact)", 1, 180, 21, key="ea_cool",
+                                            help="Any customer emailed within this window is skipped")
+        _ea_email_req   = _cd2.checkbox("✉️ Only customers with known email", True, key="ea_email_req")
+
+        # ── Compute candidates ──
+        _aud_type, _aud_val = _audience_opts[_ea_aud]
+        if _aud_type == 'status' and 'Status' in _cust_grp.columns:
+            _mask = _cust_grp['Status'].isin(_aud_val)
+        elif _aud_type == 'cadence' and 'Cadence' in _cust_grp.columns:
+            _mask = _cust_grp['Cadence'].isin(_aud_val)
+        elif _aud_type == 'spend':
+            _mask = _cust_grp['Total_Spend'] >= _aud_val
+        else:
+            _mask = pd.Series(True, index=_cust_grp.index)
+
+        _candidates = _cust_grp[_mask].copy()
+
+        if _ea_email_req:
+            _candidates = _candidates[
+                _candidates['All_Emails'].fillna('').str.strip().replace('—','') != '']
+
+        # Cooldown filter
+        _now_ts = pd.Timestamp.now()
+        if st.session_state.piki_send_log:
+            _sl_df = pd.DataFrame(st.session_state.piki_send_log)
+            _recent_cids = _sl_df[
+                pd.to_datetime(_sl_df['sent_at'], errors='coerce') >=
+                (_now_ts - pd.Timedelta(days=int(_ea_cooldown)))]['cid'].unique()
+            _candidates = _candidates[~_candidates['CUSTOMER ID'].astype(str).isin(_recent_cids)]
+
+        _final_cands = _candidates.head(int(_ea_limit))
+        _cat_tmpls   = [x for x in T if x['cat'] == _ea_cat] or T[:1]
+
+        # Stats strip
+        _ms1, _ms2, _ms3, _ms4 = st.columns(4)
+        _ms1.metric("👥 Total audience",   len(_cust_grp[_mask] if _aud_type != 'spend' else _cust_grp[_mask]))
+        _ms2.metric("✉️ Have email",       len(_candidates) if _ea_email_req else len(_candidates))
+        _ms3.metric("⏭️ Skipped (cooldown)", max(0, len(_candidates) - len(_final_cands)))
+        _ms4.metric("📬 Will send",        len(_final_cands))
+
+        if len(_final_cands) == 0:
+            st.info("No eligible recipients match the current criteria. Adjust the audience, cooldown, or email filter.")
+
+        # ── Promo code slot (optional — makes discounts real) ─────
+        with st.expander("🎟️ Promo Code (optional — makes discounts real in the app)", expanded=False):
+            st.markdown("""<div style="font-size:13px;color:#555;line-height:1.7;margin-bottom:12px">
+            Enter a promo code that is <strong>already active in your Piki ordering system</strong>.
+            If provided, the code will be displayed prominently in every email that mentions a discount,
+            so customers can enter it at checkout. <br>
+            <strong>Leave blank</strong> if you haven't created a promo code yet — the emails will
+            still send but won't include a specific code.
+            </div>""", unsafe_allow_html=True)
+            _pc1, _pc2, _pc3 = st.columns(3)
+            _promo_code   = _pc1.text_input("Promo code", placeholder="e.g. COMEBACK20", key="ea_promo_code")
+            _promo_label  = _pc2.text_input("What it does", placeholder="e.g. 20% off all orders", key="ea_promo_label")
+            _promo_expiry = _pc3.text_input("Expires", placeholder="e.g. 31 Dec 2025", key="ea_promo_expiry")
+            if _promo_code:
+                st.success(f"✅ Code **{_promo_code}** ({_promo_label}) will be injected into all emails that mention a discount.")
+
+        _build_btn = st.button("🔨 Build Campaign & Preview", type="primary",
+                               disabled=len(_final_cands) == 0, key="ea_build")
+
+        # Optional: Claude AI-enhanced subject lines
+        _ai_subj_on = st.checkbox(
+            "🤖 Use Claude AI to write unique subject lines (costs ~1–2 API tokens/email, better open rates)",
+            value=False, key="ea_ai_subj",
+            help="When enabled, Claude writes a personalised subject line for each customer using their profile. Requires internet access.")
+
+        if _build_btn:
+            _queue = []
+            _ai_fail_count = 0
+            _build_prog = st.progress(0, "Building campaign…")
+            for _bi, (_, _brow) in enumerate(_final_cands.iterrows()):
+                _tmpl = _cat_tmpls[_bi % len(_cat_tmpls)]
+                _cid  = str(_brow.get('CUSTOMER ID', f'c{_bi}'))
+                _tid  = _tmpl['id']
+                _raw_em = str(_brow.get('All_Emails','')).replace('—','').strip()
+                _em = next((e.strip() for e in _raw_em.split('/') if '@' in e and e.strip()), None)
+                if not _em:
+                    continue
+                try:
+                    _base_subj = _tmpl['subj'](_brow)
+                    _html      = _tmpl['body'](_brow, _cid, _tid)
+                    # Inject promo code if one was provided
+                    _pc_val = st.session_state.get('ea_promo_code','').strip()
+                    _pc_lbl = st.session_state.get('ea_promo_label','').strip()
+                    _pc_exp = st.session_state.get('ea_promo_expiry','').strip()
+                    if _pc_val:
+                        _promo_block = (
+                            f'<div style="background:#fff8f0;border:2px dashed #FF6B00;border-radius:10px;'
+                            f'padding:16px 20px;text-align:center;margin:20px 0;">'
+                            f'<div style="font-size:11px;color:#999;text-transform:uppercase;'
+                            f'letter-spacing:1px;margin-bottom:4px">Your exclusive offer</div>'
+                            f'<div style="font-size:28px;font-weight:900;color:#FF6B00;'
+                            f'letter-spacing:2px">{_pc_val}</div>'
+                            f'<div style="font-size:14px;color:#555;margin-top:6px">{_pc_lbl}</div>'
+                            + (f'<div style="font-size:12px;color:#aaa;margin-top:4px">Expires: {_pc_exp}</div>' if _pc_exp else '')
+                            + '</div>'
+                        )
+                        # Inject promo code block before footer
+                        _html = _html.replace("\n  <div class=\"footer\">", _promo_block + "\n  <div class=\"footer\">", 1)
+                except Exception:
+                    continue
+
+                # ── Claude AI subject line (optional) ──
+                _final_subj = _base_subj
+                if _ai_subj_on and _ai_fail_count < 3:
+                    try:
+                        import urllib.request, json as _json
+                        _profile = (f"Name: {_brow.get('Name','?')} | City: {_brow.get('City','?')} | "
+                                    f"Status: {_brow.get('Status','?')} | Cadence: {_brow.get('Cadence','?')} | "
+                                    f"Orders: {int(_brow.get('Total_Orders',0))} | "
+                                    f"Spend: {int(_brow.get('Total_Spend',0)):,} TZS | "
+                                    f"Days silent: {int(_brow.get('Recency_Days',0))} | "
+                                    f"Top restaurant: {_brow.get('Top_Restaurant','?')} | "
+                                    f"Top products: {_brow.get('Top_Products','?')}")
+                        _ai_prompt = (f"Write ONE compelling email subject line for a food delivery app "
+                                      f"(Piki, Tanzania). Customer profile: {_profile}. "
+                                      f"Email category: {_tmpl['cat']}. "
+                                      f"Base subject: {_base_subj}. "
+                                      f"Rules: max 60 chars, personalised, use first name, add relevant emoji, "
+                                      f"create urgency or curiosity, do NOT use ALL CAPS. "
+                                      f"Return ONLY the subject line, nothing else.")
+                        _req_body = _json.dumps({
+                            "model": "claude-haiku-4-5-20251001",
+                            "max_tokens": 80,
+                            "messages": [{"role": "user", "content": _ai_prompt}]
+                        }).encode()
+                        _req = urllib.request.Request(
+                            "https://api.anthropic.com/v1/messages",
+                            data=_req_body,
+                            headers={"content-type":"application/json",
+                                     "anthropic-version":"2023-06-01"},
+                            method="POST")
+                        with urllib.request.urlopen(_req, timeout=8) as _resp:
+                            _ai_resp = _json.loads(_resp.read())
+                            _ai_text = _ai_resp.get('content',[{}])[0].get('text','').strip()
+                            if _ai_text and len(_ai_text) > 5:
+                                _final_subj = _ai_text[:80]
+                    except Exception:
+                        _ai_fail_count += 1
+                        # Silently fall back to template subject
+
+                _queue.append({'cid':_cid,'email':_em,'name':str(_brow.get('Name','Customer')),
+                               'tid':_tid,'cat':_tmpl['cat'],'subject':_final_subj,'html':_html,
+                               'status':str(_brow.get('Status','—')),
+                               'cadence':str(_brow.get('Cadence','—')),
+                               'city':str(_brow.get('City','—'))})
+                _build_prog.progress((_bi+1)/max(len(_final_cands),1), f"Building {_bi+1}/{len(_final_cands)}…")
+
+            st.session_state.piki_preview_queue  = _queue
+            st.session_state.piki_campaign_ready = True
+            st.rerun()
+
+        # ════════════════════════════════════════════════════════════
+        # PREVIEW & CONFIRM SEND
+        # ════════════════════════════════════════════════════════════
+        if st.session_state.piki_campaign_ready and st.session_state.piki_preview_queue:
+            _pq = st.session_state.piki_preview_queue
+            st.markdown(f"---\n### 👁️ Preview — {len(_pq)} emails ready to send")
+
+            _pt1, _pt2, _pt3 = st.tabs(["📋 Recipient List", "✉️ Email Preview", "🚀 Confirm & Send"])
+
+            with _pt1:
+                _pq_df = pd.DataFrame([{
+                    'Name':p['name'],'Email':p['email'],'City':p['city'],
+                    'Status':p['status'],'Cadence':p['cadence'],
+                    'Template':p['tid'],'Subject':p['subject']
+                } for p in _pq])
+                st.dataframe(_pq_df, use_container_width=True, height=380, hide_index=True)
+                st.download_button("⬇️ Download List", _pq_df.to_csv(index=False).encode(),
+                    "campaign_recipients.csv","text/csv", key="ea_dl_list")
+
+            with _pt2:
+                _pv_n = st.number_input("Preview email #", 1, len(_pq), 1, key="ea_pv_n") - 1
+                _pv   = _pq[_pv_n]
+                st.markdown(f"**To:** `{_pv['email']}` &nbsp; **Subject:** {_pv['subject']} &nbsp; **Template:** `{_pv['tid']}`")
+                st.components.v1.html(_pv['html'], height=580, scrolling=True)
+
+            with _pt3:
+                st.markdown("""<div style="background:#fff3e0;border-left:4px solid #e65100;
+                    padding:14px 18px;border-radius:8px;font-size:13px;margin-bottom:16px">
+                    ⚠️ <strong>You are about to send real emails to real customers.</strong>
+                    Please review the recipient list and email previews carefully.
+                    Emails cannot be unsent. The sender will appear as
+                    <strong>Piki Customer Service &lt;service@piki.co.tz&gt;</strong>
+                    and replies go to <strong>service@piki.co.tz</strong>.
+                    </div>""", unsafe_allow_html=True)
+
+                _ea_confirm = st.checkbox(
+                    f"✅ I have reviewed the list and confirm sending {len(_pq)} emails",
+                    key="ea_confirm")
+                _smtp_ready = st.session_state.piki_smtp_ok
+                if not _smtp_ready:
+                    st.warning("⚙️ Please configure and test your SMTP connection first.")
+
+                _send_btn = st.button("🚀 Send Campaign", type="primary",
+                    key="ea_send_now",
+                    disabled=(not _ea_confirm or not _smtp_ready))
+
+                if _send_btn and _ea_confirm and _smtp_ready:
+                    _host_v = SMTP_HOST
+                    _port_v = SMTP_PORT
+                    _user_v = SMTP_USER
+                    _pass_v = SMTP_PASS
+                    _ok=0; _fail=0; _fails=[]
+                    _prog = st.progress(0, "Sending…")
+                    try:
+                        _ctx3 = ssl.create_default_context()
+                        with smtplib.SMTP(_host_v, _port_v) as _srv3:
+                            _srv3.ehlo(); _srv3.starttls(context=_ctx3); _srv3.ehlo()
+                            _srv3.login(_user_v, _pass_v)
+                            for _si, _em_item in enumerate(_pq):
+                                try:
+                                    _msg = MIMEMultipart('alternative')
+                                    _msg['Subject']  = _em_item['subject']
+                                    _msg['From']     = SENDER_FROM
+                                    _msg['To']       = _em_item['email']
+                                    _msg['Reply-To'] = REPLY_TO
+                                    _msg['X-Campaign-ID'] = _em_item['tid']
+                                    _plain = (f"Hi {_em_item['name']},\n\n"
+                                              f"Please open this email in your email client to read it properly.\n\n"
+                                              f"Piki Customer Service\nservice@piki.co.tz")
+                                    _msg.attach(MIMEText(_plain, 'plain', 'utf-8'))
+                                    _msg.attach(MIMEText(_em_item['html'], 'html', 'utf-8'))
+                                    _srv3.sendmail(_user_v, _em_item['email'], _msg.as_string())
+                                    st.session_state.piki_send_log.append({
+                                        'cid':_em_item['cid'],'email':_em_item['email'],
+                                        'name':_em_item['name'],'tid':_em_item['tid'],
+                                        'cat':_em_item['cat'],'subject':_em_item['subject'],
+                                        'sent_at':str(_now_ts),'status':'sent',
+                                        'opened':False,'clicked':False
+                                    })
+                                    _ok += 1
+                                except Exception as _se:
+                                    _fail += 1
+                                    _fails.append({'to':_em_item['email'],'error':str(_se)})
+                                    st.session_state.piki_send_log.append({
+                                        'cid':_em_item['cid'],'email':_em_item['email'],
+                                        'name':_em_item['name'],'tid':_em_item['tid'],
+                                        'cat':_em_item['cat'],'subject':_em_item['subject'],
+                                        'sent_at':str(_now_ts),'status':'failed',
+                                        'error':str(_se),'opened':False,'clicked':False
+                                    })
+                                _prog.progress((_si+1)/len(_pq), f"Sent {_si+1}/{len(_pq)}…")
+                        st.success(f"✅ Done! {_ok} sent · {_fail} failed")
+                        if _fails:
+                            with st.expander(f"⚠️ {_fail} failed sends"):
+                                st.dataframe(pd.DataFrame(_fails))
+                        st.session_state.piki_campaign_ready = False
+                        st.session_state.piki_preview_queue  = []
+                    except Exception as _ce:
+                        st.error(f"SMTP error: {_ce}")
+
+        # ════════════════════════════════════════════════════════════
+        # TRACKING DASHBOARD
+        # ════════════════════════════════════════════════════════════
+        if st.session_state.piki_send_log:
+            st.markdown("---")
+            st.markdown("### 📊 Campaign Tracking Dashboard")
+            _log = pd.DataFrame(st.session_state.piki_send_log)
+            _log['sent_at'] = pd.to_datetime(_log['sent_at'], errors='coerce')
+            _tot_s = (_log['status']=='sent').sum()
+            _tot_f = (_log['status']=='failed').sum()
+            _tot_o = _log.get('opened',pd.Series(False,index=_log.index)).sum()
+            _tot_c = _log.get('clicked',pd.Series(False,index=_log.index)).sum()
+            _tr1,_tr2,_tr3,_tr4,_tr5 = st.columns(5)
+            _tr1.metric("📨 Sent",    _tot_s)
+            _tr2.metric("❌ Failed",  _tot_f)
+            _tr3.metric("👁️ Opened",  _tot_o,
+                        f"{_tot_o/_tot_s*100:.1f}% open rate" if _tot_s else "—")
+            _tr4.metric("🖱️ Clicked", _tot_c,
+                        f"{_tot_c/_tot_s*100:.1f}% CTR" if _tot_s else "—")
+            _tr5.metric("📅 Campaigns", int(_log['sent_at'].dt.date.nunique()))
+
+            # Category performance table
+            st.markdown("##### 📧 Performance by Email Category")
+            _cp = (_log.groupby('cat').agg(
+                Sent=('status', lambda x:(x=='sent').sum()),
+                Failed=('status', lambda x:(x=='failed').sum()),
+            ).reset_index().sort_values('Sent',ascending=False))
+            st.dataframe(_cp, use_container_width=True, height=220, hide_index=True)
+
+            # Timeline chart
+            if _tot_s >= 2:
+                _tl = _log[_log['status']=='sent'].copy()
+                _tl['Date'] = _tl['sent_at'].dt.date
+                _tl_cnt = _tl.groupby('Date').size().reset_index(name='Emails Sent')
+                _fig_tl, _ax_tl = plt.subplots(figsize=(8,2.5))
+                _ax_tl.bar(_tl_cnt['Date'].astype(str), _tl_cnt['Emails Sent'],
+                           color='#FF6B00', alpha=0.85, edgecolor='white')
+                _ax_tl.set_title("Daily Emails Sent", fontweight='bold', fontsize=10)
+                _ax_tl.set_xlabel("Date"); _ax_tl.set_ylabel("Emails")
+                _ax_tl.grid(axis='y', alpha=0.2); plt.xticks(rotation=30, ha='right')
+                plt.tight_layout(pad=1.2); st.pyplot(_fig_tl); plt.close()
+
+            _dl1, _dl2 = st.columns(2)
+            with _dl1:
+                st.download_button("⬇️ Download Full Send Log",
+                    _log.to_csv(index=False).encode(), "piki_email_log.csv", "text/csv",
+                    key="ea_dl_log")
+            with _dl2:
+                if st.button("🗑️ Clear Log", key="ea_clear"):
+                    st.session_state.piki_send_log = []
+                    st.rerun()
+
+
+    # ══════════════════════════════════════════════════════════════
+    # VENDOR RETENTION
+    # ══════════════════════════════════════════════════════════════
+    else:
+        st.markdown("""
+        <div style="background:#e8f5e9;border-left:4px solid #2e7d32;padding:12px 18px;
+                    border-radius:8px;font-size:13px;line-height:1.7;margin-bottom:16px;">
+        <b>📐 Vendor health scoring</b><br>
+        Each restaurant is scored on <b>recency</b> (days since last completed order),
+        <b>volume trend</b> (current week vs 8-week average), <b>rejection rate</b>,
+        and <b>revenue contribution</b>. Vendors are classified into health tiers so the
+        account management team knows exactly who needs attention and why.
+        </div>""", unsafe_allow_html=True)
+
+        # ── City filter ──
+        _vr_city_f = st.multiselect("🏙️ Filter by City", _crm_cities,
+                                     placeholder="All cities", key="crm_vend_city")
+        _vr_df = _crm_raw[_crm_raw['BUSINESS CITY'].isin(_vr_city_f)] if _vr_city_f else _crm_raw.copy()
+
+        # ── Build vendor profile — cached ─────────────────────────
+        _vend_grp = _build_vendor_profiles(_vr_df, _crm_ref_date)
+
+        # ── Vendor health classification ────────────────────────
+        def _vend_health(row):
+            if row['Recency_Days'] > 14 and row['Total_Orders'] > 10:
+                return '🔴 Inactive'
+            if row['Recency_Days'] > 7:
+                return '🟠 At Risk'
+            if row['Rejection_Rate'] >= 20:
+                return '🟡 High Rejection'
+            if row['WoW_Pct'] <= -30 and row['Avg_8Wk'] >= 5:
+                return '🟡 Declining'
+            if row['WoW_Pct'] >= 20:
+                return '🟢 Growing'
+            if row['Completion_Rate'] >= 90 and row['Total_Orders'] >= 10:
+                return '🟢 Healthy'
+            return '⚪ Stable'
+
+        _vend_grp['Health'] = _vend_grp.apply(_vend_health, axis=1)
+
+        def _vend_action(row):
+            h = row['Health']
+            name = row['BUSINESS NAME']
+            rej  = row['Rejection_Rate']
+            drop = row['WoW_Pct']
+            if '🔴 Inactive' in h:
+                return f"📞 CALL URGENTLY — {int(row['Recency_Days'])} days silent. Confirm business is open, check system access, schedule visit"
+            if '🟠 At Risk' in h:
+                return f"📱 WhatsApp check-in — confirm operational status, offer menu update support"
+            if '🟡 High Rejection' in h:
+                return f"🔧 Ops review — {rej:.0f}% rejection rate. Investigate: capacity, hours, system? Schedule training"
+            if '🟡 Declining' in h:
+                return f"📊 Account review — {abs(drop):.0f}% drop vs avg. Check menu freshness, pricing, or competitor impact"
+            if '🟢 Growing' in h:
+                return f"🏆 Feature in app — highlight in promotions, explore menu expansion, offer visibility boost"
+            if '🟢 Healthy' in h:
+                return f"💬 Maintain relationship — monthly check-in, share their performance stats, loyalty acknowledgement"
+            return "👀 Monitor — standard check-in"
+
+        _vend_grp['Action'] = _vend_grp.apply(_vend_action, axis=1)
+
+        # ── Summary KPIs ────────────────────────────────────────
+        _v_inactive = (_vend_grp['Health'] == '🔴 Inactive').sum()
+        _v_atrisk   = (_vend_grp['Health'] == '🟠 At Risk').sum()
+        _v_higrej   = (_vend_grp['Health'] == '🟡 High Rejection').sum()
+        _v_decline  = (_vend_grp['Health'] == '🟡 Declining').sum()
+        _v_growing  = (_vend_grp['Health'] == '🟢 Growing').sum()
+        _v_healthy  = (_vend_grp['Health'] == '🟢 Healthy').sum()
+
+        _vm1,_vm2,_vm3,_vm4,_vm5,_vm6 = st.columns(6)
+        _vm1.metric("🔴 Inactive",      _v_inactive)
+        _vm2.metric("🟠 At Risk",        _v_atrisk)
+        _vm3.metric("🟡 High Rejection", _v_higrej)
+        _vm4.metric("🟡 Declining",      _v_decline)
+        _vm5.metric("🟢 Growing",        _v_growing)
+        _vm6.metric("🟢 Healthy",        _v_healthy)
+
+        # Lost revenue from inactive vendors
+        _inactive_rev = _vend_grp[_vend_grp['Health']=='🔴 Inactive']['Total_Revenue'].sum()
+        if _inactive_rev > 0:
+            st.markdown(
+                f'<div style="background:#ffebee;border-left:4px solid #c62828;padding:10px 16px;'
+                f'border-radius:6px;font-size:13px;margin:8px 0;">'
+                f'🔴 <b>{_v_inactive} inactive vendors</b> generated '
+                f'<b>{_inactive_rev/1e6:.1f}M TZS</b> historically — immediate account recovery needed</div>',
+                unsafe_allow_html=True)
+
+        st.markdown("---")
+
+        # ── Vendor health chart ──
+        _vend_health_counts = _vend_grp['Health'].value_counts().reset_index()
+        _vend_health_counts.columns = ['Health','Vendors']
+        _vh_colors_map = {
+            '🔴 Inactive':'#c62828','🟠 At Risk':'#e67e22',
+            '🟡 High Rejection':'#f1c40f','🟡 Declining':'#f39c12',
+            '🟢 Growing':'#2e7d32','🟢 Healthy':'#4caf50','⚪ Stable':'#9e9e9e'
+        }
+        _fig_vh, _ax_vh = plt.subplots(figsize=(10, 3.5))
+        _vhb = _ax_vh.barh(
+            _vend_health_counts['Health'], _vend_health_counts['Vendors'],
+            color=[_vh_colors_map.get(x,'#aaa') for x in _vend_health_counts['Health']],
+            alpha=0.88, edgecolor='white'
+        )
+        for _b, _v in zip(_vhb, _vend_health_counts['Vendors']):
+            _ax_vh.text(_b.get_width()+0.3, _b.get_y()+_b.get_height()/2,
+                         str(_v), va='center', fontsize=9, fontweight='bold')
+        _ax_vh.set_title("Vendor Health Breakdown", fontweight='bold', fontsize=11)
+        _ax_vh.set_xlabel("Number of Vendors"); _ax_vh.grid(axis='x', alpha=0.2)
+        plt.tight_layout(pad=1.2); st.pyplot(_fig_vh); plt.close()
+
+        # ── Vendor tables by health status ──────────────────────
+        st.markdown("### 📋 Vendor Action Lists")
+        _vend_filter = st.selectbox(
+            "Filter by health status",
+            ['All','🔴 Inactive','🟠 At Risk','🟡 High Rejection',
+             '🟡 Declining','🟢 Growing','🟢 Healthy','⚪ Stable'],
+            key="vend_health_filter")
+
+        _vend_show = (_vend_grp if _vend_filter == 'All'
+                      else _vend_grp[_vend_grp['Health'] == _vend_filter]).copy()
+
+        # Sort: worst health first, then by revenue
+        _health_order = {'🔴 Inactive':0,'🟠 At Risk':1,'🟡 High Rejection':2,
+                         '🟡 Declining':3,'⚪ Stable':4,'🟢 Healthy':5,'🟢 Growing':6}
+        _vend_show['_sort'] = _vend_show['Health'].map(_health_order).fillna(9)
+        _vend_show = _vend_show.sort_values(['_sort','Total_Revenue'], ascending=[True,False]).drop(columns='_sort')
+
+        _vend_disp_cols = ['BUSINESS NAME','City','Health','Total_Orders','This_Week',
+                           'Avg_8Wk','WoW_Pct','Completion_Rate','Rejection_Rate',
+                           'Total_Revenue','Recency_Days','Action']
+        _vend_disp = _vend_show[_vend_disp_cols].copy()
+        _vend_disp['Total_Revenue'] = _vend_disp['Total_Revenue'].apply(lambda x: f"{int(x):,} TZS")
+        _vend_disp['WoW_Pct']       = _vend_disp['WoW_Pct'].apply(lambda x: f"{'+'if x>=0 else ''}{x:.1f}%")
+        _vend_disp['Completion_Rate']= _vend_disp['Completion_Rate'].apply(lambda x: f"{x:.1f}%")
+        _vend_disp['Rejection_Rate'] = _vend_disp['Rejection_Rate'].apply(lambda x: f"{x:.1f}%")
+        _vend_disp = _vend_disp.rename(columns={
+            'BUSINESS NAME':'Vendor','Total_Orders':'All-Time Orders',
+            'This_Week':'This Wk','Avg_8Wk':'8-Wk Avg',
+            'WoW_Pct':'vs Avg','Completion_Rate':'Completion %',
+            'Rejection_Rate':'Rejection %','Total_Revenue':'Revenue',
+            'Recency_Days':'Days Since Order'
+        }).reset_index(drop=True)
+
+        def _style_vend(df_in):
+            sty = pd.DataFrame('', index=df_in.index, columns=df_in.columns)
+            health_bg = {
+                '🔴 Inactive':'#ffebee','🟠 At Risk':'#fff3e0',
+                '🟡 High Rejection':'#fffde7','🟡 Declining':'#fffde7',
+                '🟢 Growing':'#e8f5e9','🟢 Healthy':'#e8f5e9',
+            }
+            if 'Health' in df_in.columns:
+                for idx, row in df_in.iterrows():
+                    bg = health_bg.get(str(row.get('Health','')), '')
+                    if bg:
+                        for col in df_in.columns:
+                            sty.at[idx,col] = f'background-color:{bg}'
+            return sty
+
+        st.dataframe(_vend_disp.style.apply(_style_vend, axis=None),
+                     use_container_width=True, height=500)
+        st.download_button("⬇️ Download Vendor Action List",
+            data=_vend_disp.to_csv(index=False).encode(),
+            file_name=f"vendor_health_{_vend_filter.replace(' ','_')}.csv",
+            mime="text/csv", key="dl_vend")
