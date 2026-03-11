@@ -4552,7 +4552,7 @@ with tab4:
 
         # Restaurant summary df
         _p4_biz_df = (df4f.groupby('BUSINESS NAME').agg(
-            City=('BUSINESS CITY', lambda x: x.mode().iloc[0] if len(x) > 0 else '—'),
+            City=('BUSINESS CITY', lambda x: x.mode().iloc[0] if not x.dropna().empty and not x.dropna().mode().empty else '—'),
             Orders=('ID', 'count'),
             Revenue=('SUBTOTAL', 'sum'),
             Avg_DT=('Average Delivery Time', 'mean'),
