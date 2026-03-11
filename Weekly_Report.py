@@ -826,8 +826,8 @@ with st.sidebar:
                 st.session_state.raw_df  = raw
                 st.session_state["_src"] = DEFAULT_CSV
             elif "raw_df" not in st.session_state:
-                st.error(f"⚠️ **{DEFAULT_CSV}** not found in app folder.")
-                st.info("Place the file next to Weekly_Report.py, or expand '📂 Upload' above.")
+                st.warning(f"⚠️ No data loaded yet — **{DEFAULT_CSV}** was not found in the app folder.")
+                st.info("👆 Use the **📂 Upload Data File** panel above to upload your CSV or Excel file to get started.")
                 st.stop()
 
     raw = st.session_state.raw_df
@@ -4487,156 +4487,339 @@ with tab3:
 # TAB 4 — PRODUCTS & GEO
 # ═══════════════════════════════════════════════════════════════
 with tab4:
-    st.markdown('<div class="section-header">📦 Product Trends & Geographic Analysis</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-header">📦 Product Intelligence & Restaurant Explorer</div>', unsafe_allow_html=True)
+    st.caption("Discover what sells, where, and from which restaurant — built to help you create deals and promotions")
 
-    # ── 8-week default analysis window ──
-    _p4_all = compute_delivery_stages(df)
+    # ── Base data setup ────────────────────────────────────────────────────────
+    _p4_all         = compute_delivery_stages(df)
     _p4_latest_date = _p4_all['DELIVERY DATE'].dropna().max()
     _p4_8w_start    = _p4_latest_date - pd.Timedelta(weeks=8)
-    # Current/latest week bounds for date picker default
-    _p4_cw_monday   = _p4_latest_date - pd.Timedelta(days=_p4_latest_date.weekday())
-    _p4_cw_sunday   = _p4_cw_monday + pd.Timedelta(days=6)
+    _p4_min_date    = _p4_all['DELIVERY DATE'].min().date()
+    _p4_max_date    = _p4_latest_date.date()
+    _p4_8w_clamped  = max(_p4_8w_start.date(), _p4_min_date)
 
-    st.markdown(
-        f"""<div style="background:#FFF4EC;border-left:3px solid #FF6B00;
-            padding:10px 14px;border-radius:6px;margin-bottom:12px;font-size:13px;">
-        📅 <b>Analysis period:</b> Last 8 weeks 
-        ({_p4_8w_start.strftime('%d %b')} – {_p4_latest_date.strftime('%d %b %Y')}) &nbsp;|&nbsp;
-        Latest week: <b>{_p4_cw_monday.strftime('%d %b')} – {_p4_cw_sunday.strftime('%d %b %Y')}</b>
-        </div>""", unsafe_allow_html=True)
-
-    # Compute date bounds — always available
-    _p4_min_date   = _p4_all['DELIVERY DATE'].min().date()
-    _p4_max_date   = _p4_latest_date.date()
-    _p4_8w_clamped = max(_p4_8w_start.date(), _p4_min_date)
-
-    # Always render date pickers (expander keeps them visible/interactive)
-    with st.expander("🗓️ Customize date range (default = last 8 weeks)", expanded=False):
+    with st.expander("🗓️ Date range (default = last 8 weeks)", expanded=False):
         _p4fc1, _p4fc2 = st.columns(2)
         _p4_from = _p4fc1.date_input("From", value=_p4_8w_clamped,
                                       min_value=_p4_min_date, max_value=_p4_max_date, key="p4_from")
         _p4_to   = _p4fc2.date_input("To",   value=_p4_max_date,
                                       min_value=_p4_min_date, max_value=_p4_max_date, key="p4_to")
-    # Retrieve from session state as fallback in case expander hasn't been opened
     _p4_from = st.session_state.get("p4_from", _p4_8w_clamped)
     _p4_to   = st.session_state.get("p4_to",   _p4_max_date)
 
-    # Apply date filter
     _p4_mask = ((_p4_all['DELIVERY DATE'].dt.date >= _p4_from) &
                 (_p4_all['DELIVERY DATE'].dt.date <= _p4_to))
     df4 = _p4_all[_p4_mask].copy()
 
     if df4.empty:
         st.warning("No data in selected date range.")
-        st.stop()
-
-    # ── Product aggregation ──
-    product_totals     = defaultdict(int)
-    weekly_prod_totals = defaultdict(lambda: defaultdict(int))
-    prod_biz_map       = defaultdict(set)
-
-    # Optional product filter within this tab
-    prod_filter = st.multiselect("Filter by Product (optional)",
-                                  sorted(set(PRODUCT_MAPPING.values())),
-                                  key="prod_tab_filter")
-
-    for _, row in df4.iterrows():
-        try:
-            wk_period = row['DELIVERY DATE'].to_period('W-SUN').start_time
-        except Exception:
-            continue
-        bname = row.get('BUSINESS NAME', '')
-        for pname, qty in extract_products(row.get('PRODUCTS', '')):
-            pstd = standardize_product(pname)
-            if prod_filter and pstd not in prod_filter:
-                continue
-            product_totals[pstd]                   += qty
-            weekly_prod_totals[wk_period][pstd]    += qty
-            prod_biz_map[pstd].add(bname)
-
-    if product_totals:
-        total_prod_df = pd.DataFrame(product_totals.items(), columns=['Product','Total Quantity'])
-        total_prod_df['Businesses Selling']    = total_prod_df['Product'].apply(lambda x: len(prod_biz_map[x]))
-        total_prod_df['Associated Businesses'] = total_prod_df['Product'].apply(
-            lambda x: ", ".join(sorted(prod_biz_map[x])))
-        total_prod_df = total_prod_df.sort_values('Total Quantity', ascending=False)
     else:
-        total_prod_df = pd.DataFrame(columns=['Product','Total Quantity','Businesses Selling','Associated Businesses'])
-        st.warning("No product data found. Check that the PRODUCTS column has data in format '1 x Item Name'.")
+        # ── GLOBAL FILTERS ──────────────────────────────────────────────────────
+        _p4_cities  = sorted(df4['BUSINESS CITY'].dropna().unique())
+        _f1, _f2    = st.columns(2)
+        _p4_city_sel = _f1.multiselect("🏙️ Filter by City", _p4_cities,
+                                        placeholder="All cities", key="p4_city_sel")
+        _biz_opts = sorted(df4[df4['BUSINESS CITY'].isin(_p4_city_sel)]['BUSINESS NAME'].dropna().unique()
+                           if _p4_city_sel else df4['BUSINESS NAME'].dropna().unique())
+        _p4_biz_sel  = _f2.multiselect("🏪 Filter by Restaurant", _biz_opts,
+                                        placeholder="All restaurants", key="p4_biz_sel")
 
-    # ── Business performance ──
-    biz_perf = (df4.groupby('BUSINESS NAME')
-                .agg(Total_Orders=('ID','count'), Total_Sales=('SUBTOTAL','sum'),
-                     Avg_DT=('Average Delivery Time','mean'))
-                .reset_index()
-                .sort_values('Total_Orders', ascending=False)
-                .head(10)
-                .rename(columns={'Avg_DT':'Avg Delivery (min)'}))
-    biz_perf['Avg Delivery (min)'] = biz_perf['Avg Delivery (min)'].round(1)
+        # Apply filters
+        df4f = df4.copy()
+        if _p4_city_sel: df4f = df4f[df4f['BUSINESS CITY'].isin(_p4_city_sel)]
+        if _p4_biz_sel:  df4f = df4f[df4f['BUSINESS NAME'].isin(_p4_biz_sel)]
 
-    # ── Two column layout ──
-    pc1, pc2 = st.columns(2)
+        # ── Build product aggregations from filtered data ───────────────────────
+        _p4_prod_qty     = defaultdict(int)      # product -> total qty
+        _p4_biz_prod_qty = defaultdict(lambda: defaultdict(int))  # biz -> product -> qty
+        _p4_week_prod    = defaultdict(lambda: defaultdict(int))  # week -> product -> qty
 
-    with pc1:
-        st.subheader("🏆 Top 10 Businesses")
-        st.dataframe(biz_perf, use_container_width=True)
-        fig_biz, ax_biz = plt.subplots(figsize=(7, 4))
-        ax_biz.barh(biz_perf['BUSINESS NAME'], biz_perf['Total_Orders'], color='#FF6B00')
-        ax_biz.set_xlabel("Orders"); ax_biz.invert_yaxis()
-        ax_biz.set_title("Top 10 by Orders"); plt.tight_layout()
-        st.pyplot(fig_biz); plt.close()
+        for _, _r4 in df4f.iterrows():
+            _bn4 = str(_r4.get('BUSINESS NAME', '—'))
+            try:    _wk4 = _r4['DELIVERY DATE'].to_period('W-SUN').start_time
+            except: _wk4 = None
+            for _pn4, _qty4 in extract_products(_r4.get('PRODUCTS', '')):
+                _ps4 = standardize_product(_pn4)
+                _p4_prod_qty[_ps4]           += _qty4
+                _p4_biz_prod_qty[_bn4][_ps4] += _qty4
+                if _wk4: _p4_week_prod[_wk4][_ps4] += _qty4
 
-    with pc2:
-        st.subheader("📦 Top 15 Products")
-        st.dataframe(total_prod_df.head(15)[['Product','Total Quantity','Businesses Selling']],
-                     use_container_width=True)
-        top15 = total_prod_df.head(15)
-        fig_prod, ax_prod = plt.subplots(figsize=(7, 4))
-        ax_prod.barh(top15['Product'], top15['Total Quantity'], color='#2ca02c')
-        ax_prod.set_xlabel("Quantity"); ax_prod.invert_yaxis()
-        ax_prod.set_title("Top 15 Products"); plt.tight_layout()
-        st.pyplot(fig_prod); plt.close()
+        # Product summary df
+        _p4_prod_df = pd.DataFrame(
+            [{'Product': p, 'Units Sold': q} for p, q in _p4_prod_qty.items()]
+        ).sort_values('Units Sold', ascending=False).reset_index(drop=True) \
+            if _p4_prod_qty else pd.DataFrame(columns=['Product','Units Sold'])
 
-    # Downloads
-    dc1, dc2 = st.columns(2)
-    dc1.download_button("⬇️ Download Business Report",
-                        data=excel_bytes(biz_perf, "Top Businesses"),
-                        file_name="Top_Businesses.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    dc2.download_button("⬇️ Download Product Trend",
-                        data=excel_bytes(total_prod_df, "Products"),
-                        file_name="Total_Product_Trend.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        # Restaurant summary df
+        _p4_biz_df = (df4f.groupby('BUSINESS NAME').agg(
+            City=('BUSINESS CITY', lambda x: x.mode().iloc[0] if len(x) > 0 else '—'),
+            Orders=('ID', 'count'),
+            Revenue=('SUBTOTAL', 'sum'),
+            Avg_DT=('Average Delivery Time', 'mean'),
+        ).reset_index().sort_values('Orders', ascending=False)
+         .rename(columns={'Avg_DT': 'Avg DT (min)'}))
+        _p4_biz_df['Avg DT (min)'] = _p4_biz_df['Avg DT (min)'].round(1)
+        _p4_biz_df['Revenue (TZS)'] = _p4_biz_df['Revenue'].astype(int)
+        _p4_biz_df = _p4_biz_df.drop(columns=['Revenue'])
 
-    st.divider()
+        # ══════════════════════════════════════════════════════════════════════
+        # SINGLE RESTAURANT DRILLDOWN
+        # ══════════════════════════════════════════════════════════════════════
+        if _p4_biz_sel and len(_p4_biz_sel) == 1:
+            _sel = _p4_biz_sel[0]
+            _sel_row = _p4_biz_df[_p4_biz_df['BUSINESS NAME'] == _sel]
 
-    # ── Weekly Product Movement ──
-    st.subheader("📆 Weekly Product Movement")
-    wp_rows = [[w, p, q] for w, prods in weekly_prod_totals.items()
-                          for p, q in prods.items()]
-    wp_df = pd.DataFrame(wp_rows, columns=['Week','Product','Quantity'])
-    if not wp_df.empty:
-        # Pivot: products × weeks for top 10
-        top_prods = total_prod_df.head(10)['Product'].tolist()
-        wp_pivot = (wp_df[wp_df['Product'].isin(top_prods)]
-                    .pivot_table(index='Product', columns='Week',
-                                 values='Quantity', aggfunc='sum', fill_value=0))
-        st.dataframe(wp_pivot, use_container_width=True)
+            st.markdown(f"## 🍽️ {_sel}")
+            if not _sel_row.empty:
+                _sr = _sel_row.iloc[0]
+                _dm1, _dm2, _dm3, _dm4 = st.columns(4)
+                _dm1.metric("📦 Orders",          f"{int(_sr['Orders']):,}")
+                _dm2.metric("💰 Revenue",          f"{int(_sr['Revenue (TZS)']):,} TZS")
+                _dm3.metric("⏱️ Avg Delivery",     f"{_sr['Avg DT (min)']} min")
+                _dm4.metric("🏙️ City",             _sr['City'])
 
-        # Line chart — top 8
-        fig_wp, ax_wp = plt.subplots(figsize=(13, 5))
-        for prod in top_prods[:8]:
-            prod_data = wp_df[wp_df['Product']==prod].sort_values('Week')
-            if prod_data.empty: continue
-            ax_wp.plot([str(w.date()) for w in prod_data['Week']],
-                       prod_data['Quantity'], marker='o', label=prod)
-        ax_wp.set_xlabel("Week"); ax_wp.set_ylabel("Quantity Sold")
-        ax_wp.set_title("Weekly Product Trend — Top 8 Products")
-        ax_wp.legend(fontsize=8, ncol=2); ax_wp.grid(True, alpha=0.3)
-        plt.xticks(rotation=45, ha='right'); plt.tight_layout()
-        st.pyplot(fig_wp); plt.close()
+            # Products for this restaurant
+            _sel_prods = sorted(_p4_biz_prod_qty.get(_sel, {}).items(), key=lambda x: -x[1])
+            if _sel_prods:
+                _total_qty = sum(q for _, q in _sel_prods)
+                _sp_df = pd.DataFrame(_sel_prods, columns=['Product', 'Units Sold'])
+                _sp_df['% Share']   = (_sp_df['Units Sold'] / _total_qty * 100).round(1)
+                _sp_df['Rank']      = range(1, len(_sp_df)+1)
+                _sp_df = _sp_df[['Rank','Product','Units Sold','% Share']]
 
-    # AI
+                _dc1, _dc2 = st.columns([3, 2])
+                with _dc1:
+                    st.markdown("#### 🏆 What This Restaurant Sells")
+                    st.dataframe(_sp_df, use_container_width=True, hide_index=True, height=380)
+                    st.download_button("⬇️ Download Product Sheet",
+                        data=excel_bytes(_sp_df, _sel[:28]),
+                        file_name=f"{_sel[:30].replace(' ','_')}_products.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="dl_sel_biz_prods")
+
+                with _dc2:
+                    st.markdown("#### 📊 Product Mix")
+                    _top8 = _sp_df.head(8)
+                    _fig_pie, _ax_pie = plt.subplots(figsize=(5, 4.5))
+                    _ax_pie.pie(_top8['Units Sold'], labels=_top8['Product'],
+                                autopct='%1.0f%%', startangle=140,
+                                colors=plt.cm.Set3.colors[:len(_top8)])
+                    _ax_pie.set_title("Top 8 Products", fontsize=9, fontweight='bold')
+                    plt.tight_layout(); st.pyplot(_fig_pie); plt.close()
+
+                # Weekly trend
+                _sel_wk = [[w, p, q] for w, prods in _p4_week_prod.items()
+                            for p, q in prods.items()
+                            if p in dict(_sel_prods)]
+                if len(_sel_wk) > 0:
+                    _sel_wk_df = pd.DataFrame(_sel_wk, columns=['Week','Product','Qty'])
+                    _top5_sel  = _sp_df.head(5)['Product'].tolist()
+                    st.markdown("#### 📈 Weekly Sales Trend")
+                    _fig_swk, _ax_swk = plt.subplots(figsize=(11, 4))
+                    for _sp5 in _top5_sel:
+                        _spd = _sel_wk_df[_sel_wk_df['Product']==_sp5].sort_values('Week')
+                        if _spd.empty: continue
+                        _ax_swk.plot([str(w.date()) for w in _spd['Week']],
+                                     _spd['Qty'], marker='o', label=_sp5, lw=2)
+                    _ax_swk.set_xlabel("Week"); _ax_swk.set_ylabel("Units Sold")
+                    _ax_swk.legend(fontsize=8, ncol=2); _ax_swk.grid(True, alpha=0.25)
+                    plt.xticks(rotation=35, ha='right'); plt.tight_layout()
+                    st.pyplot(_fig_swk); plt.close()
+
+                # Deal & promotion suggestions
+                st.markdown("#### 💡 Deal & Promotion Suggestions")
+                _top3n = _sp_df.head(3)['Product'].tolist()
+                _slow  = _sp_df[_sp_df['% Share'] < 3].head(3)['Product'].tolist()
+                _dc1s, _dc2s, _dc3s = st.columns(3)
+                _dc1s.markdown(f"""<div style="background:#fff8e1;border-left:3px solid #f9a825;
+                    padding:12px;border-radius:8px;font-size:13px;line-height:1.7">
+                    🔥 <b>Bundle Deal</b><br>Combine
+                    <b>{(' + '.join(_top3n[:2])) if len(_top3n)>=2 else (_top3n[0] if _top3n else '—')}</b>
+                    at a bundled price — your top sellers already ordered together.</div>""",
+                    unsafe_allow_html=True)
+                _dc2s.markdown(f"""<div style="background:#e8f5e9;border-left:3px solid #2e7d32;
+                    padding:12px;border-radius:8px;font-size:13px;line-height:1.7">
+                    ⚡ <b>Flash Deal</b><br>Run a 2-hour flash price on
+                    <b>{_top3n[0] if _top3n else '—'}</b> — already your #1 seller,
+                    a flash deal will drive a volume spike.</div>""",
+                    unsafe_allow_html=True)
+                _dc3s.markdown(
+                    f"""<div style="background:#eff6ff;border-left:3px solid #3b82f6;
+                    padding:12px;border-radius:8px;font-size:13px;line-height:1.7">
+                    📉 <b>Slow Mover Boost</b><br>{'<b>' + ', '.join(_slow) + '</b> sell below 3% share. '
+                    + 'Offer them as a free add-on with your top seller to clear stock.'
+                    if _slow else 'All products have healthy share — no slow movers right now ✅'}</div>""",
+                    unsafe_allow_html=True)
+            else:
+                st.info("No product data for this restaurant in the selected period.")
+
+        else:
+            # ══════════════════════════════════════════════════════════════════
+            # CITY / OVERVIEW MODE  (no restaurant filter or multiple selected)
+            # ══════════════════════════════════════════════════════════════════
+            _ov1, _ov2, _ov3 = st.tabs(["🏆 Top Products", "🏪 Restaurant Explorer", "📈 Weekly Trends"])
+
+            # ── Tab 1: Top Products ────────────────────────────────────────────
+            with _ov1:
+                _city_lbl = f" in {', '.join(_p4_city_sel)}" if _p4_city_sel else " — All Cities"
+                st.markdown(f"#### 🏆 Top Selling Products{_city_lbl}")
+                if _p4_prod_df.empty:
+                    st.info("No product data for current filter.")
+                else:
+                    # add top restaurant per product
+                    def _top_rest_for(prod):
+                        biz_list = sorted(_p4_biz_prod_qty.items(),
+                                          key=lambda x: -x[1].get(prod, 0))
+                        return ' · '.join(b for b, _ in biz_list[:3] if _.get(prod, 0) > 0)
+
+                    _show_n  = st.slider("Show top N products", 10, 60, 25, key="p4_topn")
+                    _top_df  = _p4_prod_df.head(_show_n).copy()
+                    _top_df['Top Restaurants'] = _top_df['Product'].apply(_top_rest_for)
+
+                    _col_chart, _col_tbl = st.columns([2, 3])
+                    with _col_chart:
+                        _fig_tp, _ax_tp = plt.subplots(figsize=(6, max(4, _show_n * 0.3)))
+                        _clr = ['#FF6B00' if i < 1 else '#ffad60' if i < 3 else '#ffd1a4'
+                                for i in range(len(_top_df))]
+                        _ax_tp.barh(_top_df['Product'], _top_df['Units Sold'],
+                                    color=_clr, edgecolor='white')
+                        for _bi, _bv in enumerate(_top_df['Units Sold']):
+                            _ax_tp.text(_bv * 1.01, _bi, f"{_bv:,}", va='center', fontsize=7)
+                        _ax_tp.invert_yaxis()
+                        _ax_tp.set_xlabel("Units Sold")
+                        _ax_tp.set_title("Products by Volume", fontweight='bold', fontsize=10)
+                        _ax_tp.grid(axis='x', alpha=0.2)
+                        plt.tight_layout(); st.pyplot(_fig_tp); plt.close()
+
+                    with _col_tbl:
+                        st.dataframe(_top_df, use_container_width=True,
+                                     hide_index=True, height=420)
+                        st.download_button("⬇️ Download Product List",
+                            data=excel_bytes(_top_df, "Top Products"),
+                            file_name=f"top_products{('_'+_p4_city_sel[0]) if len(_p4_city_sel)==1 else ''}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            key="dl_top_prods")
+
+            # ── Tab 2: Restaurant Explorer ──────────────────────────────────────
+            with _ov2:
+                _city_lbl2 = f" in {', '.join(_p4_city_sel)}" if _p4_city_sel else " — All Cities"
+                st.markdown(f"#### 🏪 Restaurant Explorer{_city_lbl2}")
+                if _p4_biz_df.empty:
+                    st.info("No restaurant data for current filter.")
+                else:
+                    _show_biz = st.slider("Show top N restaurants", 5, 60, 20, key="p4_biz_n")
+                    _top_biz  = _p4_biz_df.head(_show_biz).copy()
+
+                    def _top3_prods(bname):
+                        prods = sorted(_p4_biz_prod_qty.get(bname, {}).items(), key=lambda x: -x[1])
+                        return ' · '.join(p for p, _ in prods[:3]) if prods else '—'
+
+                    _top_biz['Top 3 Products'] = _top_biz['BUSINESS NAME'].apply(_top3_prods)
+
+                    # Chart
+                    _fig_biz2, _ax_biz2 = plt.subplots(figsize=(8, max(4, _show_biz * 0.3)))
+                    _bclr = ['#FF6B00' if i < 1 else '#ffad60' if i < 3 else '#ffd1a4'
+                             for i in range(len(_top_biz))]
+                    _ax_biz2.barh(_top_biz['BUSINESS NAME'], _top_biz['Orders'],
+                                  color=_bclr, edgecolor='white')
+                    for _bi2, _bv2 in enumerate(_top_biz['Orders']):
+                        _ax_biz2.text(_bv2 * 1.01, _bi2, f"{_bv2:,}", va='center', fontsize=7)
+                    _ax_biz2.invert_yaxis()
+                    _ax_biz2.set_xlabel("Orders")
+                    _ax_biz2.set_title("Restaurants by Order Volume", fontweight='bold', fontsize=10)
+                    _ax_biz2.grid(axis='x', alpha=0.2)
+                    plt.tight_layout(); st.pyplot(_fig_biz2); plt.close()
+
+                    st.dataframe(
+                        _top_biz.rename(columns={'BUSINESS NAME': 'Restaurant'}),
+                        use_container_width=True, hide_index=True, height=380)
+                    st.download_button("⬇️ Download Restaurant Rankings",
+                        data=excel_bytes(_top_biz.rename(columns={'BUSINESS NAME':'Restaurant'}),
+                                         "Restaurants"),
+                        file_name="restaurant_rankings.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="dl_biz_rank")
+
+                    # ── Per-restaurant product cards ──────────────────────────
+                    st.markdown("---")
+                    st.markdown("#### 📋 Restaurant Product Cards")
+                    st.caption("Expand any restaurant to see exactly what it sells — use this to build targeted deals")
+
+                    for _, _bcrow in _top_biz.head(20).iterrows():
+                        _bcn   = _bcrow['BUSINESS NAME']
+                        _bcps  = sorted(_p4_biz_prod_qty.get(_bcn, {}).items(), key=lambda x: -x[1])
+                        if not _bcps: continue
+                        _bctot = sum(q for _, q in _bcps)
+                        with st.expander(
+                            f"🍽️ **{_bcn}** — {int(_bcrow['Orders']):,} orders · "
+                            f"{int(_bcrow['Revenue (TZS)']):,} TZS · "
+                            f"Top: {_bcps[0][0]}",
+                            expanded=False):
+                            _bc_df = pd.DataFrame(_bcps, columns=['Product','Units Sold'])
+                            _bc_df['% Share'] = (_bc_df['Units Sold'] / _bctot * 100).round(1)
+                            _bcc1, _bcc2 = st.columns([2, 1])
+                            with _bcc1:
+                                st.dataframe(_bc_df.head(20), use_container_width=True,
+                                             hide_index=True, height=280)
+                            with _bcc2:
+                                _fig_bc, _ax_bc = plt.subplots(figsize=(4, 3.5))
+                                _top6bc = _bc_df.head(6)
+                                _ax_bc.barh(_top6bc['Product'], _top6bc['Units Sold'],
+                                            color='#FF6B00', alpha=0.85, edgecolor='white')
+                                _ax_bc.invert_yaxis(); _ax_bc.set_xlabel("Units")
+                                _ax_bc.set_title("Top Products", fontsize=9, fontweight='bold')
+                                plt.tight_layout(); st.pyplot(_fig_bc); plt.close()
+                            st.download_button(
+                                f"⬇️ Download {_bcn[:22]} sheet",
+                                data=excel_bytes(_bc_df, _bcn[:28]),
+                                file_name=f"{_bcn[:28].replace(' ','_')}_products.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                key=f"dl_bc_{abs(hash(_bcn)) % 99999}")
+
+            # ── Tab 3: Weekly Trends ─────────────────────────────────────────
+            with _ov3:
+                _city_lbl3 = f" in {', '.join(_p4_city_sel)}" if _p4_city_sel else ""
+                st.markdown(f"#### 📈 Weekly Product Trends{_city_lbl3}")
+                if not _p4_week_prod:
+                    st.info("No weekly data available.")
+                else:
+                    _wk_rows = [[w, p, q] for w, prods in _p4_week_prod.items()
+                                 for p, q in prods.items()]
+                    _wp_df   = pd.DataFrame(_wk_rows, columns=['Week','Product','Qty'])
+                    _top10p  = _p4_prod_df.head(10)['Product'].tolist()
+
+                    _wp_pivot = (_wp_df[_wp_df['Product'].isin(_top10p)]
+                                 .pivot_table(index='Product', columns='Week',
+                                              values='Qty', aggfunc='sum', fill_value=0))
+                    _wp_pivot.columns = [str(w.date()) for w in _wp_pivot.columns]
+                    st.dataframe(_wp_pivot, use_container_width=True)
+
+                    _fig_wk, _ax_wk = plt.subplots(figsize=(12, 5))
+                    for _wkp in _top10p[:8]:
+                        _wkd = _wp_df[_wp_df['Product'] == _wkp].sort_values('Week')
+                        if _wkd.empty: continue
+                        _ax_wk.plot([str(w.date()) for w in _wkd['Week']],
+                                    _wkd['Qty'], marker='o', label=_wkp, lw=2)
+                    _ax_wk.set_xlabel("Week"); _ax_wk.set_ylabel("Units Sold")
+                    _ax_wk.set_title("Weekly Trend — Top 8 Products", fontweight='bold', fontsize=10)
+                    _ax_wk.legend(fontsize=8, ncol=2); _ax_wk.grid(True, alpha=0.25)
+                    plt.xticks(rotation=35, ha='right'); plt.tight_layout()
+                    st.pyplot(_fig_wk); plt.close()
+
+                    st.download_button("⬇️ Download Weekly Trends",
+                        data=excel_bytes(_wp_pivot.reset_index(), "Weekly Trends"),
+                        file_name="weekly_product_trends.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="dl_wk_trends")
+
+    # ── backward-compat variables used by AI insight button ─────────────────
+    product_totals = _p4_prod_qty if not df4.empty else {}
+    total_prod_df  = _p4_prod_df  if not df4.empty else pd.DataFrame(columns=['Product','Total Quantity'])
+    biz_perf       = _p4_biz_df.rename(columns={'Orders':'Total_Orders','Revenue (TZS)':'Total_Sales'}) \
+                     if not df4.empty else pd.DataFrame()
+    wp_df          = pd.DataFrame(columns=['Week','Product','Quantity'])
+    prod_biz_map   = defaultdict(set)
+
     ai_insight_button("products", "Product Trends", build_product_insight, total_prod_df, biz_perf, wp_df)
 
     st.divider()
@@ -6832,9 +7015,7 @@ with tab6:
     # 📧 SMART EMAIL ENGAGEMENT AGENT
     # ══════════════════════════════════════════════════════════════
     if "Customer" in _crm_mode:
-        import smtplib, ssl, uuid, hashlib
-        from email.mime.multipart import MIMEMultipart
-        from email.mime.text      import MIMEText
+        # smtplib/ssl imported lazily in send block only (not needed for preview mode)
 
         st.markdown("---")
         st.markdown('<div class="section-header">📧 Smart Email Engagement Agent</div>', unsafe_allow_html=True)
@@ -7804,78 +7985,17 @@ p{{color:#444;font-size:15px;line-height:1.75;margin:0 0 16px}}
         # ════════════════════════════════════════════════════════════
         st.markdown("### 🎯 Build Your Campaign")
 
-        # ── Hardcoded Outlook credentials ────────────────────────
-        SMTP_HOST   = "smtp-mail.outlook.com"
-        SMTP_PORT   = 587
-        SMTP_USER   = "lusekangele@outlook.com"
-        SMTP_PASS   = "lujaka1999"
+        # Email sending is disabled on cloud deployment (outbound SMTP is blocked).
+        # Users can preview all emails and download the recipient list.
+        _smtp_ready = False
 
-        # ── Connection test with clear diagnostics ──────────────────
-        _conn_col1, _conn_col2 = st.columns([3, 1])
-        with _conn_col1:
-            pass  # status shown below
-        with _conn_col2:
-            if st.button("🔄 Test Connection", key="ea_retry_conn"):
-                st.session_state.piki_smtp_ok = None
-
-        if st.session_state.piki_smtp_ok is None:
-            with st.spinner("Testing email connection..."):
-                import socket as _sock
-                try:
-                    _t = _sock.create_connection((SMTP_HOST, SMTP_PORT), timeout=4)
-                    _t.close()
-                    _ctx_chk = ssl.create_default_context()
-                    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=8) as _schk:
-                        _schk.ehlo(); _schk.starttls(context=_ctx_chk); _schk.ehlo()
-                        _schk.login(SMTP_USER, SMTP_PASS)
-                    st.session_state.piki_smtp_ok = True
-                except _sock.timeout:
-                    st.session_state.piki_smtp_ok = 'port_blocked'
-                except OSError as _oe:
-                    if 'Name or service not known' in str(_oe) or 'Temporary failure' in str(_oe) or 'No address' in str(_oe):
-                        st.session_state.piki_smtp_ok = 'dns_blocked'
-                    else:
-                        st.session_state.piki_smtp_ok = f'other:{_oe}'
-                except smtplib.SMTPAuthenticationError as _ae:
-                    st.session_state.piki_smtp_ok = f'auth:{_ae}'
-                except Exception as _ge:
-                    st.session_state.piki_smtp_ok = f'other:{_ge}'
-
-        _smtp_status = st.session_state.piki_smtp_ok
-
-        if _smtp_status is True:
-            st.success("✅ Email server connected — Outlook ready · lusekangele@outlook.com")
-
-        elif _smtp_status in ('dns_blocked', 'port_blocked'):
-            st.markdown("""
-<div style="background:#fff3e0;border-left:4px solid #e65100;padding:16px 20px;
-            border-radius:8px;font-size:13px;line-height:1.9;margin-bottom:8px">
-<strong>🚧 Network restriction — this server cannot reach external email providers</strong><br><br>
-This is <em>not</em> a password problem. The machine running this Streamlit app has outbound internet blocked.
-No email provider (Outlook, Gmail, SendGrid) will work until this is resolved.<br><br>
-<strong>Solution A — Run on your own laptop (works in 5 minutes):</strong><br>
-1. Save the file to your laptop<br>
-2. <code>pip install streamlit pandas matplotlib plotly</code><br>
-3. <code>streamlit run Weekly_Report__4_.py</code><br>
-4. Open <code>http://localhost:8501</code> — email will work on your office internet<br><br>
-<strong>Solution B — Deploy to Railway.app (free hosting with full internet):</strong><br>
-Go to <a href="https://railway.app">railway.app</a>, connect GitHub, push the file.
-Railway gives you a public URL with no outbound restrictions.<br><br>
-<strong>Solution C — Ask your hosting provider to open port 587 outbound</strong> to smtp-mail.outlook.com<br><br>
-<strong>Meanwhile — use Preview &amp; Export mode below:</strong>
-Build and preview all emails, download the CSV list, and send manually from your Outlook.
-</div>""", unsafe_allow_html=True)
-            if 'piki_smtp_ok' in st.session_state:
-                st.session_state.piki_smtp_ok = 'preview_only'
-
-        elif isinstance(_smtp_status, str) and _smtp_status.startswith('auth:'):
-            st.error(f"Authentication failed — wrong password or SMTP not enabled in Outlook settings: {_smtp_status[5:]}")
-            st.markdown("""**Fix:** Outlook.com → Settings → Mail → Sync email → Enable POP/IMAP/SMTP. If you have 2FA, create an App Password.""")
-
-        elif isinstance(_smtp_status, str) and _smtp_status not in ('preview_only',):
-            st.warning(f"Connection issue: {_smtp_status}")
-
-        _smtp_ready = (_smtp_status is True)
+        st.markdown("""
+        <div style="background:#fff8e1;border-left:4px solid #f9a825;padding:14px 18px;
+                    border-radius:8px;font-size:13px;line-height:1.8;margin-bottom:8px">
+        📧 <strong>Email Preview Mode</strong> — Build your campaign, preview every email,
+        and download the full recipient list with subjects. Sending is available when running
+        the app locally on your own laptop (where outbound email is not restricted).
+        </div>""", unsafe_allow_html=True)
 
         # ── Audience + template selection ──
         _cb1, _cb2, _cb3 = st.columns(3)
@@ -8098,15 +8218,14 @@ Build and preview all emails, download the CSV list, and send manually from your
                     disabled=(not _ea_confirm or not _smtp_ready))
 
                 if _send_btn and _ea_confirm and _smtp_ready:
-                    _host_v = SMTP_HOST
-                    _port_v = SMTP_PORT
-                    _user_v = SMTP_USER
-                    _pass_v = SMTP_PASS
+                    import smtplib, ssl
+                    from email.mime.multipart import MIMEMultipart
+                    from email.mime.text import MIMEText
                     _ok=0; _fail=0; _fails=[]
                     _prog = st.progress(0, "Sending…")
                     try:
                         _ctx3 = ssl.create_default_context()
-                        with smtplib.SMTP(_host_v, _port_v) as _srv3:
+                        with smtplib.SMTP("smtp-mail.outlook.com", 587) as _srv3:
                             _srv3.ehlo(); _srv3.starttls(context=_ctx3); _srv3.ehlo()
                             _srv3.login(_user_v, _pass_v)
                             for _si, _em_item in enumerate(_pq):
