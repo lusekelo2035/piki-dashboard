@@ -1,21 +1,3 @@
-pip freeze | grep -E "streamlit|pandas|matplotlib|numpy|anthropic|rapidfuzz|folium|shapely|requests|google|gspread|openpyxl"
-```
-
----
-
-### 3. The email agent added `smtplib`/`ssl` inline imports
-These are standard library modules (no install needed), so that's not the issue.
-
----
-
-## Step-by-Step Fix
-
-**Step 1** — Go to your Streamlit Cloud dashboard → click your app → click **"Manage app"** (bottom right) → click **"View logs"**. The real error will be there. Share it here and I can pinpoint exactly what's failing.
-
-**Step 2** — While you're looking, make sure your `requirements.txt` in GitHub looks like this (with your actual pinned versions):
-```
-
-
 streamlit>=1.32.0
 pandas>=2.0.0
 numpy>=1.24.0
